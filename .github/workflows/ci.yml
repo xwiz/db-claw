@@ -1,0 +1,205 @@
+name: CI
+
+# Cross-language CI: Rust (cascade + rewriter), Python (training + eval +
+# rewriter), TypeScript (extractors). Each language runs in its own job
+# so failures are clearly attributable.
+#
+# The bypass corpus (the 10 mandatory-filter pen-test classes from the
+# SemanticSQL plan §Verification#8) gates merge: any failure ships
+# nothing.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-rust-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rust-
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (default features — onnx gated off)
+        run: cargo test --workspace --all-targets
+
+      - name: Install ONNX Runtime (load-dynamic)
+        # The `--features onnx` build uses ort with `load-dynamic`, which
+        # links against `libonnxruntime` at runtime. We install the
+        # CPU build from the Microsoft release feed; ORT_DYLIB_PATH
+        # points the compiled binary at it.
+        run: |
+          ORT_VERSION=1.18.1
+          curl -sSL -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          mkdir -p /tmp/ort && tar -xzf /tmp/ort.tgz -C /tmp/ort --strip-components=1
+          echo "ORT_DYLIB_PATH=/tmp/ort/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Test (--features onnx — Stage 1 + Stage 3 inference)
+        # Confirms the cfg-gated Linker + SlotFiller code paths still
+        # compile against the pinned ort/tokenizers versions. Runtime
+        # tests that need real ONNX weights are skipped — exec-acc
+        # validation lives in the Spider eval harness, not unit tests.
+        run: cargo test -p semsql-runtime --features onnx
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        run: pipx install uv
+      - name: Sync workspace
+        run: uv sync --all-extras
+      - name: Lint (ruff)
+        run: uv run ruff check python
+      - name: Test
+        run: uv run pytest python -q
+
+  typescript:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm -r build
+      - name: Test
+        run: pnpm -r test
+
+  bypass-corpus-gate:
+    # The mandatory-filter bypass corpus is the v1.0 ship gate per the
+    # plan. Run it as a dedicated job so a green check is unambiguous
+    # in the merge UI even if other suites flake.
+    needs: [rust, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bypass-${{ hashFiles('**/Cargo.lock') }}
+      - run: pipx install uv
+      - run: uv sync --all-extras
+      - name: Run Python rewriter bypass corpus
+        run: uv run pytest python/semsql_rewriter/tests/test_injector_bypass.py -v
+      - name: Run Rust two-parser corpus
+        run: cargo test -p semsql-second-pass --test two_parser_corpus
+
+  spider-mini-smoke:
+    # End-to-end smoke against the synthetic Spider mini-corpus.
+    # Builds the `semsql` binary, materialises the fixture, runs the
+    # full eval, and asserts the report is non-empty + the cascade
+    # buckets every example. Catches integration regressions across
+    # the entire cascade — schema-extract, graph-load, Stage 0a/0b,
+    # transpiler, exec-eq — that the per-language unit suites miss.
+    needs: [rust, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-spider-mini-${{ hashFiles('**/Cargo.lock') }}
+      - run: pipx install uv
+      - run: uv sync --all-extras
+      - name: Build semsql binary (default features)
+        run: cargo build -p semsql-cli
+      - name: Materialise the mini-corpus
+        run: |
+          uv run python -m semsql_eval build-mini-corpus \
+            --out target/spider_mini
+      - name: Run cascade against the mini-corpus
+        run: |
+          uv run python -m semsql_eval spider \
+            --questions target/spider_mini/dev.json \
+            --db-root target/spider_mini/database \
+            --semsql-bin target/debug/semsql \
+            --graph-cache-dir target/spider_mini_graphs \
+            --report-json target/spider_mini/report.json
+      - name: Assert report is well-formed + every example bucketed
+        run: |
+          uv run python - <<'PY'
+          import json, sys
+          report = json.loads(open("target/spider_mini/report.json").read())
+          s = report["summary"]
+          assert s["total"] > 0, "no examples evaluated"
+          # Every example must land in exactly one bucket.
+          assert s["correct"] + s["wrong"] + s["bailed"] + s["errored"] == s["total"], (
+              f"buckets do not sum to total: {s}"
+          )
+          print(f"spider-mini smoke: total={s['total']} correct={s['correct']} "
+                f"wrong={s['wrong']} bailed={s['bailed']} errored={s['errored']}")
+          PY
+
+  cross-language-contract:
+    # The two-parser fixture must stay in lockstep with the Python
+    # rewriter's output. If the Python regenerator and Rust consumer
+    # disagree, this gate catches it before the bypass-corpus suite
+    # masks the discrepancy.
+    needs: [python, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pipx install uv
+      - run: uv sync --all-extras
+      - name: Regenerate two-parser corpus
+        run: uv run pytest python/semsql_rewriter/tests/test_two_parser_corpus.py -v
+      - name: Fail if corpus regenerated (commit needed)
+        run: |
+          if ! git diff --quiet -- crates/semsql-second-pass/tests/fixtures/; then
+            echo "::error::two-parser corpus is stale. Run pytest locally and commit the regenerated fixture."
+            git --no-pager diff -- crates/semsql-second-pass/tests/fixtures/
+            exit 1
+          fi

@@ -1,0 +1,19 @@
+[package]
+name = "semsql-second-pass"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Independent Rust re-validator (sqlparser-rs) for the SQL emitted by the Python rewriter. Two parsers must agree."
+
+[dependencies]
+semsql-core = { path = "../semsql-core" }
+sqlparser.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ahash.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,199 @@
+# SemanticSQL — Intent Pattern Library
+#
+# This file is the deterministic answer to "how does an LLM know that
+# 'bleeding money' means look at expenses?". Stage 0b matches every pattern
+# (PCRE, case-insensitive) against the normalised NL query; matches feed
+# Stage 1 (additive boost on `column_hints`) and Stage 3 (slot resolution
+# preference).
+#
+# Patterns are *additive only*: an intent hint can prefer a column that
+# already exists in the SemanticGraph, but cannot synthesise one. The
+# validator and mandatory-filter injector still run on every query.
+#
+# Contributing
+# ------------
+#   Every pattern requires a fixture test in
+#   `python/semsql_eval/src/semsql_eval/intent_fixtures.yaml` before merge.
+#   Patterns that match too eagerly will silently miscategorise queries —
+#   we keep the bar high.
+#
+# Schema
+# ------
+#   pattern:        PCRE, case-insensitive at runtime — escape backslashes.
+#   intent_type:    stable identifier shared with SemanticGraph IntentReference.
+#   column_hints:   optional list of canonical or label-style column names
+#                   that Stage 1 should boost. Stage 3 prefers candidates
+#                   matching one of these.
+#   ordering:       ASC | DESC — feeds the ORDER BY slot.
+#   default_limit:  feeds the LIMIT slot if no explicit count is parsed.
+#   comparator:     SQL comparator + literal, e.g. "< 0".
+#   description:    one-line explanation surfaced by `semsql doctor`.
+#
+# Patterns are evaluated in the order they appear; multiple intents can
+# fire on the same query (e.g. "top 5 customers in the red").
+
+# --- Spending / cost idioms --------------------------------------------------
+
+- pattern: '(bleeding|hemorrhag\w+) money'
+  intent_type: high_expenditure
+  column_hints: [total_expenses, expenses, cost, spend, expenditure, opex, burn, monthly_burn]
+  ordering: DESC
+  default_limit: 10
+  description: "Idiom for high spend / expense outflow. Surfaces top spenders."
+
+- pattern: '\b(burning|burning through)\s+(cash|money|capital)\b'
+  intent_type: high_expenditure
+  column_hints: [burn, monthly_burn, cash_outflow, expenses]
+  ordering: DESC
+  default_limit: 10
+  description: "Startup-speak for cash burn — same target columns as 'bleeding money'."
+
+# --- Profitability idioms ---------------------------------------------------
+
+- pattern: '\b(in the red|losing money|unprofitable|underwater)\b'
+  intent_type: negative_profit
+  column_hints: [profit, net_income, margin, gross_margin, ebitda]
+  comparator: "< 0"
+  description: "Negative-profit filter idioms. Adds `< 0` predicate on profit-style columns."
+
+- pattern: '\b(in the black|profitable|making money)\b'
+  intent_type: positive_profit
+  column_hints: [profit, net_income, margin, gross_margin, ebitda]
+  comparator: "> 0"
+  description: "Positive-profit filter idioms."
+
+# --- Ranking / extremes -----------------------------------------------------
+
+- pattern: '\b(top|highest|biggest|largest|most)\s+(\d+)?\b'
+  intent_type: ranking_desc
+  ordering: DESC
+  default_limit: 10
+  description: "Ranking by descending magnitude. Top-N, highest-value, etc."
+
+- pattern: '\b(bottom|lowest|smallest|least)\s+(\d+)?\b'
+  intent_type: ranking_asc
+  ordering: ASC
+  default_limit: 10
+  description: "Ranking by ascending magnitude. Bottom-N, lowest-value, etc."
+
+- pattern: '\b(worst|under-?perform\w*)\b'
+  intent_type: ranking_asc
+  ordering: ASC
+  default_limit: 10
+  description: "Negative-extreme idioms. Surfaces worst-performing rows."
+
+# --- Time-window idioms (best-effort — Stage 3 also handles these) ----------
+
+- pattern: '\b(last|past|previous)\s+(year|quarter|month|week|day|fortnight)\b'
+  intent_type: recent_window
+  description: "Recent-time-window idiom. Stage 3 maps to dialect-specific date math."
+
+- pattern: '\b(stale|inactive|dormant|long-?dead)\b'
+  intent_type: stale_record
+  column_hints: [last_seen_at, last_login_at, last_active_at, updated_at]
+  description: "Inactivity idioms. Boosts last-activity timestamp columns."
+
+# --- Customer / churn idioms -------------------------------------------------
+
+- pattern: '\b(churn(ing|ed)?|cancell?ed|left|departed)\b'
+  intent_type: churn
+  column_hints: [cancelled_at, churned_at, ended_at, terminated_at, left_at]
+  description: "Churn / cancellation idioms."
+
+- pattern: '\b(new|fresh|recent|just[- ]joined)\b'
+  intent_type: recent_join
+  column_hints: [created_at, joined_at, signed_up_at, registered_at]
+  ordering: DESC
+  description: "Recent-onboarding idioms. Boosts created/joined timestamp columns."
+
+# --- Volume idioms ----------------------------------------------------------
+
+- pattern: '\b(busy|active|hot|trending)\b'
+  intent_type: high_volume
+  column_hints: [request_count, transaction_count, event_count, hits, views]
+  ordering: DESC
+  default_limit: 10
+  description: "High-volume idioms. Boosts count/event columns."
+
+- pattern: '\b(quiet|idle|cold)\b'
+  intent_type: low_volume
+  column_hints: [request_count, transaction_count, event_count, hits, views]
+  ordering: ASC
+  default_limit: 10
+  description: "Low-volume idioms."
+
+# --- Latency / performance idioms -------------------------------------------
+
+- pattern: '\b(slow|laggy|sluggish|crawl(ing)?)\b'
+  intent_type: high_latency
+  column_hints: [latency_ms, response_time_ms, p95_latency, p99_latency, duration_ms, elapsed_ms]
+  ordering: DESC
+  default_limit: 10
+  description: "Latency idioms. Boosts response/duration columns. Top-N slowest."
+
+- pattern: '\b(fast|snappy|responsive|quick)\b'
+  intent_type: low_latency
+  column_hints: [latency_ms, response_time_ms, p95_latency, duration_ms]
+  ordering: ASC
+  default_limit: 10
+  description: "Low-latency idioms."
+
+# --- Error / health idioms --------------------------------------------------
+
+- pattern: '\b(failing|failed|broken|erroring|crash(ed|ing)?)\b'
+  intent_type: error_state
+  column_hints: [error_count, failure_count, status_code, error, last_error_at]
+  ordering: DESC
+  default_limit: 10
+  description: "Error/failure idioms. Boosts error-count and last-error columns."
+
+- pattern: '\b(healthy|ok|clean|nominal)\b'
+  intent_type: healthy_state
+  column_hints: [status, status_code, health_check_status]
+  description: "Healthy-state idioms — Stage 3 maps to the canonical healthy enum value."
+
+# --- Outlier / anomaly idioms -----------------------------------------------
+
+- pattern: '\b(outliers?|anomal(y|ies|ous)|weird|suspicious|unusual)\b'
+  intent_type: outlier
+  column_hints: [anomaly_score, z_score, deviation, std_dev]
+  ordering: DESC
+  default_limit: 25
+  description: "Outlier / anomaly idioms. Surfaces high-deviation rows."
+
+# --- Compliance / lifecycle idioms ------------------------------------------
+
+- pattern: '\b(overdue|past[- ]due|late|delinquent|expired)\b'
+  intent_type: overdue
+  column_hints: [due_at, due_date, expires_at, expiry_date, deadline]
+  comparator: "< NOW()"
+  ordering: ASC
+  description: "Overdue / past-deadline idioms. Boosts due-date columns; predicate is dialect-mapped in Stage 3."
+
+- pattern: '\b(upcoming|due soon|approaching|coming[- ]up)\b'
+  intent_type: upcoming
+  column_hints: [due_at, due_date, scheduled_at, starts_at]
+  ordering: ASC
+  default_limit: 25
+  description: "Upcoming-deadline idioms. Boosts upcoming-event columns."
+
+- pattern: '\b(deleted|removed|archived|trash(ed)?)\b'
+  intent_type: soft_deleted
+  column_hints: [deleted_at, archived_at, removed_at]
+  description: "Soft-delete idioms. Stage 3 inverts the default `deleted_at IS NULL` scope."
+
+# --- Volume direction idioms ------------------------------------------------
+
+- pattern: '\b(spik(e|ing|ed)|surge|burst)\b'
+  intent_type: volume_spike
+  column_hints: [request_count, event_count, hits, transactions, peak_qps]
+  ordering: DESC
+  default_limit: 25
+  description: "Spike / surge idioms. Surfaces peak-volume rows."
+
+- pattern: '\b(drop(ping|ped)?|dip|decline|fall(ing)?)\b'
+  intent_type: volume_drop
+  column_hints: [request_count, event_count, conversion_rate, completion_rate]
+  ordering: ASC
+  default_limit: 25
+  description: "Volume-drop idioms. Surfaces declining rows."

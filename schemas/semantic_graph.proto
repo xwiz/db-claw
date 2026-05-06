@@ -1,0 +1,266 @@
+// SemanticGraph — canonical contract for SemanticSQL.
+//
+// Every layer (Rust runtime, Python rewriter, TS extractors) reads and writes
+// this schema. No layer owns the contract; the schema does.
+//
+// Versioning: additive only — never repurpose a field number, never remove a
+// field. Bump `schema_version` on the root message for any breaking change.
+
+syntax = "proto3";
+
+package semsql.v1;
+
+// =============================================================================
+// Provenance — every fact in the graph carries a source locator so users can
+// click through to the file:line where a vocabulary term came from. This is the
+// auditability differentiator vs. WrenAI's opaque MDL.
+// =============================================================================
+
+message SourceLocator {
+  string file = 1;          // path relative to repo root
+  uint32 line = 2;          // 1-indexed
+  optional uint32 column = 3;
+  // Layer index from the spec, 1=DB schema, ..., 6=form/table label (highest).
+  // See SourceLayer enum.
+  SourceLayer layer = 4;
+  // Human-readable extractor name, e.g. "extractor-laravel:filament-form".
+  string extractor = 5;
+}
+
+enum SourceLayer {
+  SOURCE_LAYER_UNSPECIFIED = 0;
+  SOURCE_LAYER_DB_SCHEMA = 1;
+  SOURCE_LAYER_ORM = 2;
+  SOURCE_LAYER_APP_CONSTANT = 3;
+  SOURCE_LAYER_API_RESOURCE = 4;
+  SOURCE_LAYER_I18N = 5;
+  SOURCE_LAYER_FORM_OR_TABLE_LABEL = 6;  // highest priority
+}
+
+// =============================================================================
+// Entities, fields, relationships, enums, units
+// =============================================================================
+
+message Entity {
+  // Stable canonical name (matches DB table name unless overridden).
+  // Allowlist regex: [A-Za-z_][A-Za-z0-9_]{0,63}
+  string canonical_name = 1;
+
+  // DB-side
+  string db_table = 2;
+  string db_schema = 3;            // e.g. "public"
+
+  // Human-facing
+  string singular_label = 4;       // "Student"
+  string plural_label = 5;         // "Students"
+
+  // Cross-references
+  repeated string field_names = 6;
+  repeated string aliases = 7;     // additional vocabulary terms
+
+  // Mandatory scope predicates always injected for queries on this entity.
+  repeated ScopePredicate scopes = 8;
+
+  // Provenance for every claim above.
+  repeated SourceLocator sources = 15;
+}
+
+message Field {
+  string canonical_name = 1;       // e.g. "users.created_at"
+  string entity = 2;               // owning entity canonical_name
+  string db_column = 3;
+  FieldType type = 4;
+
+  string display_label = 5;        // e.g. "Joined Date"
+  repeated string aliases = 6;     // ["joined", "member since", ...]
+
+  optional EnumRef enum_ref = 7;   // if this field is an enum
+  optional UnitRef unit_ref = 8;   // if this field carries units (cents/USD)
+
+  bool nullable = 9;
+  optional string default_value = 10;
+
+  repeated SourceLocator sources = 15;
+}
+
+enum FieldType {
+  FIELD_TYPE_UNSPECIFIED = 0;
+  FIELD_TYPE_INTEGER = 1;
+  FIELD_TYPE_BIGINT = 2;
+  FIELD_TYPE_DECIMAL = 3;
+  FIELD_TYPE_FLOAT = 4;
+  FIELD_TYPE_BOOLEAN = 5;
+  FIELD_TYPE_STRING = 6;
+  FIELD_TYPE_TEXT = 7;
+  FIELD_TYPE_DATE = 8;
+  FIELD_TYPE_TIMESTAMP = 9;
+  FIELD_TYPE_JSON = 10;
+  FIELD_TYPE_UUID = 11;
+  FIELD_TYPE_BLOB = 12;
+}
+
+message Relationship {
+  // From side
+  string from_entity = 1;
+  string from_field = 2;           // FK column on the from side
+
+  // To side
+  string to_entity = 3;
+  string to_field = 4;             // PK column on the to side
+
+  RelationshipKind kind = 5;
+  string relation_name = 6;        // ORM-declared name, e.g. "tenant"
+
+  repeated SourceLocator sources = 15;
+}
+
+enum RelationshipKind {
+  RELATIONSHIP_KIND_UNSPECIFIED = 0;
+  RELATIONSHIP_KIND_BELONGS_TO = 1;
+  RELATIONSHIP_KIND_HAS_ONE = 2;
+  RELATIONSHIP_KIND_HAS_MANY = 3;
+  RELATIONSHIP_KIND_MANY_TO_MANY = 4;
+}
+
+message EnumDef {
+  string canonical_name = 1;       // e.g. "users.status_code"
+  // Map from raw DB value (string-encoded) to human label.
+  map<string, string> values = 2;  // {"1": "Pending", "2": "Active", "39": "Error"}
+  // Reverse aliases — alternative labels users say.
+  // Keyed by DB value; each list is a set of synonyms.
+  map<string, ValueAliases> aliases = 3;
+  string source_authority = 4;     // "filament_form", "constants_file", ...
+  repeated SourceLocator sources = 15;
+}
+
+message ValueAliases {
+  repeated string aliases = 1;     // ["enabled", "live", "on"]
+}
+
+message EnumRef {
+  string enum_canonical_name = 1;
+}
+
+message UnitDef {
+  string canonical_name = 1;       // e.g. "money.cents_to_usd"
+  string storage_unit = 2;         // "cents"
+  string display_unit = 3;         // "USD"
+  // Conversion expressed as multiplicative factor: storage * factor = display.
+  double factor = 4;               // 0.01
+}
+
+message UnitRef {
+  string unit_canonical_name = 1;
+}
+
+// =============================================================================
+// Mandatory scope — injected on every query touching the owning entity.
+// =============================================================================
+
+message ScopePredicate {
+  ScopeKind kind = 1;
+  // SQL expression template, with `{{table}}` placeholder for the alias and
+  // `:param_name` placeholders for bound parameters.
+  string template = 2;
+  // Parameters this predicate requires from the caller.
+  repeated string required_params = 3;
+  string source_rule = 4;          // human-readable origin
+  repeated SourceLocator sources = 15;
+}
+
+enum ScopeKind {
+  SCOPE_KIND_UNSPECIFIED = 0;
+  SCOPE_KIND_TENANT = 1;
+  SCOPE_KIND_SOFT_DELETE = 2;
+  SCOPE_KIND_OWNER = 3;
+  SCOPE_KIND_RLS = 4;              // database-level (advisory only)
+  SCOPE_KIND_CUSTOM = 5;
+}
+
+// =============================================================================
+// Vocabulary — every term users might say, mapped to canonical refs.
+// Highest-layer entry wins; lower layers attach as aliases.
+// =============================================================================
+
+message VocabularyEntry {
+  string term = 1;                 // user-facing label, normalised NFC
+  CanonicalRef canonical = 2;
+  float confidence = 3;            // [0.0, 1.0]
+  SourceLocator source = 4;
+  // If multiple sources contributed, this entry is the winner; the rest live
+  // in `superseded`.
+  repeated SourceLocator superseded = 5;
+}
+
+message CanonicalRef {
+  oneof target {
+    string entity = 1;
+    string field = 2;              // dotted: "users.created_at"
+    EnumValueRef enum_value = 3;
+    string relationship = 4;
+  }
+}
+
+message EnumValueRef {
+  string enum_canonical_name = 1;  // "users.status_code"
+  string raw_value = 2;            // "39" (string-encoded for protobuf-friendliness)
+}
+
+// =============================================================================
+// Conflicts — two extractor sources disagreed; resolution is recorded.
+// =============================================================================
+
+message ConflictLogEntry {
+  string canonical_target = 1;     // "users.status_code", "tenants" entity, ...
+  repeated VocabularyEntry candidates = 2;
+  string resolution = 3;           // "filament_form wins per layer cascade"
+  string suggested_override = 4;   // user can paste this into semsql.overrides.yaml
+}
+
+// =============================================================================
+// Sample values — opportunistic snippets from the live DB to disambiguate
+// fields with similar names. Always sampled with a row limit; never a dump.
+// =============================================================================
+
+message SampleValues {
+  string field_canonical_name = 1;
+  repeated string examples = 2;    // up to 10 distinct values, hashed if PII-flagged
+  bool pii_redacted = 3;
+}
+
+// =============================================================================
+// Intent reference — Stage 0b matches against the YAML library and emits
+// IntentHints at runtime. Intent definitions themselves live outside the graph
+// (in intent-library/patterns.yaml) so they can be community-maintained.
+// =============================================================================
+
+message IntentReference {
+  string intent_type = 1;          // matches a key in patterns.yaml
+  // Columns this intent prefers — resolved against this graph at extract time.
+  repeated string preferred_field_canonical_names = 2;
+}
+
+// =============================================================================
+// Root — a complete SemanticGraph for one application.
+// =============================================================================
+
+message SemanticGraph {
+  uint32 schema_version = 1;       // bump on breaking changes; current: 1
+  string application_name = 2;
+  string schema_hash = 3;          // sha256 of normalised entity/field/enum
+                                   // names — used for drift detection.
+  int64 generated_at_unix = 4;
+
+  repeated Entity entities = 10;
+  repeated Field fields = 11;
+  repeated Relationship relationships = 12;
+  repeated EnumDef enums = 13;
+  repeated UnitDef units = 14;
+  repeated VocabularyEntry vocabulary = 15;
+  repeated SampleValues samples = 16;
+  repeated IntentReference intents = 17;
+  repeated ConflictLogEntry conflicts = 18;
+
+  // Free-form metadata (extractor versions, framework detected, ...).
+  map<string, string> metadata = 99;
+}

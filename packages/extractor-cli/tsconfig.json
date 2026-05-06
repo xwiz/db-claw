@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../extractor-sdk" },
+    { "path": "../extractor-django" },
+    { "path": "../extractor-laravel" },
+    { "path": "../extractor-nextjs" },
+    { "path": "../extractor-rails" },
+    { "path": "../extractor-vue" },
+    { "path": "../extractor-i18n" }
+  ]
+}

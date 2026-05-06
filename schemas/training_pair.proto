@@ -1,0 +1,82 @@
+// TrainingPair — per-stage training records emitted by Phase 2 generator.
+//
+// Each cascade stage consumes a different shape; we encode them in one proto
+// with a oneof. Records are written to Parquet shards keyed by stage.
+
+syntax = "proto3";
+
+package semsql.v1;
+
+import "semantic_graph.proto";
+
+message TrainingPair {
+  string id = 1;                   // stable hash of the canonical SQL AST
+  uint32 difficulty_bucket = 2;    // 0=trivial..4=expert (curriculum learning)
+  string source_template = 3;      // template name that produced this pair
+  string schema_hash = 4;          // SemanticGraph schema hash at gen time
+  string vocab_version = 5;        // hash of vocabulary section at gen time
+
+  oneof body {
+    LinkerExample linker = 10;     // Stage 1
+    SkeletonExample skeleton = 11; // Stage 2
+    SlotExample slot = 12;         // Stage 3
+    EndToEndExample e2e = 13;      // for full-pipeline eval only
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Stage 1 — Schema Linker (cross-encoder, ranking).
+//
+// One NL produces multiple LinkerExamples (one per candidate schema item).
+// Hard negatives are similarly-named columns from other tables.
+// -----------------------------------------------------------------------------
+
+message LinkerExample {
+  string nl = 1;                   // natural-language query
+  CanonicalRef candidate = 2;      // schema item being scored
+  float relevance_label = 3;       // 0.0 (irrelevant) .. 1.0 (perfect)
+  bool is_hard_negative = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Stage 2 — Skeleton Generator (encoder-decoder).
+// -----------------------------------------------------------------------------
+
+message SkeletonExample {
+  string nl = 1;
+  // The schema slice Stage 1 would have emitted, in canonical order.
+  repeated CanonicalRef ranked_schema = 2;
+  // NatSQL skeleton with @entityN / @fieldN / @valN placeholders.
+  string natsql_skeleton = 3;
+  // Optional intent hints that were active for this NL.
+  repeated string intent_types = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Stage 3 — Slot Filler (classifier).
+// -----------------------------------------------------------------------------
+
+message SlotExample {
+  string nl = 1;
+  string skeleton = 2;
+  string slot_name = 3;            // e.g. "@field2"
+  // Candidate set for this slot (typically 2..10 items from Stage 1).
+  repeated CanonicalRef candidates = 4;
+  // Index of the correct candidate in `candidates`.
+  uint32 correct_index = 5;
+  // Optional intent hint that should bias resolution.
+  optional string intent_type = 6;
+}
+
+// -----------------------------------------------------------------------------
+// End-to-end (eval-only) — full NL → SQL pair, never used for training.
+// -----------------------------------------------------------------------------
+
+message EndToEndExample {
+  string nl = 1;
+  string sql = 2;                  // ground truth
+  string dialect = 3;              // postgres, mysql, sqlite, ...
+  // Mandatory scope params present in the SQL (so we can verify injector
+  // produces equivalent output).
+  map<string, string> scope_params = 4;
+}

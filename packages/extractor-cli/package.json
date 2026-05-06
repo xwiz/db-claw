@@ -1,0 +1,34 @@
+{
+  "name": "@semsql/extractor-cli",
+  "version": "0.1.0-dev",
+  "description": "`semsql-extract` Node binary — orchestrates framework adapters and emits a SemanticGraph.",
+  "license": "Apache-2.0 OR MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "semsql-extract": "./dist/cli.js"
+  },
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "biome check src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@semsql/extractor-sdk": "workspace:*",
+    "@semsql/extractor-django": "workspace:*",
+    "@semsql/extractor-laravel": "workspace:*",
+    "@semsql/extractor-nextjs": "workspace:*",
+    "@semsql/extractor-rails": "workspace:*",
+    "@semsql/extractor-vue": "workspace:*",
+    "@semsql/extractor-i18n": "workspace:*",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}

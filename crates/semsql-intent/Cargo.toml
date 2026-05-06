@@ -1,0 +1,17 @@
+[package]
+name = "semsql-intent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stage 0b — Intent Pattern Library matcher (regex + fuzzy)."
+
+[dependencies]
+semsql-core = { path = "../semsql-core" }
+fancy-regex.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+once_cell.workspace = true
+indexmap.workspace = true

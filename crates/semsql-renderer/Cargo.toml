@@ -1,0 +1,13 @@
+[package]
+name = "semsql-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Last-mile SQL dialect renderer — AST → dialect-specific string."
+
+[dependencies]
+semsql-core = { path = "../semsql-core" }
+sqlparser.workspace = true
+thiserror.workspace = true

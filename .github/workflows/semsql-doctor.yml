@@ -1,0 +1,114 @@
+name: semsql doctor
+
+# Gate every PR through the SemanticGraph healthcheck:
+#  1. Build the SemanticGraph from the live DB schema.
+#  2. Run `semsql doctor` to surface vocabulary conflicts and RLS gaps.
+#  3. Fail closed on any RLS DISABLED or RLS-no-policies finding for a
+#     tenanted table — exec_acc regressions are loud, but RLS regressions
+#     are silent until a customer leaks data, so we treat them as
+#     deployment-blocking.
+#
+# Inputs (configured per-repo via repository variables / secrets):
+#  - SEMSQL_DB_URL: a CI-only Postgres URL with read-only access to the
+#    schema. The doctor command never writes; we still recommend
+#    `LOGIN PASSWORD ... CONNECTION LIMIT 4` and a dedicated role.
+#
+# This workflow is the v1.0 deployment gate per the SemanticSQL plan.
+# Vendored alongside the project so a fresh fork inherits it for free.
+
+on:
+  pull_request:
+    paths:
+      # Run on any change that could shift the live schema or scope rules:
+      # migrations, ORM models, Filament resources, extractor adapters.
+      - "db/migrations/**"
+      - "migrations/**"
+      - "app/Models/**"
+      - "app/Filament/**"
+      - "src/db/**"
+      - "lib/db/**"
+      - "drizzle/**"
+      - "schema.prisma"
+      - "intent-library/patterns.yaml"
+      - "**/*.semsql"
+  workflow_dispatch:
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        # The runtime doctor check is Postgres-only today (only RDBMS
+        # with first-class RLS); pin a known-good major. Override
+        # locally if the deployer uses a managed PG.
+        image: postgres:16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SEMSQL_DB_URL: ${{ secrets.SEMSQL_DB_URL || 'postgres://ci:ci@localhost:5432/app' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply schema migrations
+        # Replace this step with the project's own migration runner.
+        # The default assumes a `make migrate` target — adjust as needed.
+        run: |
+          if [ -f Makefile ] && grep -qE '^migrate:' Makefile; then
+            make migrate
+          else
+            echo "::warning::no migration runner found; doctor will operate on the schema as-is"
+          fi
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doctor-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doctor-
+
+      - name: Build semsql binary
+        run: cargo build -p semsql-cli --release
+
+      - name: Extract SemanticGraph from live DB
+        run: |
+          ./target/release/semsql extract . \
+            --framework none \
+            --db-url "$SEMSQL_DB_URL" \
+            --output target/graph.semsql
+
+      - name: Run semsql doctor with RLS check
+        # Doctor exits non-zero on:
+        #   - hard vocabulary conflicts
+        #   - RLS disabled on any tenanted table
+        #   - RLS enabled but zero policies (silent deny-all)
+        run: |
+          ./target/release/semsql doctor \
+            --graph target/graph.semsql \
+            --db-url "$SEMSQL_DB_URL"
+
+      - name: Upload SemanticGraph artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semsql-graph-${{ github.event.pull_request.number || github.run_id }}
+          path: target/graph.semsql
+          retention-days: 7

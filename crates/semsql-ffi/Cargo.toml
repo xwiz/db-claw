@@ -1,0 +1,19 @@
+[package]
+name = "semsql-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI / WASM / Node-API / PyO3 bindings for SemanticSQL."
+
+[lib]
+name = "semsql_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+semsql-core    = { path = "../semsql-core" }
+semsql-graph   = { path = "../semsql-graph" }
+semsql-runtime = { path = "../semsql-runtime" }
+serde.workspace = true
+serde_json.workspace = true

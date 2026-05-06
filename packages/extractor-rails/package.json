@@ -1,0 +1,33 @@
+{
+  "name": "@semsql/extractor-rails",
+  "version": "0.1.0-dev",
+  "description": "Rails + ActiveRecord extractor — schema.rb, migrations, locales, model enums. v0.1 priority.",
+  "license": "Apache-2.0 OR MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "biome check src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@semsql/extractor-sdk": "workspace:*",
+    "@semsql/extractor-i18n": "workspace:*",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}

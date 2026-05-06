@@ -1,0 +1,30 @@
+[package]
+name = "semsql-extract-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DB-side schema introspection — Postgres / MySQL / SQLite / MSSQL information_schema."
+
+[dependencies]
+semsql-core = { path = "../semsql-core" }
+rusqlite.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sqlx = { workspace = true, optional = true }
+futures.workspace = true
+
+[features]
+default = ["postgres"]
+# Postgres backend via sqlx. Gated behind a feature flag because pulling
+# `sqlx` adds a non-trivial compile cost; downstream users embedding the
+# crate without Postgres can opt out with `default-features = false`.
+postgres = ["dep:sqlx"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }

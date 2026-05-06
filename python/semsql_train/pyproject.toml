@@ -1,0 +1,41 @@
+[project]
+name = "semsql-train"
+version = "0.1.0.dev0"
+description = "SemanticSQL training pipeline — per-stage data generators, distillation, ONNX export."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0 OR MIT" }
+authors = [{ name = "DB Claw contributors" }]
+
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "click>=8.1",
+    "rich>=13.7",
+    # sqlglot is the canonical SQL parser across the workspace (also used
+    # by the Python rewriter). Required for Spider/BIRD gold-SQL parsing
+    # in `spider_linker.py`. Lightweight pure-Python dep — no risk of
+    # blowing up the install footprint for users who only use the data
+    # generator without ML extras.
+    "sqlglot>=25.20",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "peft>=0.13",
+    "datasets>=3.0",
+    "optimum[onnxruntime]>=1.23",
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+    "accelerate>=1.0",
+]
+dev = ["pytest>=8.3", "ruff>=0.7", "mypy>=1.13"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/semsql_train"]

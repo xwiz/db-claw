@@ -1,0 +1,32 @@
+{
+  "name": "@semsql/extractor-vue",
+  "version": "0.1.0-dev",
+  "description": "Vue 3 SFC extractor — <label> + v-model field associations. v0.1 priority.",
+  "license": "Apache-2.0 OR MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "biome check src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@semsql/extractor-sdk": "workspace:*",
+    "@vue/compiler-core": "^3.5.13",
+    "@vue/compiler-sfc": "^3.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}

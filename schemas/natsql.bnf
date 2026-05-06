@@ -1,0 +1,61 @@
+; NatSQL grammar — the intermediate representation Stage 2 generates.
+;
+; Adapted from the published Natural-SQL grammar
+;   ("Natural SQL: Making SQL Easier to Infer from Natural Language Specifications",
+;    Findings of EMNLP 2021, https://aclanthology.org/2021.findings-emnlp.174/).
+;
+; Differences vs. the original NatSQL paper:
+;   - Identifiers carry an explicit "@entity" / "@field" / "@val" prefix while
+;     coming out of Stage 2 (skeleton form). Stage 3 fills these in to produce
+;     "concrete NatSQL" which the deterministic transpiler converts to SQL.
+;   - We additionally allow ORDER_BY / LIMIT slots so intent hints
+;     ("bleeding money" → ORDER BY DESC LIMIT 10) can be expressed.
+;
+; The grammar is consumed by:
+;   1. llguidance, to constrain Stage 2 decoding to valid skeletons.
+;   2. semsql-natsql, to parse concrete NatSQL into an AST for transpilation.
+;
+; Format: Lark / EBNF — kept readable; see semsql-natsql/src/grammar.lark for
+; the canonical machine-readable copy used at compile time.
+
+start: query
+
+query:    select_clause where_clause? group_by_clause? order_by_clause? limit_clause?
+
+select_clause: "SELECT" select_item ("," select_item)*
+select_item:   "*"
+             | aggregate "(" field ")"
+             | field
+
+where_clause:  "WHERE" condition (("AND" | "OR") condition)*
+
+group_by_clause: "GROUP BY" field ("," field)*
+
+order_by_clause: "ORDER BY" field ("ASC" | "DESC")?
+
+limit_clause:    "LIMIT" value
+
+condition: field operator value
+         | field "IN" "(" value ("," value)* ")"
+         | field "BETWEEN" value "AND" value
+         | field "IS" "NULL"
+         | field "IS" "NOT" "NULL"
+         | field "LIKE" value
+
+operator: "=" | "!=" | "<" | "<=" | ">" | ">=" | "==" | "<>"
+
+aggregate: "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+
+field: ENTITY "." FIELD | FIELD
+value: VAL | NUMBER | STRING | "true" | "false" | "NULL"
+
+ENTITY: /@entity[0-9]+/ | CNAME
+FIELD:  /@field[0-9]+/  | CNAME
+VAL:    /@val[0-9]+/
+
+CNAME:   /[A-Za-z_][A-Za-z0-9_]{0,63}/
+NUMBER:  /-?[0-9]+(\.[0-9]+)?/
+STRING:  /'(?:[^'\\]|\\.)*'/
+
+%import common.WS
+%ignore WS

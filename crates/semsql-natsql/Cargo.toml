@@ -1,0 +1,14 @@
+[package]
+name = "semsql-natsql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NatSQL grammar + deterministic NatSQL→SQL transpiler."
+
+[dependencies]
+semsql-core = { path = "../semsql-core" }
+sqlparser.workspace = true
+serde.workspace = true
+thiserror.workspace = true

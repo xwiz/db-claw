@@ -1,0 +1,22 @@
+[package]
+name = "semsql-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generated protobuf bindings + shared core types for SemanticSQL."
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+
+[features]
+default = []
+build-protos = []  # gate the build.rs on this so contributors who only want
+                   # to consume the crate don't need protoc installed.

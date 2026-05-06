@@ -1,0 +1,24 @@
+[project]
+name = "semsql-rewriter"
+version = "0.1.0.dev0"
+description = "Security-critical SQL rewriter — sqlglot-based validator + mandatory-filter injector + vocabulary sanitiser."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0 OR MIT" }
+authors = [{ name = "DB Claw contributors" }]
+
+dependencies = [
+    "sqlglot>=25.0",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "hypothesis>=6.115", "ruff>=0.7", "mypy>=1.13"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/semsql_rewriter"]

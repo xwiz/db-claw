@@ -1,0 +1,31 @@
+{
+  "name": "@semsql/extractor-i18n",
+  "version": "0.1.0-dev",
+  "description": "i18n parsers (ICU / gettext / Rails YAML / Laravel lang) — used by every framework adapter.",
+  "license": "Apache-2.0 OR MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --passWithNoTests",
+    "lint": "biome check src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@semsql/extractor-sdk": "workspace:*",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}

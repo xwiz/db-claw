@@ -1,0 +1,135 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/semsql-core",
+    "crates/semsql-graph",
+    "crates/semsql-extract-db",
+    "crates/semsql-intent",
+    "crates/semsql-natsql",
+    "crates/semsql-runtime",
+    "crates/semsql-renderer",
+    "crates/semsql-second-pass",
+    "crates/semsql-cli",
+    "crates/semsql-ffi",
+]
+
+[workspace.package]
+version = "0.1.0-dev"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/db-claw/semantic-sql"
+homepage = "https://github.com/db-claw/semantic-sql"
+authors = ["DB Claw contributors"]
+
+[workspace.dependencies]
+# Core SQL
+sqlparser = "0.52"
+
+# Protobuf
+prost = "0.13"
+prost-build = "0.13"
+prost-types = "0.13"
+
+# SQLite (graph store)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# DB introspection (semsql-extract-db)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "mysql", "sqlite"] }
+
+# ONNX runtime (semsql-runtime, optional — enabled by `--features onnx`)
+#
+# We use `load-dynamic` rather than `download-binaries` because the
+# transitive `ort-sys` (rc.12) ships a build script that calls
+# `ureq::tls::TlsConfig::builder()` — a `ureq` API that was removed
+# upstream, breaking every `download-binaries` build. `load-dynamic`
+# skips the build-time download and instead opens `libonnxruntime` at
+# runtime via `dlopen`/`LoadLibrary`. The caller must install ONNX
+# Runtime themselves (one of):
+#
+#   - macOS:  `brew install onnxruntime`
+#   - Linux:  `apt install libonnxruntime-dev` (Debian 13+) or
+#             download from https://github.com/microsoft/onnxruntime/releases
+#   - Windows: download `onnxruntime-win-x64-*.zip` from the same release
+#             page; extract `onnxruntime.dll` next to the binary.
+#
+# The library is located via `ORT_DYLIB_PATH` env var (preferred) or by
+# the OS dynamic-loader's default search rules. semsql's CLI prints a
+# clear error pointing at the install URL when the library is missing.
+# Pinned hard:
+#   - `ort` + `ort-sys` rc.12, both default-features off. The broken
+#     `ureq::tls` call lives in `ort-sys` build-script behind the
+#     `download-binaries` feature; with `load-dynamic` the build
+#     script's TLS path never runs, so the build is clean.
+#   - `ort-sys` is pinned with `=` because anything older than rc.12
+#     has a stale `OrtApi` field set that no longer matches the
+#     upstream ONNX Runtime headers, and anything newer doesn't exist
+#     yet. When a stable 2.x lands the `=` can soften.
+#   - `tokenizers` 0.19.1 unconditionally compiles `utils::onig`
+#     unless `unstable_wasm` is enabled — that flag swaps the onig
+#     regex backend for fancy-regex despite the WASM-suggesting name.
+#     0.20.x has the same gate. Without `unstable_wasm`,
+#     `default-features = false` still pulls onig and fails because
+#     we don't link the onig crate. See
+#     tokenizers/src/utils/mod.rs cfg gate
+#     `#[cfg(not(feature = "unstable_wasm"))]`.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+ort-sys = { version = "=2.0.0-rc.10", default-features = false }
+tokenizers = { version = "=0.19.1", default-features = false, features = ["unstable_wasm"] }
+
+# Constrained decoding
+#
+# llguidance — Stage 2 (skeleton generator) decodes under a CFG bound
+# to the per-query schema slice so hallucinated tables/columns are
+# structurally impossible. Pinned to 1.7.x because the grammar API
+# stabilised in that line and the crate's MSRV (1.87) is comfortably
+# below our local toolchain. Only consumers that enable the `onnx`
+# feature on `semsql-runtime` actually compile this dep.
+llguidance = { version = "1.7.5", default-features = false, features = ["lark"] }
+
+# Async / tracing
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Regex (intent library, sanitiser)
+regex = "1"
+fancy-regex = "0.13"
+
+# Misc
+once_cell = "1"
+indexmap = { version = "2", features = ["serde"] }
+ahash = "0.8"
+unicode-normalization = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Test utilities
+proptest = "1"
+insta = { version = "1", features = ["yaml", "json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1

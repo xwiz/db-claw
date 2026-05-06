@@ -1,0 +1,47 @@
+# Rust
+target/
+Cargo.lock.*
+*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# Models / data (large)
+models/cascade/*.onnx
+models/fine-tunes/**
+*.parquet
+data/raw/
+data/cache/
+
+# SemanticGraph artefacts
+*.semsql
+*.semsql-shm
+*.semsql-wal
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local env
+.env
+.env.*
+!.env.example

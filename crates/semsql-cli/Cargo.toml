@@ -1,0 +1,36 @@
+[package]
+name = "semsql-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`semsql` — command-line driver for SemanticSQL."
+
+[[bin]]
+name = "semsql"
+path = "src/main.rs"
+
+[features]
+default = ["postgres"]
+# Re-export the underlying extract-db backend toggle so users can opt out
+# of Postgres at the CLI level (smaller binary, fewer transitive deps).
+postgres = ["semsql-extract-db/postgres"]
+
+[dependencies]
+semsql-core       = { path = "../semsql-core" }
+semsql-graph      = { path = "../semsql-graph" }
+semsql-intent     = { path = "../semsql-intent" }
+semsql-extract-db = { path = "../semsql-extract-db", default-features = false }
+semsql-runtime    = { path = "../semsql-runtime" }
+clap.workspace    = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile = "3"
