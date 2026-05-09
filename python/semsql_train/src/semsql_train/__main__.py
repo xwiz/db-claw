@@ -386,6 +386,25 @@ def inspect_manifest_cmd(manifest_path: Path) -> None:
     help="HF dataset id; override if the upstream repo path changes.",
 )
 @click.option(
+    "--omnisql-question-key",
+    type=str,
+    default="question",
+    help="Column name carrying the NL question. Override for non-OmniSQL "
+    "parquets routed through this path (e.g. Gretel uses 'sql_prompt').",
+)
+@click.option(
+    "--omnisql-sql-key",
+    type=str,
+    default="sql",
+    help="Column name carrying gold SQL. Override per-corpus.",
+)
+@click.option(
+    "--omnisql-db-id-key",
+    type=str,
+    default="db_id",
+    help="Column name carrying the db_id. Override per-corpus (Gretel: 'domain').",
+)
+@click.option(
     "--out",
     "out_jsonl",
     type=click.Path(path_type=Path),
@@ -408,6 +427,9 @@ def build_teacher_cache_cmd(
     omnisql_max_rows: int | None,
     omnisql_parquet_glob: str | None,
     omnisql_dataset_id: str,
+    omnisql_question_key: str,
+    omnisql_sql_key: str,
+    omnisql_db_id_key: str,
     out_jsonl: Path,
     dialect: str,
 ) -> None:
@@ -453,6 +475,9 @@ def build_teacher_cache_cmd(
             dialect=dialect,
             max_rows=omnisql_max_rows,
             parquet_glob=omnisql_parquet_glob,
+            question_key=omnisql_question_key,
+            sql_key=omnisql_sql_key,
+            db_id_key=omnisql_db_id_key,
         )
     else:
         stats = build_teacher_cache(
