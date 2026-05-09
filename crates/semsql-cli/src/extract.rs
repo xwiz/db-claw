@@ -61,19 +61,31 @@ pub async fn run_db_only(db_url: &str, out: &Path) -> Result<ExtractSummary> {
         // Postgres can return `schema.table` for non-default schemas;
         // collapse to the bare canonical name (the SemanticGraph already
         // tracks schema separately on the entity row).
-        let (canonical, schema) = match table.split_once('.') {
+        let (raw_table, schema) = match table.split_once('.') {
             Some((s, t)) => (t.to_string(), Some(s.to_string())),
             None => (table.clone(), None),
         };
-        if !is_safe_canonical(&canonical) {
-            tracing::warn!(table = %table, "skipping table — name fails canonical allow-list");
-            continue;
-        }
+        // Canonical entity names are always lowercased — model weights trained
+        // on lowercase snake_case names (Spider/BIRD). db_table preserves original.
+        let canonical = if is_safe_canonical(&raw_table) {
+            raw_table.to_lowercase()
+        } else {
+            match to_canonical_snake(&raw_table) {
+                Some(c) => {
+                    tracing::debug!(table = %raw_table, canonical = %c, "canonicalized non-standard table name");
+                    c
+                }
+                None => {
+                    tracing::warn!(table = %table, "skipping table — name fails canonical allow-list");
+                    continue;
+                }
+            }
+        };
         insert_entity(
             &conn,
             EntityInsert {
                 canonical_name: &canonical,
-                db_table: &canonical,
+                db_table: &raw_table,
                 db_schema: schema.as_deref(),
                 singular_label: None,
                 plural_label: None,
@@ -105,24 +117,52 @@ pub async fn run_db_only(db_url: &str, out: &Path) -> Result<ExtractSummary> {
         .await
         .map_err(|e| anyhow::anyhow!("list_columns: {e}"))?;
     for col in columns {
-        let canonical_table = col
+        let raw_col_table = col
             .table
             .split_once('.')
             .map(|(_, t)| t.to_string())
             .unwrap_or_else(|| col.table.clone());
-        if !is_safe_canonical(&canonical_table) || !is_safe_canonical(&col.column) {
-            tracing::warn!(
-                table = %col.table,
-                column = %col.column,
-                "skipping field — non-canonical identifier"
-            );
-            continue;
-        }
+        let canonical_table = if is_safe_canonical(&raw_col_table) {
+            raw_col_table.to_lowercase()
+        } else {
+            match to_canonical_snake(&raw_col_table) {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(table = %col.table, "skipping field — table name not canonicalisable");
+                    continue;
+                }
+            }
+        };
+        // Canonical field names are always lowercased — model weights trained
+        // on lowercase names. db_column preserves original for SQL emit.
+        let canonical_col = if is_safe_canonical(&col.column) {
+            col.column.to_lowercase()
+        } else {
+            match to_canonical_snake(&col.column) {
+                Some(c) => {
+                    tracing::debug!(
+                        table = %col.table,
+                        column = %col.column,
+                        canonical = %c,
+                        "canonicalized non-standard column name"
+                    );
+                    c
+                }
+                None => {
+                    tracing::warn!(
+                        table = %col.table,
+                        column = %col.column,
+                        "skipping field — column name not canonicalisable"
+                    );
+                    continue;
+                }
+            }
+        };
         insert_field(
             &conn,
             FieldInsert {
                 entity: &canonical_table,
-                field: &col.column,
+                field: &canonical_col,
                 db_column: &col.column,
                 field_type: &col.data_type,
                 display_label: None,
@@ -132,6 +172,26 @@ pub async fn run_db_only(db_url: &str, out: &Path) -> Result<ExtractSummary> {
         )
         .map_err(|e| anyhow::anyhow!("insert_field({}.{}): {e}", col.table, col.column))?;
         summary.field_count += 1;
+
+        // Register field in vocabulary so Stage 1 (schema linker) can
+        // score it. canonical_value is "entity.field" as expected by
+        // collect_schema_items in stage_linker.rs.
+        let field_vocab_value = format!("{canonical_table}.{canonical_col}");
+        insert_vocab(
+            &conn,
+            VocabInsert {
+                term: &canonical_col,
+                canonical_kind: "field",
+                canonical_value: &field_vocab_value,
+                confidence: 0.5,
+                source_layer: SOURCE_LAYER_DB_SCHEMA,
+                source_locator: None,
+            },
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("insert_vocab(field {}.{}): {e}", col.table, col.column)
+        })?;
+        summary.vocab_count += 1;
     }
 
     let schema_hash = compute_schema_hash(&summary, &tables);
@@ -327,6 +387,31 @@ fn is_safe_canonical(s: &str) -> bool {
     let first = bytes.next().unwrap();
     (first.is_ascii_alphabetic() || first == b'_')
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Convert an arbitrary DB identifier (spaces, parens, slashes, etc.) to a
+/// `[a-z_][a-z0-9_]{0,62}` canonical form. Used so BIRD-style columns like
+/// "Free Meal Count (K-12)" become "free_meal_count_k_12" in the graph while
+/// the original string is preserved as `db_column`/`db_table` for SQL emit.
+/// Returns `None` when the result would be empty after stripping non-word chars.
+fn to_canonical_snake(s: &str) -> Option<String> {
+    let lowered: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    // Collapse consecutive underscores and drop empty segments.
+    let parts: Vec<&str> = lowered.split('_').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut result = parts.join("_");
+    // Ensure it doesn't start with a digit.
+    if result.starts_with(|c: char| c.is_ascii_digit()) {
+        result.insert(0, '_');
+    }
+    // Truncate to 63 chars.
+    result.truncate(63);
+    if result.is_empty() { None } else { Some(result) }
 }
 
 fn compute_schema_hash(summary: &ExtractSummary, tables: &[String]) -> String {

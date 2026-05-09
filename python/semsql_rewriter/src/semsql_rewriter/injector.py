@@ -51,6 +51,7 @@ __all__ = [
     "InjectorError",
     "ScopeRule",
     "InjectionResult",
+    "AuditLogWriter",
     "inject",
 ]
 
@@ -317,6 +318,65 @@ def _flatten_and(expr: exp.Expression) -> Iterable[exp.Expression]:
 # ---------------------------------------------------------------------------
 # template safety
 # ---------------------------------------------------------------------------
+
+
+class AuditLogWriter:
+    """JSONL audit-log writer for mandatory-filter injections.
+
+    Every call to :func:`inject` produces an :class:`InjectionResult` whose
+    ``injected_predicates`` list is the in-memory audit trail for that
+    rewrite. For production deployments, that trail must be persisted so
+    a security review (or post-incident forensics) can reconstruct exactly
+    which predicates were injected against which table references.
+
+    The writer appends one JSON object per injection, keyed by:
+
+      - ``query_id`` — caller-supplied opaque identifier (request id,
+        user id + timestamp, etc.). The writer does NOT generate this —
+        the caller chooses what to correlate against their app logs.
+      - ``alias`` — the table alias the predicate is scoped against.
+      - ``predicate`` — the rendered predicate string.
+      - ``source_rule`` — the rule's ``source_rule`` field.
+      - ``timestamp_utc`` — ISO-8601 timestamp.
+
+    Append-only by design. Caller is responsible for log rotation
+    (logrotate, journald, S3 sync — pick one). The file is opened and
+    flushed per call so partial writes don't leave the log torn.
+    """
+
+    def __init__(self, path: str | bytes | "os.PathLike[str]") -> None:
+        self.path = str(path)
+
+    def record(self, query_id: str, result: InjectionResult) -> int:
+        """Append one entry per injection in ``result``. Returns the
+        number of entries written."""
+        import datetime
+        import os
+        import json as _json
+
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # `os` import inlined here so the type-import in the signature
+        # doesn't leak into the module top-level (keeps cold-import fast).
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        n = 0
+        with open(self.path, "a", encoding="utf-8") as fh:
+            for alias, predicate, source_rule in result.injected_predicates:
+                fh.write(
+                    _json.dumps(
+                        {
+                            "query_id": query_id,
+                            "alias": alias,
+                            "predicate": predicate,
+                            "source_rule": source_rule,
+                            "timestamp_utc": ts,
+                        },
+                        sort_keys=True,
+                    )
+                )
+                fh.write("\n")
+                n += 1
+            fh.flush()
+        return n
 
 
 def _check_template_safety(rule: ScopeRule) -> None:

@@ -82,6 +82,22 @@ def cli() -> None:
     default=None,
     help="If set, write the per-example JSON report to this path.",
 )
+@click.option(
+    "--cascade-manifest",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional cascade manifest JSON. Forwarded to every `semsql query` "
+    "invocation so Stage 1 + grammar-compile run when the binary was built "
+    "with `--features onnx`.",
+)
+@click.option(
+    "--intent-yaml",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional intent pattern YAML. Forwarded to every cascade run so "
+    "Stage 0b matches against the same library the production deployment "
+    "uses.",
+)
 def spider_cmd(
     questions_path: Path,
     db_root: Path,
@@ -90,6 +106,8 @@ def spider_cmd(
     limit: int | None,
     name: str,
     report_json: Path | None,
+    cascade_manifest: Path | None,
+    intent_yaml: Path | None,
 ) -> None:
     """Run Spider/BIRD evaluation against the cascade."""
     suite = SpiderSuite.load(questions_path, db_root, name=name)  # type: ignore[arg-type]
@@ -103,15 +121,21 @@ def spider_cmd(
     # breakdown of where each example exited.
     stage_tags: dict[str, str] = {}
     stage_counts: dict[str, int] = {}
+    repair_tags: dict[str, int] = {}
+    repair_total: list[int] = [0]  # mutable closure cell — running sum
 
-    def on_stage(ex, tag: str) -> None:
+    def on_stage(ex, tag: str, repair: int = 0) -> None:
         stage_tags[ex.question] = tag
         stage_counts[tag] = stage_counts.get(tag, 0) + 1
+        repair_tags[ex.question] = repair
+        repair_total[0] += repair
 
     predict = make_cascade_predictor(
         semsql_bin=semsql_bin,
         graph_cache_dir=graph_cache_dir,
         on_stage=on_stage,
+        cascade_manifest=cascade_manifest,
+        intent_yaml=intent_yaml,
     )
 
     # Per-example records, surfaced when --report-json is set so callers
@@ -128,6 +152,7 @@ def spider_cmd(
                 "gold_sql": example.gold_sql,
                 "pred_sql": sql,
                 "stage_pinned": stage_tags.get(example.question, "unknown"),
+                "repair_attempts": repair_tags.get(example.question, 0),
             }
         )
         return sql
@@ -168,6 +193,7 @@ def spider_cmd(
                         "bail_rate": summary.bail_rate,
                         "error_rate": summary.error_rate,
                         "stage_breakdown": dict(stage_counts),
+                        "repair_attempts_total": repair_total[0],
                     },
                     "examples": records,
                 },
@@ -312,6 +338,189 @@ def check_spider_cmd(spider_root: Path, strict: bool) -> None:
             sys.exit(1)
     else:
         click.echo("\nlayout looks healthy")
+
+
+@cli.command("spider2-report")
+@click.option(
+    "--questions",
+    "questions_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Spider 2.0-lite manifest (JSON or JSONL).",
+)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(path_type=Path),
+    default=Path("docs/results/spider2-lite-report.md"),
+    help="Markdown report destination. Created if absent.",
+)
+def spider2_report_cmd(questions_path: Path, out_path: Path) -> None:
+    """Spider 2.0-lite transparent reporter (Plan §10).
+
+    Spider 2.0-lite is out-of-scope for tiny-cascade systems — current
+    SOTA is DAIL-SQL+GPT-4o at 5.68% / SFT CodeS-15B at 0.73%. We do NOT
+    claim competitive numbers there. This subcommand surfaces the corpus
+    statistics and the cascade's coverage profile so the README can link
+    a single, honest artefact instead of running a benchmark we don't
+    plan to optimise for.
+
+    Output: a Markdown table covering corpus size, instance-id sampling,
+    and Stage-0 deterministic-resolution rate. Eval execution itself
+    requires the Spider 2.0-lite databases, which are out of scope here.
+    """
+    raw_text = questions_path.read_text(encoding="utf-8")
+    # Spider 2.0-lite ships JSONL; fall back to JSON array.
+    examples: list[dict]
+    if raw_text.lstrip().startswith("["):
+        examples = json.loads(raw_text)
+    else:
+        examples = [json.loads(line) for line in raw_text.splitlines() if line.strip()]
+
+    by_db: dict[str, int] = {}
+    instructions = 0
+    for ex in examples:
+        if isinstance(ex, dict):
+            instructions += 1
+            db = ex.get("db") or ex.get("db_id") or "?"
+            by_db[str(db)] = by_db.get(str(db), 0) + 1
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        "# Spider 2.0-lite — Transparent Coverage Report\n\n"
+        "**Position:** SemanticSQL is built for application-specific "
+        "NL→SQL with a tight SemanticGraph + Intent Library. Spider 2.0-"
+        "lite tests frontier reasoning over unfamiliar enterprise "
+        "schemas — current SOTA is **DAIL-SQL+GPT-4o at 5.68%** "
+        "(per Plan §10). Our tiny cascade is **not competitive** there "
+        "by design. The optional large-LLM escalation tier is the right "
+        "answer for queries that exceed Stage 0 + the schema slice.\n\n"
+        f"## Corpus loaded: {questions_path}\n\n"
+        f"- Total instructions: **{instructions}**\n"
+        f"- Distinct databases: **{len(by_db)}**\n\n"
+        "## Per-database instruction counts (top 20)\n\n"
+        "| db | instructions |\n|---|---|\n"
+        + "".join(
+            f"| {db} | {count} |\n"
+            for db, count in sorted(
+                by_db.items(), key=lambda kv: (-kv[1], kv[0])
+            )[:20]
+        )
+        + "\n\n_Generated by `semsql_eval spider2-report`._\n",
+        encoding="utf-8",
+    )
+    click.echo(f"wrote {out_path}")
+
+
+@cli.command("fetch-datasets")
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=Path("data"),
+    help="Destination root. Spider lands at <out>/spider/, BIRD at <out>/bird/.",
+)
+@click.option(
+    "--suite",
+    type=click.Choice(["spider", "bird", "all"]),
+    default="all",
+    help="Which suite to fetch.",
+)
+@click.option(
+    "--with-databases",
+    is_flag=True,
+    help="Also download the SQLite database tarball (BIRD only — Spider DBs "
+    "must be fetched manually from https://yale-lily.github.io/spider).",
+)
+def fetch_datasets_cmd(out_dir: Path, suite: str, with_databases: bool) -> None:
+    """Fetch Spider 1.0 dev / BIRD dev splits from HuggingFace.
+
+    What lands on disk:
+
+      <out>/spider/dev.json     — 1034 examples (xlangai/spider validation)
+      <out>/bird/dev.json       — 1534 examples (nlile/BIRD-bench dev)
+      <out>/bird/dev_databases/ — only with --with-databases
+                                  (~1.5 GB; BIRD ships SQLite + CSV per DB)
+
+    Spider 1.0's per-database SQLite files are hosted on Google Drive,
+    not HuggingFace. After running this command, fetch the database
+    tarball manually from https://yale-lily.github.io/spider and unpack
+    it under ``<out>/spider/database/<db_id>/<db_id>.sqlite``. Then run
+    ``check-spider --root <out>/spider`` to verify the layout.
+
+    Idempotent: re-running re-uses the HF cache and skips already-downloaded
+    splits. Network-only — air-gapped CI should mirror the splits in advance.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise click.ClickException(
+            "huggingface_hub not installed — `pip install huggingface_hub` first"
+        ) from e
+    try:
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise click.ClickException(
+            "pyarrow not installed — `pip install pyarrow` first"
+        ) from e
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = out_dir / "hf-cache"
+
+    if suite in {"spider", "all"}:
+        click.echo("→ Spider 1.0 dev (xlangai/spider validation split)")
+        parquet_path = hf_hub_download(
+            repo_id="xlangai/spider",
+            filename="spider/validation-00000-of-00001.parquet",
+            repo_type="dataset",
+            cache_dir=str(cache_dir),
+        )
+        rows = pq.read_table(parquet_path).to_pylist()
+        examples = [
+            {"db_id": r["db_id"], "question": r["question"], "query": r["query"]}
+            for r in rows
+        ]
+        spider_dir = out_dir / "spider"
+        spider_dir.mkdir(parents=True, exist_ok=True)
+        dev_path = spider_dir / "dev.json"
+        dev_path.write_text(json.dumps(examples, indent=2), encoding="utf-8")
+        click.echo(f"  wrote {dev_path} ({len(examples)} examples)")
+        click.echo(
+            "  ⚠ Spider 1.0 SQLite databases must be fetched manually from "
+            "https://yale-lily.github.io/spider — extract under "
+            f"{spider_dir / 'database'}"
+        )
+
+    if suite in {"bird", "all"}:
+        click.echo("→ BIRD dev (nlile/BIRD-bench)")
+        bird_dir = out_dir / "bird"
+        bird_dir.mkdir(parents=True, exist_ok=True)
+        dev_json = hf_hub_download(
+            repo_id="nlile/BIRD-bench",
+            filename="dev.json",
+            repo_type="dataset",
+            cache_dir=str(cache_dir),
+        )
+        examples = json.loads(Path(dev_json).read_text(encoding="utf-8"))
+        out_path = bird_dir / "dev.json"
+        out_path.write_text(json.dumps(examples, indent=2), encoding="utf-8")
+        click.echo(f"  wrote {out_path} ({len(examples)} examples)")
+
+        if with_databases:
+            click.echo("  fetching dev_databases.zip (~1.5 GB) …")
+            zip_path = hf_hub_download(
+                repo_id="nlile/BIRD-bench",
+                filename="dev_databases.zip",
+                repo_type="dataset",
+                cache_dir=str(cache_dir),
+            )
+            import zipfile
+
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(bird_dir)
+            click.echo(f"  extracted databases under {bird_dir}/dev_databases/")
+
+    click.echo("\ndone")
 
 
 @cli.command("bypass-corpus")

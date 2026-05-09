@@ -9,5 +9,15 @@ description = "Last-mile SQL dialect renderer — AST → dialect-specific strin
 
 [dependencies]
 semsql-core = { path = "../semsql-core" }
+semsql-natsql = { path = "../semsql-natsql" }
 sqlparser.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Differential render tests execute every dialect's output against an
+# in-memory SQLite. SQLite accepts both double-quoted (PG/SQLite/DuckDB/
+# Snowflake) and backtick-quoted (MySQL) identifiers via its MySQL-compat
+# parsing path. MSSQL `[name]` brackets and BigQuery dataset paths are
+# checked structurally in the lib tests but not executed against an
+# engine — they need their own dedicated runners.
+rusqlite = { workspace = true }

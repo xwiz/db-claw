@@ -75,8 +75,11 @@ impl Linker {
             model,
             entities,
             fields,
-            top_k_entities: 5,
-            top_k_fields: 10,
+            // Spider training distribution: 1-2 entities, 1-3 fields.
+            // Sending more schema context degrades the skeleton decoder
+            // (out-of-distribution). Revise after Phase D retraining.
+            top_k_entities: 2,
+            top_k_fields: 4,
             intent_bias: 0.3,
         })
     }

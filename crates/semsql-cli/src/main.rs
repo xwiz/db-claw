@@ -52,6 +52,30 @@ enum Cmd {
         graph: PathBuf,
         /// Natural-language question.
         nl: String,
+        /// Optional target dialect for the final SQL emit. Defaults
+        /// to the cascade's dialect-agnostic output. Supported:
+        /// `postgres`, `mysql`, `sqlite`, `mssql`, `bigquery`,
+        /// `snowflake`, `duckdb`. Unknown names fail-closed with a
+        /// clear error.
+        #[arg(long)]
+        dialect: Option<String>,
+        /// Optional cascade manifest JSON. When supplied AND the
+        /// binary was built with `--features onnx`, queries that
+        /// fall through Stage 0a are routed through Stage 1 (schema
+        /// linker) and the grammar compiler. Stage 2 weights ship in
+        /// a future cut — until then the cascade surfaces a clear
+        /// "Stage 2 not yet shipped" error rather than guessing.
+        /// Without `--features onnx`, this flag is silently ignored
+        /// and the deterministic-only cascade is used.
+        #[arg(long)]
+        cascade_manifest: Option<PathBuf>,
+        /// Optional intent pattern YAML to load alongside the
+        /// graph. When omitted, Stage 0b's intent matcher is empty
+        /// (queries like `top 5 spenders` need either an explicit
+        /// `by <field>` tail or an intent library to resolve at
+        /// Stage 0a).
+        #[arg(long)]
+        intent_yaml: Option<PathBuf>,
     },
 
     /// Surface conflicts and deployment-readiness warnings.
@@ -73,6 +97,48 @@ enum Cmd {
         /// CI runs without re-running the eval.
         #[arg(long)]
         eval_report: Option<PathBuf>,
+        /// Optional starter `semsql.overrides.yaml` writer. When set,
+        /// doctor generates a YAML scaffold from every `conflict_log`
+        /// row's `suggested_override` so users can edit + commit a
+        /// concrete tie-breaker rather than re-run extraction with
+        /// matching label changes. Existing target files are NOT
+        /// overwritten — fail closed if the path is occupied.
+        #[arg(long)]
+        write_overrides: Option<PathBuf>,
+        /// Optional drilldown into the per-example records of an
+        /// eval report. When paired with `--eval-report` and a
+        /// positive `--examples N`, doctor prints the first N
+        /// non-correct examples (bailed, errored, or wrong) with
+        /// their stage tag, gold SQL, and predicted SQL — fastest
+        /// path from "exec_acc dropped" to a concrete cascade bug.
+        #[arg(long, default_value_t = 0)]
+        examples: u32,
+        /// Fail-closed RLS gate. When set, doctor exits non-zero if
+        /// the SemanticGraph declares any tenanted entity *unless*
+        /// every one of those entities was successfully verified to
+        /// have RLS enabled with at least one policy via `--db-url`.
+        /// Use this in CI to block production promotion when the
+        /// RLS posture is unknown — never silently. Without
+        /// `--db-url` and with at least one scoped entity, this flag
+        /// always exits non-zero.
+        #[arg(long)]
+        rls_strict: bool,
+        /// Machine-readable doctor output. With `--format json`
+        /// every diagnostic — coverage stats, conflict log, RLS
+        /// status, eval breakdown — is emitted as a single JSON
+        /// document on stdout. Suitable for CI parsing. The default
+        /// (`text`) renders the human-friendly form.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Optional cascade manifest JSON. When supplied, doctor
+        /// validates the manifest schema, asserts every referenced
+        /// ONNX file + tokenizer exists, and surfaces the cascade
+        /// version. If this binary was compiled WITHOUT
+        /// `--features onnx`, doctor warns that the manifest cannot
+        /// be loaded at query time (`semsql query` will silently
+        /// ignore it and run the deterministic-only cascade).
+        #[arg(long)]
+        cascade_manifest: Option<PathBuf>,
     },
 
     /// Run an evaluation suite against a graph + cascade.
@@ -109,13 +175,42 @@ async fn main() -> Result<()> {
             .await
         }
 
-        Cmd::Query { graph, nl } => cmd_query(&graph, &nl),
+        Cmd::Query {
+            graph,
+            nl,
+            dialect,
+            cascade_manifest,
+            intent_yaml,
+        } => cmd_query(
+            &graph,
+            &nl,
+            dialect.as_deref(),
+            cascade_manifest.as_deref(),
+            intent_yaml.as_deref(),
+        ),
 
         Cmd::Doctor {
             graph,
             db_url,
             eval_report,
-        } => cmd_doctor(&graph, db_url.as_deref(), eval_report.as_deref()).await,
+            write_overrides,
+            examples,
+            rls_strict,
+            format,
+            cascade_manifest,
+        } => {
+            cmd_doctor(
+                &graph,
+                db_url.as_deref(),
+                eval_report.as_deref(),
+                write_overrides.as_deref(),
+                examples,
+                rls_strict,
+                &format,
+                cascade_manifest.as_deref(),
+            )
+            .await
+        }
 
         Cmd::Eval { suite, graph } => cmd_eval(&suite, &graph),
     }
@@ -174,22 +269,35 @@ async fn cmd_extract(
     }
 }
 
-fn cmd_query(graph: &std::path::Path, nl: &str) -> Result<()> {
-    let cascade = semsql_runtime::Cascade::load(graph, None)
-        .with_context(|| format!("loading cascade from {}", graph.display()))?;
+fn cmd_query(
+    graph: &std::path::Path,
+    nl: &str,
+    dialect: Option<&str>,
+    cascade_manifest: Option<&std::path::Path>,
+    intent_yaml: Option<&std::path::Path>,
+) -> Result<()> {
+    let target_dialect = match dialect {
+        None => None,
+        Some(name) => Some(parse_dialect(name)?),
+    };
+    let cascade =
+        semsql_runtime::Cascade::load_with_manifest(graph, intent_yaml, cascade_manifest)
+            .with_context(|| format!("loading cascade from {}", graph.display()))?;
     match cascade.run(nl) {
         Ok(out) => {
-            println!("{}", out.sql_text);
-            // Tag the stage that pinned this query so downstream eval
-            // tooling (`semsql_eval.cascade_runner`) can bin examples
-            // by which stage they exited at. Today only Stage 0a /
-            // Stage 4 reach the success path; once Stage 1+ models
-            // ship, the runtime will emit stage_1/stage_2/stage_3
-            // here too.
-            eprintln!("stage_pinned=stage_0a");
+            let final_sql = match target_dialect {
+                Some(d) => semsql_renderer::render_text(&out.sql_text, d)
+                    .with_context(|| format!("dialect render `{d:?}`"))?,
+                None => out.sql_text.clone(),
+            };
+            println!("{final_sql}");
+            eprintln!("stage_pinned={}", out.stage_pinned);
+            eprintln!("repair_attempts={}", out.repair_attempts);
             eprintln!(
-                "stage_0a={}us stage_0b={}us stage_4={}us",
-                out.timings_us.stage_0a, out.timings_us.stage_0b, out.timings_us.stage_4
+                "stage_0a={}us stage_0b={}us stage_1={}us stage_2={}us stage_3={}us stage_4={}us",
+                out.timings_us.stage_0a, out.timings_us.stage_0b,
+                out.timings_us.stage_1, out.timings_us.stage_2,
+                out.timings_us.stage_3, out.timings_us.stage_4,
             );
             if !out.intent_hints.is_empty() {
                 eprintln!("intents: {}", out.intent_hints.join(", "));
@@ -212,11 +320,51 @@ fn cmd_query(graph: &std::path::Path, nl: &str) -> Result<()> {
     }
 }
 
+/// Parse a `--dialect` CLI argument into the renderer's [`Dialect`]
+/// enum. Aliases match the canonical engine names users type by hand.
+fn parse_dialect(name: &str) -> Result<semsql_renderer::Dialect> {
+    use semsql_renderer::Dialect;
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "postgres" | "postgresql" | "pg" => Dialect::Postgres,
+        "mysql" | "mariadb" => Dialect::MySql,
+        "sqlite" | "sqlite3" => Dialect::Sqlite,
+        "mssql" | "sqlserver" => Dialect::MsSql,
+        "bigquery" | "bq" => Dialect::BigQuery,
+        "snowflake" => Dialect::Snowflake,
+        "duckdb" => Dialect::DuckDb,
+        other => anyhow::bail!(
+            "unknown dialect `{other}` — supported: postgres, mysql, sqlite, mssql, bigquery, snowflake, duckdb"
+        ),
+    })
+}
+
 async fn cmd_doctor(
     graph: &std::path::Path,
     db_url: Option<&str>,
     eval_report: Option<&std::path::Path>,
+    write_overrides: Option<&std::path::Path>,
+    examples: u32,
+    rls_strict: bool,
+    format: &str,
+    cascade_manifest: Option<&std::path::Path>,
 ) -> Result<()> {
+    match format {
+        "text" => {}
+        "json" => {
+            return cmd_doctor_json(
+                graph,
+                db_url,
+                eval_report,
+                write_overrides,
+                rls_strict,
+                cascade_manifest,
+            )
+            .await;
+        }
+        other => anyhow::bail!(
+            "unknown --format `{other}` — supported: text, json"
+        ),
+    }
     let cov = semsql_graph::read::coverage(graph)
         .with_context(|| format!("reading coverage from {}", graph.display()))?;
     let conflicts = semsql_graph::read::conflicts(graph)
@@ -258,7 +406,18 @@ async fn cmd_doctor(
         }
     }
 
+    if let Some(out_path) = write_overrides {
+        write_overrides_yaml(out_path, &conflicts)?;
+        println!();
+        println!(
+            "wrote {} conflict scaffold(s) to {}",
+            conflicts.len(),
+            out_path.display()
+        );
+    }
+
     let mut rls_problems = 0usize;
+    let mut rls_unverified = false;
     if !cov.scoped_entities.is_empty() {
         println!();
         println!(
@@ -277,6 +436,23 @@ async fn cmd_doctor(
             rls_problems = run_rls_check(url, &cov.scoped_entities).await?;
         } else {
             println!("  hint: re-run with `--db-url <url>` to verify RLS is actually on.");
+            rls_unverified = true;
+        }
+
+        if rls_strict && (rls_problems > 0 || rls_unverified) {
+            println!();
+            if rls_unverified {
+                println!(
+                    "rls-strict: graph declares {} tenanted entit{} but RLS posture was not \
+                     verified — supply `--db-url` to confirm.",
+                    cov.scoped_entities.len(),
+                    if cov.scoped_entities.len() == 1 { "y" } else { "ies" },
+                );
+            } else {
+                println!(
+                    "rls-strict: {rls_problems} tenanted table(s) failed RLS verification."
+                );
+            }
         }
     }
 
@@ -284,9 +460,171 @@ async fn cmd_doctor(
     if let Some(report_path) = eval_report {
         println!();
         cascade_problems = render_eval_report(report_path)?;
+        if examples > 0 {
+            render_eval_examples(report_path, examples as usize)?;
+        }
     }
 
-    if !conflicts.is_empty() || rls_problems > 0 || cascade_problems > 0 {
+    let mut manifest_problems = 0usize;
+    if let Some(manifest_path) = cascade_manifest {
+        println!();
+        manifest_problems = render_manifest_report(manifest_path)?;
+    }
+
+    let strict_rls_block = rls_strict && (rls_problems > 0 || rls_unverified);
+    if !conflicts.is_empty()
+        || rls_problems > 0
+        || cascade_problems > 0
+        || strict_rls_block
+        || manifest_problems > 0
+    {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// JSON-format doctor renderer. Emits a single document with every
+/// diagnostic the text path surfaces, suitable for CI parsing.
+/// Schema is intentionally flat — keys map directly to the text
+/// blocks (`coverage`, `conflicts`, `rls`, `eval_report`).
+async fn cmd_doctor_json(
+    graph: &std::path::Path,
+    db_url: Option<&str>,
+    eval_report: Option<&std::path::Path>,
+    write_overrides: Option<&std::path::Path>,
+    rls_strict: bool,
+    cascade_manifest: Option<&std::path::Path>,
+) -> Result<()> {
+    let cov = semsql_graph::read::coverage(graph)
+        .with_context(|| format!("reading coverage from {}", graph.display()))?;
+    let conflicts = semsql_graph::read::conflicts(graph)
+        .with_context(|| format!("reading conflict_log from {}", graph.display()))?;
+
+    let mut overrides_written: Option<String> = None;
+    if let Some(out_path) = write_overrides {
+        write_overrides_yaml(out_path, &conflicts)?;
+        overrides_written = Some(out_path.display().to_string());
+    }
+
+    // RLS probe — only attempt when `--db-url` supplied.
+    let mut rls_rows: Vec<serde_json::Value> = Vec::new();
+    let mut rls_problems = 0usize;
+    let mut rls_status = "skipped";
+    let mut rls_unverified = !cov.scoped_entities.is_empty() && db_url.is_none();
+    #[cfg(feature = "postgres")]
+    if let Some(url) = db_url {
+        if (url.starts_with("postgres:") || url.starts_with("postgresql:"))
+            && !cov.scoped_entities.is_empty()
+        {
+            use semsql_extract_db::PgIntrospect;
+            let intro = PgIntrospect::connect(url)
+                .await
+                .map_err(|e| anyhow::anyhow!("postgres connect: {e}"))?;
+            let rows = intro
+                .rls_status()
+                .await
+                .map_err(|e| anyhow::anyhow!("rls_status: {e}"))?;
+            let scoped: std::collections::HashSet<&str> =
+                cov.scoped_entities.iter().map(String::as_str).collect();
+            for r in rows {
+                let key = if r.schema == "public" {
+                    r.table.clone()
+                } else {
+                    format!("{}.{}", r.schema, r.table)
+                };
+                if !scoped.contains(key.as_str()) {
+                    continue;
+                }
+                let ok = r.rls_enabled && r.policy_count > 0;
+                if !ok {
+                    rls_problems += 1;
+                }
+                rls_rows.push(serde_json::json!({
+                    "table": key,
+                    "rls_enabled": r.rls_enabled,
+                    "policy_count": r.policy_count,
+                    "ok": ok,
+                }));
+            }
+            rls_status = "checked";
+            rls_unverified = false;
+        }
+    }
+    let _ = db_url;
+
+    // Eval report (optional).
+    let mut eval_block: Option<serde_json::Value> = None;
+    let mut cascade_problems = 0usize;
+    if let Some(path) = eval_report {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading eval report `{}`", path.display()))?;
+        let report: EvalReport = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing eval report `{}`", path.display()))?;
+        let (_, problems) = format_eval_report(path, &report);
+        cascade_problems = problems;
+        eval_block = Some(serde_json::json!({
+            "path": path.display().to_string(),
+            "summary": {
+                "suite": report.summary.suite,
+                "total": report.summary.total,
+                "correct": report.summary.correct,
+                "bailed": report.summary.bailed,
+                "errored": report.summary.errored,
+                "exec_acc": report.summary.exec_acc,
+                "bail_rate": report.summary.bail_rate,
+                "stage_breakdown": report.summary.stage_breakdown,
+            },
+        }));
+    }
+
+    // Cascade manifest validation (optional).
+    let mut manifest_block: Option<serde_json::Value> = None;
+    let mut manifest_problems = 0usize;
+    if let Some(p) = cascade_manifest {
+        let (block, probs) = manifest_report_payload(p);
+        manifest_block = Some(block);
+        manifest_problems = probs;
+    }
+
+    let strict_rls_block = rls_strict && (rls_problems > 0 || rls_unverified);
+    let exit_nonzero = !conflicts.is_empty()
+        || rls_problems > 0
+        || cascade_problems > 0
+        || strict_rls_block
+        || manifest_problems > 0;
+
+    let payload = serde_json::json!({
+        "graph": graph.display().to_string(),
+        "coverage": {
+            "entities": cov.entity_count,
+            "fields": cov.field_count,
+            "vocab": cov.vocab_count,
+            "enums": cov.enum_count,
+            "scopes": cov.scope_count,
+            "entities_lacking_ui_vocab": cov.entities_lacking_ui_vocab,
+            "scoped_entities": cov.scoped_entities,
+        },
+        "conflicts": conflicts.iter().map(|c| serde_json::json!({
+            "id": c.id,
+            "target": c.canonical_target,
+            "candidates_json": c.candidates_json,
+            "resolution": c.resolution,
+            "suggested_override": c.suggested_override,
+        })).collect::<Vec<_>>(),
+        "rls": {
+            "status": rls_status,
+            "unverified": rls_unverified,
+            "problems": rls_problems,
+            "rows": rls_rows,
+        },
+        "eval_report": eval_block,
+        "cascade_manifest": manifest_block,
+        "overrides_written": overrides_written,
+        "exit_nonzero": exit_nonzero,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    if exit_nonzero {
         std::process::exit(1);
     }
     Ok(())
@@ -301,6 +639,22 @@ const CASCADE_COVERAGE_WARN_THRESHOLD: f64 = 0.5;
 #[derive(serde::Deserialize)]
 struct EvalReport {
     summary: EvalReportSummary,
+    #[serde(default)]
+    examples: Vec<EvalExampleRecord>,
+}
+
+#[derive(serde::Deserialize, Clone)]
+struct EvalExampleRecord {
+    #[serde(default)]
+    db_id: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    gold_sql: String,
+    #[serde(default)]
+    pred_sql: String,
+    #[serde(default)]
+    stage_pinned: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -335,6 +689,150 @@ fn render_eval_report(path: &std::path::Path) -> Result<usize> {
     let (rendered, problems) = format_eval_report(path, &report);
     print!("{rendered}");
     Ok(problems)
+}
+
+/// Drill into the per-example records of a report and surface the
+/// first `n` non-correct examples (bailed / errored / wrong) with
+/// their stage tag, gold SQL, and predicted SQL. Skips the report
+/// when no per-example records exist (older eval runs without
+/// `--report-json`'s example dump).
+fn render_eval_examples(path: &std::path::Path, n: usize) -> Result<()> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading eval report `{}`", path.display()))?;
+    let report: EvalReport = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing eval report `{}`", path.display()))?;
+    if report.examples.is_empty() {
+        println!("  (no per-example records in this report — re-run with --report-json)");
+        return Ok(());
+    }
+    // Filter: skip clearly-correct rows. We don't have an exec-acc
+    // signal per row in the report, so the conservative filter
+    // surfaces every bail / error / unknown-stage row. `stage_0a` rows
+    // that succeeded are silently skipped.
+    let mut interesting: Vec<&EvalExampleRecord> = report
+        .examples
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.stage_pinned.as_str(),
+                "needs_model" | "error" | "timeout" | "unknown"
+            )
+        })
+        .collect();
+    if interesting.is_empty() {
+        // Fallback: print the first N records so users can still
+        // drill into a uniformly-correct run.
+        interesting = report.examples.iter().take(n).collect();
+    } else {
+        interesting.truncate(n);
+    }
+
+    println!();
+    println!("eval drilldown — first {} non-correct example(s):", interesting.len());
+    for (i, r) in interesting.iter().enumerate() {
+        println!(
+            "  [{i:>2}] db={} stage={} q={:?}",
+            r.db_id, r.stage_pinned, r.question
+        );
+        println!("       gold: {}", truncate(&r.gold_sql, 120));
+        println!("       pred: {}", truncate(&r.pred_sql, 120));
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("…");
+    out
+}
+
+/// Write a starter `semsql.overrides.yaml` from the conflict log's
+/// suggested-override hints. Each conflict becomes one entry with a
+/// commented-out `override:` line so the user can uncomment + tweak
+/// before committing. Refuses to overwrite an existing file — the
+/// expected workflow is "doctor writes once, user edits".
+fn write_overrides_yaml(
+    out_path: &std::path::Path,
+    conflicts: &[semsql_graph::read::ConflictLogRow],
+) -> Result<()> {
+    if out_path.exists() {
+        anyhow::bail!(
+            "refusing to overwrite existing {} — move it aside first",
+            out_path.display()
+        );
+    }
+    use std::fmt::Write as _;
+    let mut buf = String::new();
+    let _ = writeln!(
+        buf,
+        "# semsql vocabulary overrides — generated by `semsql doctor --write-overrides`."
+    );
+    let _ = writeln!(
+        buf,
+        "# Each entry is a tie-breaker for one conflict_log row. Uncomment the"
+    );
+    let _ = writeln!(
+        buf,
+        "# `override:` line and edit the value to lock the resolution before re-extracting."
+    );
+    let _ = writeln!(buf, "version: 1");
+    let _ = writeln!(buf, "overrides:");
+    if conflicts.is_empty() {
+        let _ = writeln!(buf, "  []  # no conflicts in the current graph");
+    } else {
+        for c in conflicts {
+            let _ = writeln!(buf, "  - id: {}", c.id);
+            let _ = writeln!(buf, "    target: {}", yaml_escape(&c.canonical_target));
+            let _ = writeln!(
+                buf,
+                "    candidates: {}",
+                yaml_escape(&c.candidates_json)
+            );
+            let _ = writeln!(buf, "    resolution: {}", yaml_escape(&c.resolution));
+            match &c.suggested_override {
+                Some(sug) => {
+                    let _ = writeln!(buf, "    # override: {}", yaml_escape(sug));
+                }
+                None => {
+                    let _ = writeln!(
+                        buf,
+                        "    # override: <fill in — no suggestion was generated>"
+                    );
+                }
+            }
+        }
+    }
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating dir for {}", out_path.display()))?;
+        }
+    }
+    std::fs::write(out_path, buf)
+        .with_context(|| format!("writing {}", out_path.display()))?;
+    Ok(())
+}
+
+/// Quote-and-escape for YAML scalar emission. We use the simple
+/// strategy of always double-quoting + backslash-escaping `"`/`\` —
+/// produces verbose but unambiguous output. Fine for diagnostic
+/// scaffolds; the user edits these by hand anyway.
+fn yaml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Pure formatter for an [`EvalReport`]. Returns the printable text
@@ -421,12 +919,105 @@ fn format_eval_report(path: &std::path::Path, report: &EvalReport) -> (String, u
     (out, problems)
 }
 
+/// Compile-time flag set when this binary was built with
+/// `--features onnx`. The cascade manifest is only honoured at query
+/// time on onnx builds; doctor warns when this is `false` so operators
+/// don't ship with a manifest the runtime silently ignores.
+const IS_ONNX_BUILD: bool = cfg!(feature = "onnx");
+
+/// Validate a cascade manifest at `path` and print a human-readable
+/// summary. Returns the count of deployment-blocking problems.
+///
+/// Problems counted:
+///  - manifest fails to load (schema version too new, missing files,
+///    malformed JSON)
+///  - binary built without `--features onnx` (manifest can't be used
+///    at query time — counts as 1 problem so CI catches the misconfig)
+fn render_manifest_report(path: &std::path::Path) -> Result<usize> {
+    use semsql_runtime::manifest::CascadeManifest;
+    println!("cascade manifest: {}", path.display());
+    let manifest = match CascadeManifest::load(path) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("  load failed: {e}");
+            return Ok(1);
+        }
+    };
+    println!(
+        "  schema_version={} cascade_version={}",
+        manifest.schema_version, manifest.cascade_version
+    );
+    println!(
+        "  linker:      {} ({} params)",
+        manifest.linker.path.display(),
+        manifest.linker.params
+    );
+    println!(
+        "  skeleton:    {} ({} params)",
+        manifest.skeleton.path.display(),
+        manifest.skeleton.params
+    );
+    println!(
+        "  slot_filler: {} ({} params)",
+        manifest.slot_filler.path.display(),
+        manifest.slot_filler.params
+    );
+    let mut problems = 0usize;
+    if !IS_ONNX_BUILD {
+        println!();
+        println!(
+            "warning: this binary was built WITHOUT `--features onnx`. The \
+             manifest validates fine, but `semsql query --cascade-manifest` \
+             will silently ignore it and run the deterministic-only cascade. \
+             Rebuild with `cargo build -p semsql-cli --features onnx` to \
+             enable Stage 1+ inference."
+        );
+        problems += 1;
+    }
+    Ok(problems)
+}
+
+/// JSON-shape sibling of [`render_manifest_report`]. Returns the
+/// JSON block + the same problem count.
+fn manifest_report_payload(path: &std::path::Path) -> (serde_json::Value, usize) {
+    use semsql_runtime::manifest::CascadeManifest;
+    let load = CascadeManifest::load(path);
+    match load {
+        Err(e) => (
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "ok": false,
+                "error": format!("{e}"),
+                "onnx_build": IS_ONNX_BUILD,
+            }),
+            1,
+        ),
+        Ok(m) => {
+            let problems = if IS_ONNX_BUILD { 0 } else { 1 };
+            (
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "ok": true,
+                    "schema_version": m.schema_version,
+                    "cascade_version": m.cascade_version,
+                    "linker_params": m.linker.params,
+                    "skeleton_params": m.skeleton.params,
+                    "slot_filler_params": m.slot_filler.params,
+                    "onnx_build": IS_ONNX_BUILD,
+                }),
+                problems,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn report(stage_breakdown: &[(&str, u64)], total: u64, correct: u64) -> EvalReport {
         EvalReport {
+            examples: Vec::new(),
             summary: EvalReportSummary {
                 suite: Some("spider".into()),
                 total,
@@ -483,6 +1074,84 @@ mod tests {
         let (text, problems) = format_eval_report(std::path::Path::new("rep.json"), &r);
         assert_eq!(problems, 0);
         assert!(text.contains("eval pre-dates per-stage telemetry"));
+    }
+
+    #[test]
+    fn parse_dialect_accepts_canonical_aliases() {
+        use semsql_renderer::Dialect;
+        assert_eq!(parse_dialect("postgres").unwrap(), Dialect::Postgres);
+        assert_eq!(parse_dialect("postgresql").unwrap(), Dialect::Postgres);
+        assert_eq!(parse_dialect("PG").unwrap(), Dialect::Postgres);
+        assert_eq!(parse_dialect("mysql").unwrap(), Dialect::MySql);
+        assert_eq!(parse_dialect("MariaDB").unwrap(), Dialect::MySql);
+        assert_eq!(parse_dialect("sqlite").unwrap(), Dialect::Sqlite);
+        assert_eq!(parse_dialect("sqlite3").unwrap(), Dialect::Sqlite);
+        assert_eq!(parse_dialect("mssql").unwrap(), Dialect::MsSql);
+        assert_eq!(parse_dialect("duckdb").unwrap(), Dialect::DuckDb);
+    }
+
+    #[test]
+    fn parse_dialect_rejects_unknown() {
+        let err = parse_dialect("oracle").unwrap_err();
+        assert!(err.to_string().contains("unknown dialect `oracle`"));
+    }
+
+    #[test]
+    fn truncate_under_limit_keeps_string_intact() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_over_limit_appends_ellipsis() {
+        let out = truncate("abcdefgh", 4);
+        assert_eq!(out, "abcd…");
+    }
+
+    #[test]
+    fn yaml_escape_quotes_and_escapes_specials() {
+        assert_eq!(yaml_escape("plain"), "\"plain\"");
+        assert_eq!(yaml_escape("with \"quote\""), "\"with \\\"quote\\\"\"");
+        assert_eq!(yaml_escape("path\\to"), "\"path\\\\to\"");
+        assert_eq!(yaml_escape("a\nb"), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn write_overrides_yaml_refuses_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overrides.yaml");
+        std::fs::write(&p, "existing").unwrap();
+        let err = write_overrides_yaml(&p, &[]).unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn write_overrides_yaml_emits_empty_scaffold_for_no_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overrides.yaml");
+        write_overrides_yaml(&p, &[]).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("version: 1"));
+        assert!(body.contains("overrides:"));
+        assert!(body.contains("no conflicts in the current graph"));
+    }
+
+    #[test]
+    fn write_overrides_yaml_includes_conflict_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("overrides.yaml");
+        let conflicts = vec![semsql_graph::read::ConflictLogRow {
+            id: 7,
+            canonical_target: "users.status_code".into(),
+            candidates_json: r#"[{"layer":6,"term":"Status"},{"layer":2,"term":"status_code"}]"#
+                .into(),
+            resolution: "highest_layer_wins".into(),
+            suggested_override: Some("users.status_code <- Status".into()),
+        }];
+        write_overrides_yaml(&p, &conflicts).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("- id: 7"));
+        assert!(body.contains("target: \"users.status_code\""));
+        assert!(body.contains("# override: \"users.status_code <- Status\""));
     }
 
     #[test]

@@ -35,15 +35,32 @@ import {
     sanitiseLabel,
     SanitiserError,
     SourceLayer,
+    type LangIndex,
+    type LangIndexEntry,
     type VocabFragment,
 } from "@semsql/extractor-sdk";
+
+export type { LangIndex, LangIndexEntry };
 
 /** Result of one walk over a `lang/` directory. */
 export interface LangScanResult {
     fragments: VocabFragment[];
     /** Files we recognised as Laravel lang sources but couldn't fully parse. */
     skipped: Array<{ file: string; reason: string }>;
+    /**
+     * Raw key → label index. Maps the full dotted lang key
+     * (`users.full_name`) to its preferred-locale label string. Used
+     * by the Filament walker to resolve `->label(__('users.full_name'))`
+     * chains into concrete vocabulary fragments.
+     *
+     * Locale priority is `en` first (Laravel's default) then any other
+     * locale in walk order — first write wins. Multi-locale label
+     * resolution is downstream of this index; we ship the canonical
+     * "what the developer sees" label for vocabulary purposes.
+     */
+    index: LangIndex;
 }
+
 
 /**
  * Recursively scan `langDir` and emit vocabulary fragments. Locale-aware:
@@ -51,7 +68,11 @@ export interface LangScanResult {
  * surfaced for downstream multi-locale dedup logic.
  */
 export async function scanLangDir(langDir: string): Promise<LangScanResult> {
-    const result: LangScanResult = { fragments: [], skipped: [] };
+    const result: LangScanResult = {
+        fragments: [],
+        skipped: [],
+        index: new Map<string, LangIndexEntry>(),
+    };
     let entries: string[];
     try {
         entries = await fs.readdir(langDir);
@@ -68,11 +89,11 @@ export async function scanLangDir(langDir: string): Promise<LangScanResult> {
         if (stat.isDirectory()) {
             // lang/<locale>/...
             const locale = localeDirOrFile;
-            await scanLocaleDir(full, locale, result);
+            await scanLocaleDir(full, full, locale, result);
         } else if (localeDirOrFile.endsWith(".json")) {
-            // lang/<locale>.json
+            // lang/<locale>.json — flat key map, no group prefix.
             const locale = path.basename(localeDirOrFile, ".json");
-            await scanJsonFile(full, locale, result);
+            await scanJsonFile(full, "", locale, result);
         }
     }
     return result;
@@ -80,6 +101,7 @@ export async function scanLangDir(langDir: string): Promise<LangScanResult> {
 
 async function scanLocaleDir(
     dir: string,
+    localeRoot: string,
     locale: string,
     result: LangScanResult,
 ): Promise<void> {
@@ -94,13 +116,35 @@ async function scanLocaleDir(
         const stat = await fs.stat(full).catch(() => null);
         if (!stat) continue;
         if (stat.isDirectory()) {
-            await scanLocaleDir(full, locale, result); // nested groups
+            // Nested groups — `lang/<locale>/auth/passwords.php` →
+            // resolved as `auth.passwords.<key>` per Laravel's helper.
+            await scanLocaleDir(full, localeRoot, locale, result);
         } else if (entry.endsWith(".php")) {
-            await scanPhpFile(full, locale, result);
+            await scanPhpFile(full, groupPrefixFor(localeRoot, full, ".php"), locale, result);
         } else if (entry.endsWith(".json")) {
-            await scanJsonFile(full, locale, result);
+            // JSON inside a locale dir — Laravel doesn't formally
+            // support this layout, but real codebases ship it; treat
+            // it the same as PHP files for indexing purposes.
+            await scanJsonFile(full, groupPrefixFor(localeRoot, full, ".json"), locale, result);
         }
     }
+}
+
+/**
+ * Compute the group prefix for a lang file inside `localeRoot`.
+ *
+ *   localeRoot=lang/en, file=lang/en/auth/passwords.php → "auth.passwords"
+ *   localeRoot=lang/en, file=lang/en/users.php          → "users"
+ *
+ * Returns "" when the file is at the locale root with no group
+ * (shouldn't happen for PHP — Laravel always groups by filename — but
+ * defensive against unusual layouts).
+ */
+function groupPrefixFor(localeRoot: string, file: string, ext: string): string {
+    const rel = path.relative(localeRoot, file);
+    const noExt = rel.endsWith(ext) ? rel.slice(0, -ext.length) : rel;
+    const segs = noExt.split(/[\\/]/).filter((s) => s.length > 0);
+    return segs.join(".");
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +153,7 @@ async function scanLocaleDir(
 
 async function scanJsonFile(
     file: string,
+    groupPrefix: string,
     locale: string,
     result: LangScanResult,
 ): Promise<void> {
@@ -124,23 +169,25 @@ async function scanJsonFile(
         result.skipped.push({ file, reason: "top-level must be an object" });
         return;
     }
-    walkJson(data, [], file, locale, result);
+    walkJson(data, [], file, groupPrefix, locale, result);
 }
 
 function walkJson(
     node: unknown,
     keyStack: string[],
     file: string,
+    groupPrefix: string,
     locale: string,
     result: LangScanResult,
 ): void {
     if (typeof node === "string") {
+        recordIndex(keyStack, node, file, groupPrefix, locale, result, /*line*/ 1);
         emitFragment(keyStack, node, file, locale, result, /*line*/ 1);
         return;
     }
     if (!isPlainObject(node)) return;
     for (const [k, v] of Object.entries(node)) {
-        walkJson(v, [...keyStack, k], file, locale, result);
+        walkJson(v, [...keyStack, k], file, groupPrefix, locale, result);
     }
 }
 
@@ -164,6 +211,7 @@ function walkJson(
 
 async function scanPhpFile(
     file: string,
+    groupPrefix: string,
     locale: string,
     result: LangScanResult,
 ): Promise<void> {
@@ -180,7 +228,7 @@ async function scanPhpFile(
         result.skipped.push({ file, reason: "unbalanced `return [...]` block" });
         return;
     }
-    walkPhpArray(slice.inner, [], file, locale, result);
+    walkPhpArray(slice.inner, [], file, groupPrefix, locale, result);
 }
 
 function stripPhpComments(text: string): string {
@@ -240,6 +288,7 @@ function walkPhpArray(
     body: string,
     keyStack: string[],
     file: string,
+    groupPrefix: string,
     locale: string,
     result: LangScanResult,
 ): void {
@@ -278,19 +327,22 @@ function walkPhpArray(
                 result.skipped.push({ file, reason: "unbalanced nested array" });
                 return;
             }
-            walkPhpArray(slice.inner, [...keyStack, key.value], file, locale, result);
+            walkPhpArray(
+                slice.inner,
+                [...keyStack, key.value],
+                file,
+                groupPrefix,
+                locale,
+                result,
+            );
             i = slice.endExclusive;
         } else {
             const val = readPhpString(body, i);
             if (val) {
-                emitFragment(
-                    [...keyStack, key.value],
-                    val.value,
-                    file,
-                    locale,
-                    result,
-                    lineOf(body, i),
-                );
+                const stack = [...keyStack, key.value];
+                const ln = lineOf(body, i);
+                recordIndex(stack, val.value, file, groupPrefix, locale, result, ln);
+                emitFragment(stack, val.value, file, locale, result, ln);
                 i = val.end;
             } else {
                 // Non-string value — function call, constant, concat —
@@ -458,4 +510,45 @@ function emitFragment(
 
 function isPlainObject(x: unknown): x is Record<string, unknown> {
     return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+/**
+ * Record one (key, label) entry into the lang index. The Filament walker
+ * resolves `->label(__('users.full_name'))` chains against this index;
+ * the key here is the dotted form Laravel's `__()` helper accepts.
+ *
+ * For Laravel PHP lang files inside `lang/<locale>/...`, the
+ * `groupPrefix` is the filename's directory path relative to the locale
+ * root (e.g. `auth.passwords` for `lang/en/auth/passwords.php`). For
+ * top-level `lang/<locale>.json` flat-key files, `groupPrefix` is empty
+ * and the keys are taken verbatim.
+ *
+ * Locale priority: `en` overwrites; otherwise first write wins.
+ */
+function recordIndex(
+    keyStack: string[],
+    value: string,
+    file: string,
+    groupPrefix: string,
+    locale: string,
+    result: LangScanResult,
+    line: number,
+): void {
+    if (keyStack.length === 0 && groupPrefix === "") return;
+    const segs: string[] = [];
+    if (groupPrefix.length > 0) segs.push(...groupPrefix.split("."));
+    segs.push(...keyStack);
+    if (segs.length === 0) return;
+    const dotted = segs.join(".");
+    const existing = result.index.get(dotted);
+    const incoming: LangIndexEntry = { label: value, locale, file, line };
+    if (existing === undefined) {
+        result.index.set(dotted, incoming);
+        return;
+    }
+    // Locale priority: `en` (Laravel default) wins. Otherwise keep
+    // the first-seen entry — stable across walk-order.
+    if (existing.locale !== "en" && locale === "en") {
+        result.index.set(dotted, incoming);
+    }
 }

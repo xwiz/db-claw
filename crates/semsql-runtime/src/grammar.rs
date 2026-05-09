@@ -66,21 +66,34 @@ pub fn build_natsql_grammar(schema: &GrammarSchema) -> String {
 
     out.push_str("start: select_stmt\n\n");
 
+    // v0.3: join_clause* allows up to 3 INNER JOINs after the FROM entity.
     out.push_str("select_stmt: \"SELECT\" select_list \"FROM\" entity ");
-    out.push_str("where_clause? group_clause? order_clause? limit_clause?\n\n");
+    out.push_str("join_clause* where_clause? group_clause? having_clause? ");
+    out.push_str("order_clause? limit_clause? offset_clause?\n\n");
 
-    out.push_str("select_list: \"*\" | aggregate | field_list\n");
+    // select_list: v0.3 adds arithmetic expression (arith_expr).
+    out.push_str("select_list: \"*\" | arith_expr | aggregate | field_list\n");
     out.push_str("field_list: field (\",\" field)*\n");
     out.push_str("aggregate: AGG \"(\" (field | \"*\") \")\"\n");
-    out.push_str("AGG: \"COUNT\" | \"SUM\" | \"AVG\" | \"MIN\" | \"MAX\"\n\n");
+    out.push_str("AGG: \"COUNT\" | \"SUM\" | \"AVG\" | \"MIN\" | \"MAX\"\n");
+    // Arithmetic: field / field or aggregate / field etc.
+    out.push_str("arith_expr: (field | aggregate) ARITH_OP (field | aggregate | NUMBER)\n");
+    out.push_str("ARITH_OP: \"/\" | \"*\" | \"+\" | \"-\"\n\n");
+
+    // JOIN clause: only INNER JOIN with ON field = field.
+    out.push_str("join_clause: \"INNER\" \"JOIN\" entity \"ON\" field \"=\" field\n\n");
 
     out.push_str("where_clause: \"WHERE\" condition (\"AND\" condition)*\n");
     out.push_str("condition: field CMP value\n");
     out.push_str("CMP: \"=\" | \"!=\" | \"<\" | \">\" | \"<=\" | \">=\"\n\n");
 
+    // HAVING: same structure as WHERE.
+    out.push_str("having_clause: \"HAVING\" condition (\"AND\" condition)*\n\n");
+
     out.push_str("group_clause: \"GROUP\" \"BY\" field (\",\" field)*\n");
     out.push_str("order_clause: \"ORDER\" \"BY\" field (\"DESC\" | \"ASC\")?\n");
-    out.push_str("limit_clause: \"LIMIT\" INT\n\n");
+    out.push_str("limit_clause: \"LIMIT\" INT\n");
+    out.push_str("offset_clause: \"OFFSET\" INT\n\n");
 
     out.push_str(&entity_production(&schema.entities));
     out.push('\n');
@@ -187,6 +200,19 @@ pub fn validate_skeleton_against_schema(
     if let Some((f, _)) = &parsed.order_by {
         check_field(f, &entity_set, &field_set, &parsed)?;
     }
+    for jc in &parsed.joins {
+        if !entity_set.contains(jc.entity.as_str()) {
+            return Err(SemsqlError::validation(format!(
+                "join entity `{}` not in active schema slice",
+                jc.entity.as_str(),
+            )));
+        }
+        check_field(&jc.on_left, &entity_set, &field_set, &parsed)?;
+        check_field(&jc.on_right, &entity_set, &field_set, &parsed)?;
+    }
+    for cond in &parsed.having {
+        check_condition(cond, &entity_set, &field_set, &parsed)?;
+    }
     Ok(parsed)
 }
 
@@ -200,8 +226,19 @@ fn check_field_iter(
         match item {
             SelectItem::Star => {}
             SelectItem::Field(f) | SelectItem::Aggregate(_, f) => {
+                // `COUNT(*)` lowers to an `Aggregate(Count, Bare("__star__"))`
+                // placeholder during parsing; the transpiler renders it
+                // back as `*`. Skip schema validation for this synthetic.
+                if let Field::Bare(name) = f {
+                    if name.as_str() == "__star__" {
+                        continue;
+                    }
+                }
                 check_field(f, entities, fields, parsed)?;
             }
+            // Raw arithmetic/CAST expressions are passed through verbatim;
+            // the second-pass parser validates them against the real schema.
+            SelectItem::Expr(_) => {}
         }
     }
     Ok(())
@@ -434,6 +471,50 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("phone"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_inner_join_in_scope() {
+        let schema = GrammarSchema {
+            entities: vec!["users".into(), "orders".into()],
+            fields: vec!["users.id".into(), "orders.user_id".into()],
+            value_slots: vec![],
+        };
+        let r = validate_skeleton_against_schema(
+            "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id",
+            &schema,
+        );
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+
+    #[test]
+    fn validate_rejects_join_entity_out_of_scope() {
+        let schema = GrammarSchema {
+            entities: vec!["users".into()],
+            fields: vec!["users.id".into()],
+            value_slots: vec![],
+        };
+        let err = validate_skeleton_against_schema(
+            "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id",
+            &schema,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("orders"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_having_in_scope() {
+        let schema = GrammarSchema {
+            entities: vec!["users".into()],
+            fields: vec!["users.status_code".into()],
+            value_slots: vec![],
+        };
+        let r = validate_skeleton_against_schema(
+            "SELECT users.status_code FROM users GROUP BY users.status_code HAVING users.status_code > 2",
+            &schema,
+        );
+        assert!(r.is_ok(), "{:?}", r.err());
     }
 
     #[test]

@@ -66,6 +66,9 @@ def _cases() -> list[dict[str, object]]:
         )
     # Negative-control cases: hand-written SQL that *should* be rejected by
     # the Rust scope-leak walker even after injector logic runs (or doesn't).
+    # Every entry here is one of the 10 documented bypass classes from
+    # Plan §Verification#8 — when the Rust second-pass passes one of these,
+    # CI fails closed.
     out.extend(
         [
             {
@@ -79,6 +82,77 @@ def _cases() -> list[dict[str, object]]:
                 "name": "negative_subquery_aliasing_unscoped",
                 "input_sql": None,
                 "sql": "SELECT * FROM (SELECT * FROM users) u",
+                "scope": {"users": "tenant_id"},
+                "should_pass": False,
+            },
+            # UNION across one scoped + one unscoped branch — the Rust
+            # walker must inspect every branch independently.
+            {
+                "name": "negative_union_one_branch_unscoped",
+                "input_sql": None,
+                "sql": (
+                    "SELECT id FROM users WHERE users.tenant_id = :tenant "
+                    "UNION ALL SELECT id FROM users"
+                ),
+                "scope": {"users": "tenant_id"},
+                "should_pass": False,
+            },
+            # Self-join with one alias scoped, the other not — common
+            # injector-omission pattern when alias rewriting is buggy.
+            {
+                "name": "negative_self_join_one_alias_unscoped",
+                "input_sql": None,
+                "sql": (
+                    "SELECT u1.id, u2.id FROM users u1 "
+                    "JOIN users u2 ON u1.manager_id = u2.id "
+                    "WHERE u1.tenant_id = :tenant"
+                ),
+                "scope": {"users": "tenant_id"},
+                "should_pass": False,
+            },
+            # Correlated subquery whose inner `users` reference lacks
+            # scope. Outer is fine; inner must be checked too.
+            {
+                "name": "negative_correlated_inner_unscoped",
+                "input_sql": None,
+                "sql": (
+                    "SELECT u.id, (SELECT COUNT(*) FROM users u2 WHERE u2.id = u.id) "
+                    "AS c FROM users u WHERE u.tenant_id = :tenant"
+                ),
+                "scope": {"users": "tenant_id"},
+                "should_pass": False,
+            },
+            # Multi-statement: second statement is unscoped DML/SELECT.
+            # The select-only invariant fires before any scope check —
+            # the Rust pass must reject this on statement-count alone.
+            {
+                "name": "negative_multi_statement",
+                "input_sql": None,
+                "sql": (
+                    "SELECT * FROM users WHERE users.tenant_id = :tenant; "
+                    "SELECT * FROM users"
+                ),
+                "scope": {"users": "tenant_id"},
+                "should_pass": False,
+            },
+            # DML/DDL smuggling — the Rust pass must reject anything
+            # that isn't a SELECT/Query statement.
+            {
+                "name": "negative_dml",
+                "input_sql": None,
+                "sql": "DELETE FROM users WHERE id = 1",
+                "scope": {"users": "tenant_id"},
+                "should_pass": False,
+            },
+            # Deep nesting with the innermost layer missing scope.
+            # Validates the walker recurses into derived tables.
+            {
+                "name": "negative_three_level_inner_unscoped",
+                "input_sql": None,
+                "sql": (
+                    "SELECT * FROM (SELECT * FROM (SELECT * FROM users) i1 "
+                    "WHERE i1.tenant_id = :tenant) i2"
+                ),
                 "scope": {"users": "tenant_id"},
                 "should_pass": False,
             },
@@ -131,6 +205,28 @@ _CORPUS: list[tuple[str, str]] = [
     (
         "comment_inline",
         "SELECT * FROM /* attempt at hiding */ users",
+    ),
+    # ----- Hardening expansion (Verification#8 round 2) ------------------
+    # `IN (SELECT ... FROM users)` — the inner subquery's `users` reference
+    # is the one that needs scoping. Plan §Verification#8 calls out
+    # subquery-aliasing; the IN form is its predicate-context cousin.
+    (
+        "in_subquery",
+        "SELECT id FROM users WHERE id IN (SELECT id FROM users)",
+    ),
+    # `EXISTS (SELECT 1 FROM users WHERE ...)` — same shape, different
+    # predicate operator.
+    (
+        "exists_subquery",
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM users)",
+    ),
+    # Trailing line comment must not let an attacker paper over a missing
+    # predicate. The injector strips comments before walking the AST so
+    # the rewritten SQL has the predicate in scope regardless of what the
+    # input commentary said.
+    (
+        "trailing_line_comment",
+        "SELECT * FROM users -- pretend tenant_id is already filtered",
     ),
 ]
 

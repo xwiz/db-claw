@@ -133,6 +133,14 @@ class CascadeQueryResult:
     fault. The set is open — future stages add new tags as the cascade
     grows."""
 
+    repair_attempts: int = 0
+    """Phase E observability counter — number of Stage 2 re-decode
+    attempts triggered by validator-rejected identifiers. ``0`` on a
+    clean run, ``> 0`` when llguidance-constrained generation hit a
+    repairable failure. Surfaced into ``--report-json`` per-example
+    records so eval runs can chart constrained-vs-unconstrained drift
+    over time."""
+
 
 def run_cascade_query(
     semsql_bin: Path,
@@ -140,14 +148,25 @@ def run_cascade_query(
     nl: str,
     *,
     timeout_seconds: int = 30,
+    cascade_manifest: Path | None = None,
+    intent_yaml: Path | None = None,
 ) -> CascadeQueryResult:
     """Return the cascade's outcome for ``nl``.
 
     Emits a structured result so callers can bucket per-stage. The
     ``sql`` field is ``None`` on every non-success path; the
     ``stage_pinned`` tag distinguishes the bail reason.
+
+    ``cascade_manifest`` opts into Stage 1+ model inference (requires the
+    binary to be built with ``--features onnx``). ``intent_yaml``
+    threads an intent pattern library through Stage 0b. Both are passed
+    verbatim to ``semsql query``.
     """
     cmd = [str(semsql_bin), "query", "--graph", str(graph), nl]
+    if cascade_manifest is not None:
+        cmd.extend(["--cascade-manifest", str(cascade_manifest)])
+    if intent_yaml is not None:
+        cmd.extend(["--intent-yaml", str(intent_yaml)])
     try:
         proc = subprocess.run(
             cmd,
@@ -161,13 +180,19 @@ def run_cascade_query(
     stage = _parse_stage_pinned(proc.stderr) or (
         "stage_0a" if proc.returncode == 0 else "error"
     )
+    repair = _parse_repair_attempts(proc.stderr)
     if proc.returncode != 0:
-        return CascadeQueryResult(sql=None, stage_pinned=stage)
+        return CascadeQueryResult(
+            sql=None, stage_pinned=stage, repair_attempts=repair
+        )
     sql = proc.stdout.strip()
-    return CascadeQueryResult(sql=sql or None, stage_pinned=stage)
+    return CascadeQueryResult(
+        sql=sql or None, stage_pinned=stage, repair_attempts=repair
+    )
 
 
 _STAGE_RX = re.compile(r"^stage_pinned=([a-z0-9_]+)\s*$", re.MULTILINE)
+_REPAIR_RX = re.compile(r"^repair_attempts=(\d+)\s*$", re.MULTILINE)
 
 
 def _parse_stage_pinned(stderr: str) -> str | None:
@@ -178,6 +203,17 @@ def _parse_stage_pinned(stderr: str) -> str | None:
     (e.g. one per stage) doesn't break the parser."""
     matches = _STAGE_RX.findall(stderr or "")
     return matches[-1] if matches else None
+
+
+def _parse_repair_attempts(stderr: str) -> int:
+    """Parse the ``repair_attempts=N`` tag — `0` if absent."""
+    matches = _REPAIR_RX.findall(stderr or "")
+    if not matches:
+        return 0
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +229,8 @@ def make_cascade_predictor(
     extract_timeout_seconds: int = 60,
     query_timeout_seconds: int = 30,
     on_stage: Callable[[Example, str], None] | None = None,
+    cascade_manifest: Path | None = None,
+    intent_yaml: Path | None = None,
 ) -> Callable[[Example], str]:
     """Return a `predict(Example) -> str` for use with
     :func:`semsql_eval.spider.evaluate`.
@@ -209,6 +247,14 @@ def make_cascade_predictor(
     benchmark accuracy) rather than errors. The error column in the
     eval summary is reserved for predictor crashes — a crash is a bug
     in the eval wiring, not a benchmark miss.
+
+    ``cascade_manifest`` and ``intent_yaml`` are forwarded to every
+    cascade run. With a manifest in scope, queries that fall through
+    Stage 0a get routed through Stage 1 (schema linker) + grammar
+    compile — surfacing per-stage tags like ``needs_model_stage_2``
+    once the model stages emit those (today the orchestrator still
+    pins at ``needs_model``; the manifest just makes Stage 1 actually
+    execute).
     """
     if not semsql_bin.exists():
         # Look in PATH as a fallback so callers don't have to point
@@ -275,10 +321,15 @@ def make_cascade_predictor(
             return sentinel_sql
 
         result = run_cascade_query(
-            semsql_bin, graph_path, example.question, timeout_seconds=query_timeout_seconds
+            semsql_bin,
+            graph_path,
+            example.question,
+            timeout_seconds=query_timeout_seconds,
+            cascade_manifest=cascade_manifest,
+            intent_yaml=intent_yaml,
         )
         if on_stage is not None:
-            on_stage(example, result.stage_pinned)
+            on_stage(example, result.stage_pinned, result.repair_attempts)
         return result.sql or sentinel_sql
 
     return predict

@@ -1,4 +1,10 @@
 //! NatSQL AST — output of Stage 3, input to the transpiler.
+//!
+//! v0.3 additions over v0.2:
+//! - `joins`: up to 3 INNER JOIN clauses with ON field = field.
+//! - `having`: HAVING conditions (same structure as WHERE).
+//! - `SelectItem::Expr`: raw SQL expression for arithmetic / CAST that the
+//!   typed AST does not model in detail.
 
 use semsql_core::{CanonicalName, EntityName, FieldName};
 use serde::{Deserialize, Serialize};
@@ -8,16 +14,40 @@ use serde::{Deserialize, Serialize};
 pub struct NatSql {
     /// Items in the SELECT clause.
     pub select: Vec<SelectItem>,
-    /// Entities involved (FROM is implicit in NatSQL — derived from refs).
+    /// Primary FROM entity (first entry) plus any joined entities.
     pub entities: Vec<EntityName>,
-    /// WHERE conditions, joined by AND/OR.
+    /// INNER JOIN clauses — v0.3 supports up to 3 chains.
+    #[serde(default)]
+    pub joins: Vec<JoinClause>,
+    /// WHERE conditions, joined by AND.
     pub conditions: Vec<Condition>,
+    /// HAVING conditions, joined by AND (applied after GROUP BY aggregation).
+    #[serde(default)]
+    pub having: Vec<Condition>,
     /// GROUP BY (NatSQL form: optional).
     pub group_by: Vec<Field>,
     /// ORDER BY (single key for tiny-model scope; nested ORDERs are rare).
     pub order_by: Option<(Field, OrderDir)>,
     /// LIMIT.
     pub limit: Option<u32>,
+    /// OFFSET (0 == omit).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+/// One INNER JOIN in a v0.3 NatSQL query.
+///
+/// Represents `INNER JOIN {entity} ON {on_left} = {on_right}`. The
+/// transpiler renders these verbatim; the `on_left` and `on_right` fields
+/// must be fully-qualified (`entity.field`) to avoid ambiguity.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JoinClause {
+    /// The joined entity (table).
+    pub entity: EntityName,
+    /// Left side of the ON condition.
+    pub on_left: Field,
+    /// Right side of the ON condition.
+    pub on_right: Field,
 }
 
 /// A SELECT item.
@@ -29,6 +59,12 @@ pub enum SelectItem {
     Field(Field),
     /// An aggregate over a field.
     Aggregate(Aggregate, Field),
+    /// A raw SQL expression for arithmetic, CAST, or other complex constructs
+    /// that the tiny-model cascade can generate but the typed AST does not
+    /// model in detail (e.g. `CAST(t.col AS REAL) / t.total`).
+    /// The transpiler emits this verbatim; the cascade's column-name
+    /// rewriter handles identifier substitution on the final SQL string.
+    Expr(String),
 }
 
 /// Aggregation function — limited to the five NatSQL canonicals.

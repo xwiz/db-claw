@@ -64,3 +64,79 @@ class TestExportStage:
         )
         with pytest.raises(FileNotFoundError):
             export_stage(cfg)
+
+
+class TestExportCascade:
+    def test_writes_manifest_when_reusing_pre_existing_artefacts(
+        self, tmp_path: Path
+    ) -> None:
+        """When no checkpoints are supplied, `export_cascade` reuses
+        ONNX files already in `output_dir` and emits a manifest from
+        their on-disk state. This covers the common partial-re-export
+        flow — Stage 2 freshly trained, Stage 1 + 3 weights unchanged."""
+        from semsql_train.onnx_export import (
+            CascadeExportConfig,
+            export_cascade,
+        )
+
+        out = tmp_path / "cascade"
+        out.mkdir()
+        # Pre-populate three placeholder ONNX files + tokenizer
+        # filenames matching the manifest convention.
+        for stage in ("linker", "skeleton", "slot_filler"):
+            (out / f"{stage}.onnx").write_bytes(b"")
+            (out / f"{stage}.tok.json").write_bytes(b"")
+
+        cfg = CascadeExportConfig(
+            output_dir=out, cascade_version="v0.5.0-test"
+        )
+        manifest = export_cascade(cfg)
+        assert manifest.cascade_version == "v0.5.0-test"
+        assert manifest.linker.path == "linker.onnx"
+        assert manifest.skeleton.path == "skeleton.onnx"
+        assert manifest.slot_filler.path == "slot_filler.onnx"
+        # Manifest is also written to disk and reads back identically.
+        on_disk = read_manifest(out / "manifest.json")
+        assert on_disk.cascade_version == "v0.5.0-test"
+        assert on_disk.linker.tokenizer == "linker.tok.json"
+
+    def test_raises_when_no_checkpoint_and_no_artefact(
+        self, tmp_path: Path
+    ) -> None:
+        """A stage with no supplied checkpoint AND no pre-existing
+        ONNX file is a configuration error — the manifest would point
+        at a non-existent artefact."""
+        from semsql_train.onnx_export import (
+            CascadeExportConfig,
+            export_cascade,
+        )
+
+        out = tmp_path / "cascade"
+        out.mkdir()
+        cfg = CascadeExportConfig(output_dir=out, cascade_version="v0")
+        with pytest.raises(RuntimeError, match="no checkpoint supplied for linker"):
+            export_cascade(cfg)
+
+    def test_falls_back_to_canonical_tokenizer_when_per_stage_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """Some checkpoint-export paths leave only the canonical
+        ``tokenizer.json`` in the output dir (no per-stage rename).
+        The reuse path should record the fallback name in the
+        manifest so the Rust loader still finds it."""
+        from semsql_train.onnx_export import (
+            CascadeExportConfig,
+            export_cascade,
+        )
+
+        out = tmp_path / "cascade"
+        out.mkdir()
+        for stage in ("linker", "skeleton", "slot_filler"):
+            (out / f"{stage}.onnx").write_bytes(b"")
+        # No per-stage tokenizer files; only the canonical fallback.
+        (out / "tokenizer.json").write_bytes(b"")
+
+        cfg = CascadeExportConfig(output_dir=out, cascade_version="v0")
+        manifest = export_cascade(cfg)
+        assert manifest.linker.tokenizer == "tokenizer.json"
+        assert manifest.skeleton.tokenizer == "tokenizer.json"

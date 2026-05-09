@@ -62,6 +62,9 @@ class LinkerTrainConfig:
     student_hidden_layers: int = 4
     student_hidden_size: int = 384
 
+    # bf16 mixed precision — same toggle as Stage 2. Requires CUDA + Ada+/Hopper.
+    bf16: bool = False
+
     extra: dict[str, object] = field(default_factory=dict)
 
 
@@ -168,6 +171,11 @@ def train_linker(cfg: LinkerTrainConfig) -> Path:
         )
 
     try:
+        # See note in trainers/skeleton.py — pandas/datasets MUST be
+        # imported before torch/transformers on Python 3.13 + Windows or
+        # Trainer.__init__ blows the OS stack via pandas._libs.tslibs.
+        import pandas  # noqa: F401
+        import datasets  # noqa: F401
         import torch  # noqa: F401
         import transformers  # noqa: F401
     except ImportError as e:  # pragma: no cover — exercised only without ML extras
@@ -175,14 +183,91 @@ def train_linker(cfg: LinkerTrainConfig) -> Path:
             "Stage 1 training requires `pip install semsql-train[ml]`."
         ) from e
 
-    # Actual HF Trainer wiring lands once the distillation recipe is pinned.
-    # The contract above is what callers depend on; keeping the body
-    # explicitly NotImplemented prevents accidental "training succeeded"
-    # results from a half-wired pipeline.
-    raise NotImplementedError(
-        "train_linker: full HF Trainer wiring lands in v0.2 model milestone. "
-        "preflight() and build_dataset() are the testable surface today."
+    transformers.set_seed(cfg.seed)
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.base_model)
+    model = transformers.AutoModelForSequenceClassification.from_pretrained(
+        cfg.base_model, num_labels=2
     )
+
+    # Cross-encoder format: pair (NL, candidate description). DistilBERT's
+    # tokenizer auto-inserts [CLS] / [SEP] when given two text args. The
+    # candidate is rendered as "<kind>: <target>" so the model learns the
+    # entity-vs-field distinction without an extra type-id channel.
+    def _format_candidate(rec: dict) -> str:
+        kind = rec.get("candidate_kind", "")
+        target = rec.get("candidate_target", "")
+        return f"{kind}: {target}" if kind else target
+
+    class _LinkerDataset(torch.utils.data.Dataset):
+        def __init__(self, recs: list[dict]) -> None:
+            self.recs = recs
+
+        def __len__(self) -> int:
+            return len(self.recs)
+
+        def __getitem__(self, idx: int) -> dict:
+            rec = self.recs[idx]
+            enc = tokenizer(
+                rec["nl"],
+                _format_candidate(rec),
+                max_length=128,
+                truncation=True,
+                padding=False,
+            )
+            enc["labels"] = int(rec["relevance_label"])
+            return enc
+
+    train_recs = list(build_dataset(cfg.train_jsonl))
+    eval_recs = list(build_dataset(cfg.eval_jsonl))
+    train_ds = _LinkerDataset(train_recs)
+    eval_ds = _LinkerDataset(eval_recs)
+
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    bf16 = (
+        cfg.bf16
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+    )
+    args = transformers.TrainingArguments(
+        output_dir=str(cfg.output_dir),
+        num_train_epochs=cfg.epochs,
+        per_device_train_batch_size=cfg.batch_size,
+        per_device_eval_batch_size=cfg.batch_size,
+        learning_rate=cfg.learning_rate,
+        weight_decay=0.01,
+        warmup_ratio=0.05,
+        lr_scheduler_type="linear",
+        seed=cfg.seed,
+        logging_steps=50,
+        save_strategy="no",
+        eval_strategy="no",
+        report_to=[],
+        bf16=bf16,
+        dataloader_pin_memory=torch.cuda.is_available(),
+    )
+
+    collator = transformers.DataCollatorWithPadding(tokenizer=tokenizer)
+    import inspect
+
+    trainer_kwargs: dict[str, object] = dict(
+        model=model,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=collator,
+    )
+    sig = inspect.signature(transformers.Trainer.__init__)
+    if "processing_class" in sig.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+    else:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = transformers.Trainer(**trainer_kwargs)
+    trainer.train()
+    trainer.save_model(str(cfg.output_dir))
+    tokenizer.save_pretrained(str(cfg.output_dir))
+    return cfg.output_dir
 
 
 # ---------------------------------------------------------------------------

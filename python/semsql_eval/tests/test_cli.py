@@ -315,6 +315,163 @@ def test_build_mini_corpus_cli_writes_layout(tmp_path: Path) -> None:
     assert "layout looks healthy" in check.stdout
 
 
+def test_query_dialect_flag_renders_per_dialect(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """`semsql query --dialect <name>` should re-render the cascade
+    output per dialect — backticks for MySQL, double quotes for
+    Postgres / SQLite. Smoke covers the round-trip; per-dialect
+    quirks are unit-tested in the renderer crate."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+
+    graph = tmp_path / "demo.semsql"
+    extract = subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert extract.returncode == 0, extract.stderr
+
+    # Default — dialect-agnostic output, unquoted identifiers.
+    default = subprocess.run(
+        [str(semsql_bin), "query", "--graph", str(graph), "show tenants"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert default.returncode == 0, default.stderr
+    assert "FROM tenants" in default.stdout
+
+    # MySQL — backtick-quoted identifiers.
+    mysql = subprocess.run(
+        [
+            str(semsql_bin),
+            "query",
+            "--graph",
+            str(graph),
+            "show tenants",
+            "--dialect",
+            "mysql",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mysql.returncode == 0, mysql.stderr
+    assert "FROM `tenants`" in mysql.stdout
+
+    # SQLite — double-quoted identifiers.
+    sqlite = subprocess.run(
+        [
+            str(semsql_bin),
+            "query",
+            "--graph",
+            str(graph),
+            "show tenants",
+            "--dialect",
+            "sqlite",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert sqlite.returncode == 0, sqlite.stderr
+    assert 'FROM "tenants"' in sqlite.stdout
+
+    # MSSQL — square-bracket identifiers + TOP n (no LIMIT clause).
+    mssql = subprocess.run(
+        [
+            str(semsql_bin),
+            "query",
+            "--graph",
+            str(graph),
+            "show tenants",
+            "--dialect",
+            "mssql",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mssql.returncode == 0, mssql.stderr
+    assert "FROM [tenants]" in mssql.stdout
+
+    # BigQuery — backticks (NOT double quotes — those are strings in BQ).
+    bq = subprocess.run(
+        [
+            str(semsql_bin),
+            "query",
+            "--graph",
+            str(graph),
+            "show tenants",
+            "--dialect",
+            "bigquery",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bq.returncode == 0, bq.stderr
+    assert "FROM `tenants`" in bq.stdout
+    assert '"tenants"' not in bq.stdout
+
+
+def test_query_dialect_flag_rejects_unknown_dialect(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "query",
+            "--graph",
+            str(graph),
+            "show tenants",
+            "--dialect",
+            "oracle",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "unknown dialect `oracle`" in proc.stderr
+
+
 def test_doctor_surfaces_eval_report_stage_breakdown(
     tmp_path: Path, semsql_bin: Path
 ) -> None:
@@ -400,6 +557,379 @@ def test_doctor_surfaces_eval_report_stage_breakdown(
     assert "errored or timed out" not in doctor.stdout
 
 
+def test_doctor_examples_drills_into_non_correct_records(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """`semsql doctor --eval-report ... --examples N` should print the
+    first N non-correct examples (bailed/errored/timeout) so an
+    operator can drill from the per-stage breakdown straight to a
+    concrete query/SQL pair without re-running the eval."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+
+    graph = tmp_path / "demo.semsql"
+    extract = subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert extract.returncode == 0, extract.stderr
+
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "summary": {
+                    "suite": "spider",
+                    "total": 4,
+                    "correct": 1,
+                    "wrong": 0,
+                    "bailed": 3,
+                    "errored": 0,
+                    "exec_acc": 0.25,
+                    "bail_rate": 0.75,
+                    "error_rate": 0.0,
+                    "stage_breakdown": {"stage_0a": 1, "needs_model": 3},
+                },
+                "examples": [
+                    {
+                        "db_id": "demo",
+                        "question": "show tenants",
+                        "gold_sql": "SELECT * FROM tenants",
+                        "pred_sql": "SELECT * FROM tenants",
+                        "stage_pinned": "stage_0a",
+                    },
+                    {
+                        "db_id": "demo",
+                        "question": "complex aggregation example one",
+                        "gold_sql": "SELECT COUNT(*) FROM tenants",
+                        "pred_sql": "SELECT 1",
+                        "stage_pinned": "needs_model",
+                    },
+                    {
+                        "db_id": "demo",
+                        "question": "complex aggregation example two",
+                        "gold_sql": "SELECT name FROM tenants",
+                        "pred_sql": "SELECT 1",
+                        "stage_pinned": "needs_model",
+                    },
+                    {
+                        "db_id": "demo",
+                        "question": "complex aggregation example three",
+                        "gold_sql": "SELECT name FROM tenants",
+                        "pred_sql": "SELECT 1",
+                        "stage_pinned": "needs_model",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--eval-report",
+            str(report),
+            "--examples",
+            "2",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Low-coverage report → non-zero exit, but the drilldown text
+    # still renders to stdout.
+    assert "eval drilldown" in proc.stdout
+    assert "complex aggregation example one" in proc.stdout
+    assert "complex aggregation example two" in proc.stdout
+    # Cap honoured — only 2 surfaced even though 3 non-correct exist.
+    assert "complex aggregation example three" not in proc.stdout
+
+
+def test_doctor_write_overrides_creates_yaml_scaffold(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """`semsql doctor --write-overrides path` should emit a starter
+    YAML even when there are no conflicts in the graph — it's the
+    expected workflow for users to bootstrap an overrides file."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    out = tmp_path / "semsql.overrides.yaml"
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--write-overrides",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.exists()
+    body = out.read_text(encoding="utf-8")
+    assert "version: 1" in body
+    assert "overrides:" in body
+    assert "wrote 0 conflict scaffold(s)" in proc.stdout
+
+
+def test_doctor_write_overrides_refuses_existing_file(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    out = tmp_path / "semsql.overrides.yaml"
+    out.write_text("existing content\n", encoding="utf-8")
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--write-overrides",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "refusing to overwrite" in proc.stderr or "refusing to overwrite" in proc.stdout
+    # Existing content preserved.
+    assert out.read_text(encoding="utf-8") == "existing content\n"
+
+
+def test_doctor_format_json_emits_machine_readable_payload(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """`semsql doctor --format json` emits a single JSON document
+    with every diagnostic the text path surfaces. Suitable for CI
+    parsing — sample test asserts the top-level shape."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert "graph" in payload
+    assert "coverage" in payload
+    assert "conflicts" in payload
+    assert "rls" in payload
+    assert "eval_report" in payload
+    assert "exit_nonzero" in payload
+    assert payload["exit_nonzero"] is False
+    assert payload["coverage"]["entities"] >= 1
+    assert payload["rls"]["status"] == "skipped"
+    assert isinstance(payload["conflicts"], list)
+
+
+def test_doctor_format_json_rejects_unknown_format(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--format",
+            "yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "unknown --format `yaml`" in proc.stderr or "yaml" in proc.stderr
+
+
+def test_doctor_rls_strict_fails_when_scoped_entity_unverified(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """`--rls-strict` must fail-closed when graph declares scoped
+    entities AND no `--db-url` is supplied to verify their RLS
+    posture. We manually insert a `scopes` row via sqlite3 since the
+    `--framework=none` extractor doesn't auto-detect tenanted
+    tables — that's a manual config step in real deployments."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    # Inject a scope row so coverage.scoped_entities is non-empty.
+    conn = sqlite3.connect(graph)
+    try:
+        conn.execute(
+            "INSERT INTO scopes(entity, kind, template, required_params, source_rule) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("tenants", "tenant", "tenant_id = :tenant", "[\"tenant\"]", "test_fixture"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # No --db-url → unverified → strict mode must fail.
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--rls-strict",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "rls-strict" in proc.stdout
+    assert "RLS posture was not verified" in proc.stdout
+
+    # Without --rls-strict, same graph reports the warning but exits 0.
+    proc2 = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+
+
 def test_doctor_eval_report_low_coverage_lifts_exit_code(
     tmp_path: Path, semsql_bin: Path
 ) -> None:
@@ -471,6 +1001,207 @@ def test_doctor_eval_report_low_coverage_lifts_exit_code(
     )
     assert "cascade coverage (Stage 0a) is 10.0%" in doctor.stdout
     assert "below the 50% deployment threshold" in doctor.stdout
+
+
+def _make_valid_manifest(tmp_path: Path) -> Path:
+    """Materialise a valid cascade manifest + the ONNX/tokenizer files
+    it references. Files are zero-byte stand-ins — `CascadeManifest::load`
+    only checks existence, not validity, so this is sufficient for the
+    doctor path."""
+    for name in (
+        "linker.onnx",
+        "linker.tok.json",
+        "skeleton.onnx",
+        "skeleton.tok.json",
+        "slot.onnx",
+        "slot.tok.json",
+    ):
+        (tmp_path / name).write_bytes(b"")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cascade_version": "v0.5.0",
+                "linker": {
+                    "path": "linker.onnx",
+                    "tokenizer": "linker.tok.json",
+                    "params": 9_500_000,
+                },
+                "skeleton": {
+                    "path": "skeleton.onnx",
+                    "tokenizer": "skeleton.tok.json",
+                    "params": 19_800_000,
+                },
+                "slot_filler": {
+                    "path": "slot.onnx",
+                    "tokenizer": "slot.tok.json",
+                    "params": 4_900_000,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_doctor_cascade_manifest_warns_on_non_onnx_build(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """Doctor should validate a well-formed manifest and warn when the
+    binary was built without `--features onnx` (default in CI)."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    manifest = _make_valid_manifest(tmp_path)
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--cascade-manifest",
+            str(manifest),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Manifest validates fine — header line present.
+    assert "cascade manifest:" in proc.stdout
+    assert "cascade_version=v0.5.0" in proc.stdout
+    # Default test build is non-onnx → doctor emits the warning AND
+    # exits non-zero so CI catches the misconfig.
+    assert "WITHOUT `--features onnx`" in proc.stdout
+    assert proc.returncode == 1
+
+
+def test_doctor_cascade_manifest_rejects_missing_artefact(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """A manifest pointing at a missing ONNX file must fail closed."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    # Manifest references files that don't exist.
+    bad = tmp_path / "bad.json"
+    bad.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cascade_version": "v0",
+                "linker": {"path": "x.onnx", "tokenizer": "x.tok", "params": 0},
+                "skeleton": {"path": "y.onnx", "tokenizer": "y.tok", "params": 0},
+                "slot_filler": {"path": "z.onnx", "tokenizer": "z.tok", "params": 0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--cascade-manifest",
+            str(bad),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 1
+    assert "load failed" in proc.stdout
+    assert "missing linker ONNX" in proc.stdout
+
+
+def test_doctor_cascade_manifest_in_json_format(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """JSON doctor surfaces the manifest block under `cascade_manifest`."""
+    db_dir = tmp_path / "database" / "demo"
+    db_dir.mkdir(parents=True)
+    db = db_dir / "demo.sqlite"
+    _make_db(db)
+    graph = tmp_path / "demo.semsql"
+    subprocess.run(
+        [
+            str(semsql_bin),
+            "extract",
+            str(tmp_path),
+            "--framework",
+            "none",
+            "--db-url",
+            f"sqlite:{db.resolve()}",
+            "--output",
+            str(graph),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    manifest = _make_valid_manifest(tmp_path)
+    proc = subprocess.run(
+        [
+            str(semsql_bin),
+            "doctor",
+            "--graph",
+            str(graph),
+            "--cascade-manifest",
+            str(manifest),
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["cascade_manifest"] is not None
+    block = payload["cascade_manifest"]
+    assert block["ok"] is True
+    assert block["cascade_version"] == "v0.5.0"
+    assert block["onnx_build"] is False
+    assert payload["exit_nonzero"] is True
 
 
 def test_check_spider_flags_missing_manifests(tmp_path: Path) -> None:

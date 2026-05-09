@@ -143,3 +143,117 @@ describe("scanLangDir", () => {
         expect(frag.locator.layer).toBe(5); // I18n
     });
 });
+
+describe("scanLangDir — lang index", () => {
+    it("populates the index with PHP group-prefixed keys", async () => {
+        await write(
+            "en/users.php",
+            `<?php
+            return [
+                'full_name' => 'Full Name',
+                'email_label' => 'Email Address',
+            ];`,
+        );
+        const r = await scanLangDir(tmp);
+        // Group is the file basename — Laravel's __() helper resolves
+        // `users.full_name` against `lang/en/users.php`.
+        expect(r.index.get("users.full_name")?.label).toBe("Full Name");
+        expect(r.index.get("users.email_label")?.label).toBe("Email Address");
+        expect(r.index.get("users.full_name")?.locale).toBe("en");
+    });
+
+    it("populates the index from flat JSON (no group prefix)", async () => {
+        await write(
+            "en.json",
+            JSON.stringify({
+                "users.full_name": "Full Name",
+                "billing.balance": "Account Balance",
+            }),
+        );
+        const r = await scanLangDir(tmp);
+        expect(r.index.get("users.full_name")?.label).toBe("Full Name");
+        expect(r.index.get("billing.balance")?.label).toBe("Account Balance");
+    });
+
+    it("prefers the `en` locale on conflicts", async () => {
+        await write(
+            "fr/users.php",
+            `<?php return ['full_name' => 'Nom Complet'];`,
+        );
+        await write(
+            "en/users.php",
+            `<?php return ['full_name' => 'Full Name'];`,
+        );
+        const r = await scanLangDir(tmp);
+        const entry = r.index.get("users.full_name");
+        expect(entry?.label).toBe("Full Name");
+        expect(entry?.locale).toBe("en");
+    });
+
+    it("first-write-wins when no `en` locale present", async () => {
+        await write(
+            "de/users.php",
+            `<?php return ['full_name' => 'Vollständiger Name'];`,
+        );
+        await write(
+            "fr/users.php",
+            `<?php return ['full_name' => 'Nom Complet'];`,
+        );
+        const r = await scanLangDir(tmp);
+        const entry = r.index.get("users.full_name");
+        expect(entry).toBeDefined();
+        // Either fr or de wins depending on filesystem iteration order;
+        // the contract is "first write wins, en overrides", so we
+        // accept whichever non-en label arrived first.
+        expect(["Nom Complet", "Vollständiger Name"]).toContain(
+            entry!.label,
+        );
+        expect(entry!.locale).not.toBe("en");
+    });
+
+    it("indexes nested-directory PHP files using the path-derived group prefix", async () => {
+        // Laravel resolves `auth.passwords.reset` via `lang/<locale>/auth/passwords.php`.
+        // The walker must include the subdirectory in the index key.
+        await write(
+            "en/auth/passwords.php",
+            `<?php
+            return [
+                'reset' => 'Reset Password',
+                'sent'  => 'Reset Link Sent',
+            ];`,
+        );
+        const r = await scanLangDir(tmp);
+        expect(r.index.get("auth.passwords.reset")?.label).toBe("Reset Password");
+        expect(r.index.get("auth.passwords.sent")?.label).toBe("Reset Link Sent");
+        // Must NOT collapse to bare `passwords.reset` — that's the
+        // pre-fix bug class the regression test catches.
+        expect(r.index.get("passwords.reset")).toBeUndefined();
+    });
+
+    it("indexes deeply nested directories — auth/api/tokens.php", async () => {
+        await write(
+            "en/auth/api/tokens.php",
+            `<?php return ['expired' => 'Token Expired'];`,
+        );
+        const r = await scanLangDir(tmp);
+        expect(r.index.get("auth.api.tokens.expired")?.label).toBe(
+            "Token Expired",
+        );
+    });
+
+    it("records nested PHP keys under their group prefix", async () => {
+        await write(
+            "en/users.php",
+            `<?php
+            return [
+                'name' => [
+                    'first' => 'First Name',
+                    'last' => 'Last Name',
+                ],
+            ];`,
+        );
+        const r = await scanLangDir(tmp);
+        expect(r.index.get("users.name.first")?.label).toBe("First Name");
+        expect(r.index.get("users.name.last")?.label).toBe("Last Name");
+    });
+});

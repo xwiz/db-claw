@@ -12,5 +12,14 @@ heavyweight ML stack.
 """
 
 from .linker import LinkerTrainConfig, train_linker
+from .skeleton import SkeletonTrainConfig, train_skeleton
+from .slot_filler import SlotFillerTrainConfig, train_slot_filler
 
-__all__ = ["LinkerTrainConfig", "train_linker"]
+__all__ = [
+    "LinkerTrainConfig",
+    "SkeletonTrainConfig",
+    "SlotFillerTrainConfig",
+    "train_linker",
+    "train_skeleton",
+    "train_slot_filler",
+]

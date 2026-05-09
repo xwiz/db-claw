@@ -256,11 +256,28 @@ def _to_skeleton(sql: str, ctx: TemplateContext) -> tuple[str, dict[str, str]]:
 
 
 def _ranked_schema(graph: GraphSnapshot, ctx: TemplateContext) -> list[dict]:
-    """Schema slice the linker would have emitted for this query."""
+    """Schema slice the linker would have emitted for this query.
+
+    v0.3 / Phase C: includes ``kind == "fk"`` entries for every FK edge
+    incident on the active entity. The Stage 2 encoder renders these as
+    ``FK: a.id = b.a_id`` lines so the model sees join structure even
+    on single-entity templates (matching the teacher-cache rows that
+    carry full JOIN ON edges from gold SQL).
+    """
     out: list[dict] = []
     out.append({"kind": "entity", "target": ctx.entity_canonical, "score": 1.0})
     if ctx.field_canonical:
         out.append({"kind": "field", "target": ctx.field_canonical, "score": 1.0})
+    for rel in graph.relationships:
+        if (
+            rel.from_entity == ctx.entity_canonical
+            or rel.to_entity == ctx.entity_canonical
+        ):
+            edge = (
+                f"{rel.from_entity}.{rel.from_field} = "
+                f"{rel.to_entity}.{rel.to_field}"
+            )
+            out.append({"kind": "fk", "target": edge, "score": 1.0})
     return out
 
 

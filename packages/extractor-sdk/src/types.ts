@@ -69,3 +69,27 @@ export interface Extractor {
     /** Yields fragments. Order is irrelevant; the merge engine sorts by layer. */
     extract(ctx: ExtractCtx): AsyncIterable<VocabFragment>;
 }
+
+/**
+ * One resolved i18n entry — a (key, label) pair plus enough provenance
+ * to surface in `semsql doctor` reports.
+ *
+ * Lang/locale walkers (Laravel `lang/`, Vue `src/locales/`, Rails
+ * `config/locales/`) populate a [`LangIndex`] that the framework
+ * adapters consult when they encounter `__('key')` / `$t('key')`
+ * helpers. The shared type lives in the SDK so every adapter can
+ * cross-pollinate without coupling on a specific framework's reader.
+ */
+export interface LangIndexEntry {
+    /** Label as written in the source (sanitiser-pre). */
+    label: string;
+    /** Locale this entry won the priority cascade for. */
+    locale: string;
+    /** Source file. */
+    file: string;
+    /** 1-indexed line, best-effort. */
+    line: number;
+}
+
+/** Dotted-key → resolved-entry map. */
+export type LangIndex = Map<string, LangIndexEntry>;

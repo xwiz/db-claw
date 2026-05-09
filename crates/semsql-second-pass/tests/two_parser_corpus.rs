@@ -55,7 +55,17 @@ fn two_parsers_agree_across_corpus() {
         let result = verify_with_dialect(&case.sql, &inv, SqlDialect::Sqlite);
         match (case.should_pass, &result) {
             (true, Ok(())) => {}
-            (false, Err(SemsqlError::ScopeLeak { .. } | SemsqlError::Validation(_))) => {}
+            // Multi-statement smuggling raises ParserDisagreement (the
+            // statement-count guard fires before scope checking). DML/DDL
+            // raises Validation. Either is a valid rejection.
+            (
+                false,
+                Err(
+                    SemsqlError::ScopeLeak { .. }
+                    | SemsqlError::Validation(_)
+                    | SemsqlError::ParserDisagreement { .. },
+                ),
+            ) => {}
             (true, Err(e)) => failures.push(format!(
                 "case {} expected pass, got error: {e}\n  SQL: {}",
                 case.name, case.sql

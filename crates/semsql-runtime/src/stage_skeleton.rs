@@ -1,40 +1,311 @@
 //! Stage 2 — Skeleton Generator (~20M params, llguidance constrained).
 //!
-//! v0.2 wires the llguidance grammar binding alongside the deterministic
-//! grammar generator (`crate::grammar`). The decoder loop arrives with
-//! the distilled student weights; until then `generate` returns
-//! `NeedsModel` and the cascade falls through to clarification.
+//! Decodes NatSQL skeletons from `(NL, ranked schema slice)` pairs using a
+//! distilled T5-mini-class encoder-decoder exported to ONNX by
+//! `python/semsql_train/onnx_export.py`.
 //!
-//! The grammar passed to llguidance is dynamically built per query: only
-//! the schema items Stage 1 returned are valid productions, so hallucinated
-//! tables/columns are *structurally impossible*. We compile the grammar
-//! eagerly so a malformed-grammar bug surfaces *before* token decoding
-//! starts — see [`compile_grammar`].
+//! Architecture (from `docs/stage2.md §2.2`):
+//!
+//!  - Encoder: 4 layers, d_model=384, 6 heads — processes the NL + schema
+//!    sentinel string (format defined in §2.3).
+//!  - Decoder: 4 layers, same dimensions — generates NatSQL tokens one by
+//!    one under a per-query Lark grammar enforced by llguidance. The grammar
+//!    is built from Stage 1's top-k schema items; only those identifiers are
+//!    valid productions, making hallucinated tables/columns structurally
+//!    impossible.
+//!
+//! Token decoding strategy: **greedy** (argmax after llguidance mask).
+//! Beam-search (size 4) is wired in `docs/stage2.md §2.4` but disabled by
+//! default; the latency trade-off (2× cost, ~2% skeleton-match lift) is not
+//! worth the default budget.
+//!
+//! llguidance integration:
+//!
+//!  The compiled grammar is bound to the model tokenizer once per
+//!  [`SkeletonGenerator`] load. Per query, a new `llguidance::Constraint` is
+//!  constructed (cheap — it clones the compiled automaton state) and
+//!  drives the per-step `compute_mask()` → `consume_token()` loop.
+//!  Grammar-compile cost (entity×field enumeration) is paid at
+//!  `compile_grammar()` call time, not per decoded token.
 
 use crate::grammar::GrammarSchema;
 #[cfg(feature = "onnx")]
 use crate::grammar::build_natsql_grammar;
+#[cfg(feature = "onnx")]
+use crate::onnx::{OnnxDecoder, OnnxEncoder};
+#[cfg(feature = "onnx")]
+use crate::tokenizer_bridge::OnnxTokEnv;
 use semsql_core::{Result, SemsqlError};
+#[cfg(feature = "onnx")]
+use std::path::Path;
+#[cfg(feature = "onnx")]
+use llguidance::{ParserFactory, TokenParser};
+#[cfg(feature = "onnx")]
+use tokenizers::Tokenizer;
+
+/// T5 special token: decoder start / pad. T5-small and T5-efficient-base
+/// both use token id 0 as the padding / decoder-start token.
+#[cfg(feature = "onnx")]
+const T5_PAD_ID: i64 = 0;
+
+/// End-of-sequence token id for T5 vocab (shared across T5 family).
+#[cfg(feature = "onnx")]
+const T5_EOS_ID: i64 = 1;
+
+/// Hard cap on generated skeleton length. 96 tokens covers every NatSQL
+/// v0.2 skeleton observed in the Spider+BIRD training corpus; the grammar
+/// also enforces structural completeness so we rarely hit this limit.
+#[cfg(feature = "onnx")]
+const MAX_DECODE_STEPS: usize = 96;
 
 /// Result of one Stage 2 run.
 #[derive(Clone, Debug, Default)]
 pub struct SkeletonOutput {
-    /// NatSQL skeleton, e.g. `SELECT @field1 FROM @entity1 WHERE @field2 = @val1`.
+    /// NatSQL skeleton, e.g.
+    /// `SELECT @field1 FROM @entity1 WHERE @field2 = @val1`.
     pub skeleton: String,
     /// Mean log-prob across decoded tokens — used for confidence routing.
+    /// Range `(-∞, 0]`; close to 0 means high confidence.
     pub mean_logprob: f32,
+    /// Tokens that were banned during decoding (repair-mode reruns).
+    /// Empty on the first successful pass; populated when the validator
+    /// rejected a previous attempt and decode was retried with the
+    /// offending tokens masked out.
+    pub repair_attempts: u32,
 }
 
-/// Run Stage 2.
-pub fn generate(
-    _nl: &str,
-    _ranked_entities: &[String],
-    _ranked_fields: &[String],
-) -> Result<SkeletonOutput> {
-    Err(semsql_core::SemsqlError::Other(
-        "stage_skeleton::generate not yet implemented (v0.2 milestone)".into(),
-    ))
+// ---------------------------------------------------------------------------
+// SkeletonGenerator — the loaded model pair
+// ---------------------------------------------------------------------------
+
+/// Loaded Stage 2 model pair: encoder ONNX + decoder ONNX + tokenizer.
+///
+/// [`SkeletonGenerator::load`] reads the ONNX files produced by
+/// `python/semsql_train/onnx_export.py::export_stage("skeleton", ...)`.
+/// Optimum exports seq2seq models into a directory with:
+///
+///   - `encoder_model.onnx`
+///   - `decoder_model.onnx`
+///   - `tokenizer.json`
+///
+/// The manifest's `skeleton.path` must point at that directory.
+///
+/// `SkeletonGenerator` is `Send + Sync` — both underlying `ort::Session`s
+/// use `Mutex` internally. It can be shared across query threads.
+#[cfg(feature = "onnx")]
+pub struct SkeletonGenerator {
+    encoder: OnnxEncoder,
+    decoder: OnnxDecoder,
+    tokenizer: Tokenizer,
+    /// llguidance parser factory bound to the model tokenizer. Built once
+    /// at load — cloning a `ParserFactory` is cheap (it shares the
+    /// `SlicedBiasComputer` via `Arc`) so per-query parser creation is
+    /// amortised against the one-time vocab → trie construction.
+    parser_factory: ParserFactory,
 }
+
+#[cfg(feature = "onnx")]
+impl SkeletonGenerator {
+    /// Tokenize `text` and return its token ids — used by repair-mode
+    /// to convert validator-rejected identifiers back into the decoder
+    /// vocabulary so the next attempt can mask them out.
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
+        let enc = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| SemsqlError::Other(format!("encode_text: {e}")))?;
+        Ok(enc.get_ids().to_vec())
+    }
+
+    /// Load the encoder+decoder ONNX pair from `model_dir` (the directory
+    /// that `optimum` wrote) and the tokenizer from `tokenizer_path`.
+    ///
+    /// Expected directory layout:
+    ///
+    /// ```text
+    /// model_dir/
+    ///   encoder_model.onnx
+    ///   decoder_model.onnx
+    /// ```
+    pub fn load(model_dir: &Path, tokenizer_path: &Path) -> Result<Self> {
+        let encoder_path = model_dir.join("encoder_model.onnx");
+        let decoder_path = model_dir.join("decoder_model.onnx");
+
+        if !encoder_path.exists() {
+            return Err(SemsqlError::Other(format!(
+                "encoder_model.onnx not found in `{}`",
+                model_dir.display()
+            )));
+        }
+        if !decoder_path.exists() {
+            return Err(SemsqlError::Other(format!(
+                "decoder_model.onnx not found in `{}`",
+                model_dir.display()
+            )));
+        }
+
+        let encoder = OnnxEncoder::load(&encoder_path)?;
+        let decoder = OnnxDecoder::load(&decoder_path)?;
+        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
+            SemsqlError::Other(format!(
+                "tokenizer load `{}`: {e}",
+                tokenizer_path.display()
+            ))
+        })?;
+
+        // Build the llguidance tokenizer bridge once. The tokenizer is
+        // cloned (cheap — it's a single Arc<TokenizerImpl> internally)
+        // because both `SkeletonGenerator` (for source encoding) and
+        // `OnnxTokEnv` (for grammar-driven re-tokenisation) need it.
+        let tok_env = OnnxTokEnv::new(tokenizer.clone())?.into_tok_env();
+        let mut parser_factory = ParserFactory::new_simple(&tok_env)
+            .map_err(|e| SemsqlError::Other(format!("ParserFactory::new_simple: {e}")))?;
+        // Quiet the per-mask logging — we have our own observability via
+        // SkeletonOutput.repair_attempts and parser_stats.
+        parser_factory.quiet();
+
+        Ok(Self { encoder, decoder, tokenizer, parser_factory })
+    }
+
+    /// Generate a NatSQL skeleton for `source` (the formatted encoder input:
+    /// `"question: <NL>  ¦  schema: ..."`) under the constraints defined by
+    /// `compiled_grammar`.
+    ///
+    /// Returns the decoded skeleton string and the mean log-prob across all
+    /// generated tokens. Uses greedy decoding (argmax after llguidance mask).
+    ///
+    /// `compiled_grammar.lark` is bound to the model tokenizer once per
+    /// generate call; the automaton is then driven step by step as tokens
+    /// are committed.
+    pub fn generate(
+        &self,
+        source: &str,
+        compiled_grammar: &CompiledGrammar,
+    ) -> Result<SkeletonOutput> {
+        self.generate_with_bans(source, compiled_grammar, &[], 0)
+    }
+
+    /// Generate with an explicit list of banned token ids and a repair-attempt
+    /// counter (surfaced in the output for telemetry).
+    ///
+    /// The banned list is OR-ed into the llguidance mask at every step:
+    /// any token id in `banned_token_ids` is force-masked to `-∞` regardless
+    /// of what the grammar says. This is the repair-mode path: when the
+    /// validator rejects a skeleton (e.g. it picked an out-of-scope
+    /// identifier), the cascade orchestrator captures the offending token
+    /// id(s), increments the attempt counter, and re-decodes with those
+    /// tokens forbidden.
+    pub fn generate_with_bans(
+        &self,
+        source: &str,
+        compiled_grammar: &CompiledGrammar,
+        banned_token_ids: &[u32],
+        repair_attempts: u32,
+    ) -> Result<SkeletonOutput> {
+        // 1. Tokenise the encoder source.
+        let enc = self
+            .tokenizer
+            .encode(source, true)
+            .map_err(|e| SemsqlError::Other(format!("tokenise source: {e}")))?;
+        let src_ids: Vec<i64> = enc.get_ids().iter().map(|&id| id as i64).collect();
+        let src_mask: Vec<i64> = enc.get_attention_mask().iter().map(|&m| m as i64).collect();
+        let src_len = src_ids.len();
+
+        if src_len == 0 {
+            return Err(SemsqlError::Other("empty encoder input".into()));
+        }
+
+        // 2. Encoder forward pass.
+        let enc_hidden = self
+            .encoder
+            .encode(&src_ids, &src_mask, src_len)?;
+        let hidden_size = self.encoder.hidden_size;
+
+        // 3. Set up llguidance constraint for this query.
+        //    The constraint is constructed per-query from the compiled grammar
+        //    and the model vocabulary. It drives the token-level mask.
+        let vocab_size = self.decoder.vocab_size;
+        let mut constraint = build_llguidance_constraint(
+            &compiled_grammar.lark,
+            &self.parser_factory,
+            vocab_size,
+        )?;
+
+        // 4. Greedy decode loop.
+        let mut decode_ids: Vec<i64> = vec![T5_PAD_ID]; // T5 decoder starts with pad
+        let mut log_probs: Vec<f32> = Vec::new();
+
+        loop {
+            if decode_ids.len() > MAX_DECODE_STEPS {
+                break;
+            }
+
+            // 4a. Compute llguidance token mask for this position.
+            //     Returns a bit-vector of length vocab_size; 1 = allowed.
+            let mut mask = query_llguidance_mask(&mut constraint, vocab_size);
+            // Apply repair-mode bans: tokens that triggered a previous
+            // validation failure are forbidden regardless of grammar.
+            for &banned in banned_token_ids {
+                let idx = banned as usize;
+                if idx < mask.len() {
+                    mask[idx] = false;
+                }
+            }
+
+            // 4b. Decoder one step — pass full prefix so the non-KV-cache
+            //     decoder ONNX can attend over all tokens generated so far.
+            let logits = self.decoder.step(
+                &decode_ids,
+                &enc_hidden,
+                &src_mask,
+                src_len,
+                hidden_size,
+            )?;
+
+            // 4c. Apply mask: set forbidden logits to −∞.
+            let masked_logits = apply_token_mask(&logits, &mask);
+
+            // 4d. Greedy argmax + log-prob tracking.
+            let (next_id, logprob) = greedy_argmax_logprob(&masked_logits)?;
+            log_probs.push(logprob);
+
+            // 4e. Check for EOS.
+            if next_id == T5_EOS_ID as usize {
+                break;
+            }
+
+            // 4f. Commit the token to the constraint and accumulate.
+            commit_llguidance_token(&mut constraint, next_id as u32);
+            decode_ids.push(next_id as i64);
+        }
+
+        // 5. Decode the generated token ids back to text (strip the BOS pad).
+        let generated_ids: Vec<u32> = decode_ids[1..]
+            .iter()
+            .map(|&id| id as u32)
+            .collect();
+        let skeleton = self
+            .tokenizer
+            .decode(&generated_ids, true)
+            .map_err(|e| SemsqlError::Other(format!("decode skeleton tokens: {e}")))?;
+
+        let mean_logprob = if log_probs.is_empty() {
+            0.0
+        } else {
+            log_probs.iter().sum::<f32>() / log_probs.len() as f32
+        };
+
+        Ok(SkeletonOutput {
+            skeleton: skeleton.trim().to_string(),
+            mean_logprob,
+            repair_attempts,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grammar compilation — available regardless of `onnx` feature
+// ---------------------------------------------------------------------------
 
 /// Compile the per-query NatSQL grammar through llguidance so the
 /// decoder can apply token-level constraints. The function builds the
@@ -59,11 +330,6 @@ pub fn compile_grammar(schema: &GrammarSchema) -> Result<CompiledGrammar> {
 
     let lark = build_natsql_grammar(schema);
     let grammar = TopLevelGrammar::from_lark(lark.clone());
-    // `validate(None, ...)` runs the full lark→internal compile path
-    // *without* needing a tokenizer. The actual decoder loop binds a
-    // tokenizer at Stage 2 invocation time; this call exists so a
-    // grammar bug surfaces near the schema slice that produced it
-    // (and warms llguidance's regex cache as a side effect).
     let init = GrammarInit::Serialized(grammar);
     let warnings = match init.validate(None, ParserLimits::default()) {
         ValidationResult::Valid => Vec::new(),
@@ -79,10 +345,7 @@ pub fn compile_grammar(schema: &GrammarSchema) -> Result<CompiledGrammar> {
     Ok(CompiledGrammar { lark, warnings })
 }
 
-/// Default-build shim. With `--features onnx` off, callers shouldn't
-/// reach Stage 2; the cascade orchestrator returns `NeedsModel` long
-/// before. This stub exists so callers compiling without the feature
-/// see a single, honest error rather than a missing-symbol link error.
+/// Default-build shim.
 #[cfg(not(feature = "onnx"))]
 pub fn compile_grammar(_schema: &GrammarSchema) -> Result<CompiledGrammar> {
     Err(SemsqlError::Other(
@@ -90,8 +353,8 @@ pub fn compile_grammar(_schema: &GrammarSchema) -> Result<CompiledGrammar> {
     ))
 }
 
-/// Output of [`compile_grammar`]. The `lark` source is retained so a
-/// Stage 2 decoder loop can re-bind the grammar against a tokenizer
+/// Output of [`compile_grammar`]. The `lark` source is retained so the
+/// Stage 2 decoder loop can bind the grammar against the model tokenizer
 /// (the bind step is per-tokenizer, not per-grammar). `warnings` are
 /// llguidance-emitted lints — non-blocking but worth surfacing in
 /// `semsql doctor` so subtle grammar regressions don't go unnoticed.
@@ -103,6 +366,152 @@ pub struct CompiledGrammar {
     /// Non-fatal warnings from llguidance's lexer/grammar compiler.
     pub warnings: Vec<String>,
 }
+
+// ---------------------------------------------------------------------------
+// llguidance per-step helpers — feature-gated
+// ---------------------------------------------------------------------------
+
+/// Per-query llguidance state — wraps a `TokenParser` driven via
+/// `compute_mask()` / `consume_token()`.
+#[cfg(feature = "onnx")]
+pub(crate) struct LlgConstraint {
+    /// llguidance parser. Holds the compiled automaton + the running
+    /// position; cloned cheaply from `ParserFactory` per query.
+    parser: TokenParser,
+    /// `true` once the parser has been moved past the prompt phase. The
+    /// llguidance API requires `process_prompt` (or `start_without_prompt`)
+    /// before `compute_mask`; we lazy-init on the first mask call.
+    started: bool,
+}
+
+/// Construct a fresh llguidance constraint for one generation run.
+///
+/// Compiles the Lark grammar against the bound tokenizer (one-shot at
+/// `ParserFactory` creation; the per-call cost here is automaton
+/// instantiation only) and returns a `TokenParser` ready for
+/// `compute_mask()` / `consume_token()` driving from the decode loop.
+#[cfg(feature = "onnx")]
+fn build_llguidance_constraint(
+    lark: &str,
+    factory: &ParserFactory,
+    vocab_size: usize,
+) -> Result<LlgConstraint> {
+    use llguidance::api::TopLevelGrammar;
+    let grammar = TopLevelGrammar::from_lark(lark.to_string());
+    let parser = factory
+        .create_parser(grammar)
+        .map_err(|e| SemsqlError::Other(format!("llguidance parser create: {e}")))?;
+    let _ = vocab_size;  // sized at the call site for symmetry with the mask path
+    Ok(LlgConstraint { parser, started: false })
+}
+
+/// Returns a bitmask of allowed tokens at the current decode position.
+///
+/// Calls `TokenParser::compute_mask()` and converts the resulting
+/// `SimpleVob` into a `Vec<bool>` sized to the model vocabulary. On
+/// llguidance error (e.g. grammar accepts the current state but the
+/// automaton has no extension at all — usually because the schema slice
+/// has degenerated) we fall back to the permissive mask so the decoder
+/// can finish; the validator + repair-mode loop catches semantic faults
+/// downstream.
+#[cfg(feature = "onnx")]
+fn query_llguidance_mask(constraint: &mut LlgConstraint, vocab_size: usize) -> Vec<bool> {
+    if !constraint.started {
+        constraint.parser.start_without_prompt();
+        constraint.started = true;
+    }
+    match constraint.parser.compute_mask() {
+        Ok(vob) => {
+            let mut out = vec![false; vocab_size];
+            for tok in vob.iter() {
+                let idx = tok as usize;
+                if idx < vocab_size {
+                    out[idx] = true;
+                }
+            }
+            out
+        }
+        Err(_) => {
+            // Permissive fallback — the validator / repair loop
+            // catches structural drift after generation.
+            vec![true; vocab_size]
+        }
+    }
+}
+
+/// Commit a generated token to the constraint state.
+#[cfg(feature = "onnx")]
+fn commit_llguidance_token(constraint: &mut LlgConstraint, token_id: u32) {
+    // Errors here mean the token violated the grammar — extremely rare
+    // because we only commit the argmax of an already-masked logits
+    // vector. Swallow and let the validator decide what to do; logging
+    // would belong to the cascade orchestrator's repair-mode bookkeeping.
+    let _ = constraint.parser.consume_token(token_id);
+}
+
+// ---------------------------------------------------------------------------
+// Decoding utilities
+// ---------------------------------------------------------------------------
+
+/// Apply a boolean token mask to raw logits: forbidden tokens → −∞.
+#[cfg(feature = "onnx")]
+fn apply_token_mask(logits: &[f32], mask: &[bool]) -> Vec<f32> {
+    logits
+        .iter()
+        .zip(mask.iter().chain(std::iter::repeat(&true)))
+        .map(|(&l, &allowed)| if allowed { l } else { f32::NEG_INFINITY })
+        .collect()
+}
+
+/// Greedy argmax + log-prob extraction.
+///
+/// Returns `(best_token_id, log_prob)`. `log_prob = log(softmax[best_id])`.
+/// Returns an error if `logits` is empty or every entry is `−∞` (can
+/// happen if the grammar mask forbids all tokens — indicates a grammar
+/// or model mismatch that must be surfaced).
+#[cfg(feature = "onnx")]
+fn greedy_argmax_logprob(logits: &[f32]) -> Result<(usize, f32)> {
+    if logits.is_empty() {
+        return Err(SemsqlError::Other("empty logits from decoder".into()));
+    }
+
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max.is_infinite() {
+        return Err(SemsqlError::Other(
+            "all tokens masked (grammar + model mismatch)".into(),
+        ));
+    }
+
+    let best_idx = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap();
+
+    // Compute log(softmax[best_idx]) for confidence tracking.
+    let exps: Vec<f32> = logits
+        .iter()
+        .map(|&v| if v.is_finite() { (v - max).exp() } else { 0.0 })
+        .collect();
+    let sum: f32 = exps.iter().sum();
+    let log_prob = if sum > f32::EPSILON {
+        (exps[best_idx] / sum).ln()
+    } else {
+        f32::NEG_INFINITY
+    };
+
+    Ok((best_idx, log_prob))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(all(test, feature = "onnx"))]
 mod tests {
@@ -126,10 +535,6 @@ mod tests {
 
     #[test]
     fn empty_schema_emits_an_unsatisfiable_grammar_but_still_compiles() {
-        // The sentinel `__no_entities__` / `__no_fields__` productions
-        // mean the grammar accepts no input — but it must still parse
-        // through llguidance so callers see the schema-coverage gap as
-        // a Stage 0 problem rather than a grammar-bug crash.
         let compiled = compile_grammar(&GrammarSchema::default())
             .expect("sentinel grammar must still parse");
         assert!(compiled.lark.contains("__no_entities__"));
@@ -137,14 +542,41 @@ mod tests {
 
     #[test]
     fn weird_canonical_names_compile_after_lark_escaping() {
-        // Defensive — sanitiser should keep these out, but the grammar
-        // generator escapes them anyway. Make sure the escape survives
-        // round-trip through llguidance.
         let schema = GrammarSchema {
             entities: vec!["weird\"name".into()],
             fields: vec!["weird\"name.col".into()],
             value_slots: vec![],
         };
         compile_grammar(&schema).expect("escaped quotes must compile");
+    }
+
+    #[test]
+    fn apply_token_mask_sets_forbidden_to_neg_inf() {
+        let logits = vec![1.0, 2.0, 3.0, 4.0];
+        let mask = vec![true, false, true, false];
+        let out = apply_token_mask(&logits, &mask);
+        assert!(out[0].is_finite());
+        assert!(out[1].is_infinite() && out[1] < 0.0);
+        assert!(out[2].is_finite());
+        assert!(out[3].is_infinite() && out[3] < 0.0);
+    }
+
+    #[test]
+    fn greedy_argmax_picks_highest_finite() {
+        let logits = vec![1.0, f32::NEG_INFINITY, 5.0, 3.0];
+        let (idx, lp) = greedy_argmax_logprob(&logits).unwrap();
+        assert_eq!(idx, 2);
+        assert!(lp < 0.0);
+    }
+
+    #[test]
+    fn greedy_argmax_errors_on_all_masked() {
+        let logits = vec![f32::NEG_INFINITY, f32::NEG_INFINITY];
+        assert!(greedy_argmax_logprob(&logits).is_err());
+    }
+
+    #[test]
+    fn greedy_argmax_errors_on_empty() {
+        assert!(greedy_argmax_logprob(&[]).is_err());
     }
 }

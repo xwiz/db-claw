@@ -8,7 +8,13 @@ from __future__ import annotations
 
 import pytest
 
-from semsql_rewriter.injector import InjectionResult, InjectorError, ScopeRule, inject
+from semsql_rewriter.injector import (
+    AuditLogWriter,
+    InjectionResult,
+    InjectorError,
+    ScopeRule,
+    inject,
+)
 
 
 def _users_rule(entity: str = "users") -> ScopeRule:
@@ -133,3 +139,64 @@ class TestDialectRendering:
             "SELECT * FROM users", {"users": _users_rule()}, _params(), dialect="postgres"
         )
         assert "%(tenant)s" in result.sql
+
+
+class TestAuditLogWriter:
+    """Persistence surface for the in-memory audit trail."""
+
+    def test_records_one_line_per_injection(self, tmp_path) -> None:
+        import json
+
+        result = inject(
+            "SELECT u1.id FROM users u1 JOIN users u2 ON u1.id = u2.id",
+            {"users": _users_rule()},
+            _params(),
+            dialect="sqlite",
+        )
+        log = tmp_path / "audit.jsonl"
+        writer = AuditLogWriter(log)
+        n = writer.record("req-42", result)
+        assert n == 2  # two physical references → two entries
+
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        for line in lines:
+            entry = json.loads(line)
+            assert entry["query_id"] == "req-42"
+            assert entry["alias"] in {"u1", "u2"}
+            assert "tenant_id" in entry["predicate"]
+            assert entry["source_rule"] == "tenant_isolation"
+            assert entry["timestamp_utc"]  # ISO-8601 UTC
+
+    def test_appends_across_calls(self, tmp_path) -> None:
+        log = tmp_path / "audit.jsonl"
+        writer = AuditLogWriter(log)
+        for qid in ["req-1", "req-2", "req-3"]:
+            r = inject(
+                "SELECT * FROM users",
+                {"users": _users_rule()},
+                _params(),
+                dialect="sqlite",
+            )
+            writer.record(qid, r)
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 3
+        import json
+        ids = [json.loads(l)["query_id"] for l in lines]
+        assert ids == ["req-1", "req-2", "req-3"]
+
+    def test_no_entries_when_query_already_scoped(self, tmp_path) -> None:
+        log = tmp_path / "audit.jsonl"
+        writer = AuditLogWriter(log)
+        r = inject(
+            "SELECT * FROM users WHERE users.tenant_id = :tenant "
+            "AND users.deleted_at IS NULL",
+            {"users": _users_rule()},
+            _params(),
+            dialect="sqlite",
+        )
+        n = writer.record("idempotent", r)
+        assert n == 0
+        # File created but empty.
+        assert log.exists()
+        assert log.read_text(encoding="utf-8") == ""

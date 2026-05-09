@@ -74,11 +74,11 @@ pub struct ScoredCandidate {
 }
 
 /// Threshold below which a slot escalates to clarification instead of
-/// committing the model's top pick. 0.4 is conservative — distilled
-/// students rarely produce sub-0.4 scores for a candidate they're
-/// confident about, but a malicious or out-of-distribution query
-/// drives every candidate below this.
-pub const ABSTAIN_THRESHOLD: f32 = 0.4;
+/// committing the model's top pick. 0.1 is the Phase A smoke-test value —
+/// BIRD questions score 0.18-0.38 on models trained on Spider, which is
+/// lower than the 0.4 threshold calibrated for Spider. Raise back to 0.4
+/// after Phase D retraining on BIRD.
+pub const ABSTAIN_THRESHOLD: f32 = 0.1;
 
 /// Bias added to candidates whose canonical tail matches an intent
 /// hint. Smaller than Stage 1's `intent_bias` (0.3) because Stage 3

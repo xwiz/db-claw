@@ -64,9 +64,24 @@ class SpiderSuite:
     def load(cls, manifest: Path, db_root: Path, name: SuiteName = "spider") -> SpiderSuite:
         """Load a Spider/BIRD-style ``dev.json`` (or ``train.json``).
 
-        Spider's manifest is a list of dicts with at least ``db_id``,
-        ``question``, ``query`` (gold SQL).  BIRD uses ``SQL`` instead of
-        ``query`` and adds a few metadata fields we ignore.
+        Field-name normalisation across the three supported suites:
+
+        ============ ================== ====================== ============================
+        suite        question field     gold-SQL field         db-id field
+        ============ ================== ====================== ============================
+        spider 1.0   ``question``       ``query``              ``db_id``
+        bird         ``question``       ``SQL``                ``db_id``
+        spider 2.0-  ``instruction``    ``query`` (when        ``db`` (dataset name)
+        lite                            inline) or via the
+                                        ``gold_sql`` field
+        ============ ================== ====================== ============================
+
+        Spider 2.0-lite often stores gold SQL in an external file
+        (`evaluation_suite/gold/exec_result/<instance_id>.csv`); we
+        do *not* resolve those paths here. Manifests that omit an
+        inline gold field for an entry surface an explicit error so
+        the operator routes the run through a Spider 2.0-lite-aware
+        loader (out of scope for the v0.5 cut).
         """
         raw = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
@@ -74,12 +89,30 @@ class SpiderSuite:
 
         examples: list[Example] = []
         for entry in raw:
-            db_id = entry["db_id"]
-            question = entry["question"]
-            gold = entry.get("query") or entry.get("SQL") or entry.get("sql")
+            db_id = entry.get("db_id") or entry.get("db")
+            if not db_id:
+                raise ValueError(
+                    f"{manifest}: entry missing db_id/db field: {entry!r}"
+                )
+            question = (
+                entry.get("question")
+                or entry.get("instruction")
+                or entry.get("nl")
+            )
+            if not question:
+                raise ValueError(
+                    f"{manifest}: entry for {db_id!r} missing question/instruction/nl field"
+                )
+            gold = (
+                entry.get("query")
+                or entry.get("SQL")
+                or entry.get("sql")
+                or entry.get("gold_sql")
+            )
             if not gold:
                 raise ValueError(
-                    f"{manifest}: entry for {db_id!r} missing query/SQL/sql field"
+                    f"{manifest}: entry for {db_id!r} missing query/SQL/sql/gold_sql field "
+                    "(Spider 2.0-lite manifests with external gold files are not yet supported)"
                 )
             db_path = db_root / db_id / f"{db_id}.sqlite"
             examples.append(

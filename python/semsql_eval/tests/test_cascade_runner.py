@@ -97,6 +97,8 @@ def test_query_returns_none_on_unresolvable_question(
     res = run_cascade_query(semsql_bin, graph, "show tenants")
     assert res.sql == "SELECT * FROM tenants"
     assert res.stage_pinned == "stage_0a"
+    # Phase E observability: Stage 0a is grammar-free, so no repair attempts.
+    assert res.repair_attempts == 0
 
     # A genuinely complex question bails before models are wired.
     bail = run_cascade_query(
@@ -104,6 +106,21 @@ def test_query_returns_none_on_unresolvable_question(
     )
     assert bail.sql is None
     assert bail.stage_pinned == "needs_model"
+    assert bail.repair_attempts == 0
+
+
+def test_parse_repair_attempts_extracts_counter_from_stderr() -> None:
+    """The Phase E ``repair_attempts=N`` tag round-trips through stderr."""
+    from semsql_eval.cascade_runner import _parse_repair_attempts
+
+    assert _parse_repair_attempts("") == 0
+    assert _parse_repair_attempts("stage_pinned=stage_3\n") == 0
+    assert _parse_repair_attempts("repair_attempts=0\n") == 0
+    assert _parse_repair_attempts("repair_attempts=3\nstage_pinned=stage_3\n") == 3
+    # Multiple — last wins (defensive against future per-stage logging).
+    assert (
+        _parse_repair_attempts("repair_attempts=1\nrepair_attempts=4\n") == 4
+    )
 
 
 def test_make_predictor_returns_sentinel_on_bail(
@@ -155,6 +172,59 @@ def test_predictor_raises_when_binary_missing(tmp_path: Path) -> None:
             semsql_bin=tmp_path / "nope.exe",
             graph_cache_dir=tmp_path / "graphs",
         )
+
+
+def test_run_cascade_query_forwards_intent_yaml(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """The runner should pass `--intent-yaml` through so Stage 0b's
+    Top-N pattern can use the production intent library at eval time."""
+    src = tmp_path / "demo.sqlite"
+    _build_demo_sqlite(src)
+    graph = tmp_path / "demo.semsql"
+    build_graph_for_db(semsql_bin, src, graph)
+
+    intent = tmp_path / "patterns.yaml"
+    intent.write_text(
+        "- pattern: '\\b(top|highest)\\b'\n"
+        "  intent_type: ranking\n"
+        "  column_hints: [id]\n"
+        "  ordering: DESC\n"
+        "  default_limit: 5\n",
+        encoding="utf-8",
+    )
+
+    # The intent path itself must be accepted by the binary — assert no
+    # crash and that a Stage 0a query still resolves through.
+    res = run_cascade_query(
+        semsql_bin, graph, "show tenants", intent_yaml=intent
+    )
+    assert res.sql == "SELECT * FROM tenants"
+    assert res.stage_pinned == "stage_0a"
+
+
+def test_run_cascade_query_forwards_cascade_manifest_arg(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    """The runner should pass `--cascade-manifest` through. Without
+    `--features onnx` the binary still accepts the flag (the manifest
+    is silently ignored) so the wiring is exercised end-to-end on every
+    build."""
+    src = tmp_path / "demo.sqlite"
+    _build_demo_sqlite(src)
+    graph = tmp_path / "demo.semsql"
+    build_graph_for_db(semsql_bin, src, graph)
+
+    # Manifest doesn't need to be valid JSON in non-onnx builds — the
+    # binary never reads it. We point at a placeholder so the flag is
+    # forwarded.
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    res = run_cascade_query(
+        semsql_bin, graph, "show tenants", cascade_manifest=manifest
+    )
+    assert res.sql == "SELECT * FROM tenants"
 
 
 def test_predictor_rejects_path_traversal_db_ids(

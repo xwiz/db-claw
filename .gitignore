@@ -26,8 +26,12 @@ node_modules/
 models/cascade/*.onnx
 models/fine-tunes/**
 *.parquet
-data/raw/
-data/cache/
+data/
+!data/.gitkeep
+*.jsonl
+*.onnx
+*.sqlite
+*.db
 
 # SemanticGraph artefacts
 *.semsql
@@ -38,6 +42,7 @@ data/cache/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 *.swp
 *~
 
@@ -45,3 +50,7 @@ data/cache/
 .env
 .env.*
 !.env.example
+
+# Scratch / one-off scripts at repo root
+/eval_*.py
+/gpu_diag.py

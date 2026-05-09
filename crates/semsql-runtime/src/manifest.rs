@@ -28,6 +28,11 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StageArtifact {
     /// ONNX file path, resolved against the manifest's parent directory.
+    ///
+    /// For seq2seq stages (Stage 2 / skeleton generator), this may point
+    /// to a **directory** produced by `optimum` rather than a single ONNX
+    /// file. The directory is expected to contain `encoder_model.onnx` and
+    /// `decoder_model.onnx`. Use `is_seq2seq_dir()` to detect this case.
     pub path: PathBuf,
     /// Tokenizer file path, resolved against the manifest's parent.
     pub tokenizer: PathBuf,
@@ -35,6 +40,15 @@ pub struct StageArtifact {
     /// "is this the model you think it is?" checks. May be 0 if the
     /// exporter couldn't read the ONNX initialisers.
     pub params: u64,
+}
+
+impl StageArtifact {
+    /// True when `path` is a directory (seq2seq model exported by optimum
+    /// into an `encoder_model.onnx` + `decoder_model.onnx` pair) rather
+    /// than a single-file ONNX artifact.
+    pub fn is_seq2seq_dir(&self) -> bool {
+        self.path.is_dir()
+    }
 }
 
 /// Cascade manifest. Mirrors the Python `Manifest` dataclass.
@@ -119,10 +133,31 @@ fn resolve_stage(
     let tok = resolve_relative(parent, &stage.tokenizer);
     if !onnx.exists() {
         return Err(SemsqlError::Other(format!(
-            "manifest `{}` references missing {name} ONNX `{}`",
+            "manifest `{}` references missing {name} ONNX/directory `{}`",
             manifest_path.display(),
             onnx.display(),
         )));
+    }
+    // For seq2seq stages the path may be a directory — verify that the
+    // expected sub-files exist so operators see a clear error instead of
+    // a cryptic ort::Error mid-inference.
+    if onnx.is_dir() {
+        let enc = onnx.join("encoder_model.onnx");
+        let dec = onnx.join("decoder_model.onnx");
+        if !enc.exists() {
+            return Err(SemsqlError::Other(format!(
+                "manifest `{}`: {name} directory `{}` missing encoder_model.onnx",
+                manifest_path.display(),
+                onnx.display(),
+            )));
+        }
+        if !dec.exists() {
+            return Err(SemsqlError::Other(format!(
+                "manifest `{}`: {name} directory `{}` missing decoder_model.onnx",
+                manifest_path.display(),
+                onnx.display(),
+            )));
+        }
     }
     if !tok.exists() {
         return Err(SemsqlError::Other(format!(

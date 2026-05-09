@@ -60,14 +60,26 @@ import {
     sanitiseLabel,
     SanitiserError,
     SourceLayer,
+    type LangIndex,
+    type LangIndexEntry,
     type VocabFragment,
 } from "@semsql/extractor-sdk";
+
+export type { LangIndex, LangIndexEntry };
 
 /** Result of walking the locales directory. */
 export interface LocalesScanResult {
     fragments: VocabFragment[];
     /** Files we recognised as locale YAML but couldn't parse. */
     skipped: Array<{ file: string; reason: string }>;
+    /**
+     * Raw Rails I18n key → label index. Maps the dotted Rails I18n key
+     * (locale stripped — `activerecord.models.user`) to its
+     * preferred-locale label. View-side walkers (`t('users.email')`
+     * helpers in ERB / Slim / Haml templates) consult this index when
+     * resolving i18n-bound vocabulary.
+     */
+    index: LangIndex;
 }
 
 /** Locales we treat as authoritative for canonical names. English by
@@ -91,7 +103,11 @@ export async function scanLocales(
     root: string,
     options: LocalesScanOptions = {},
 ): Promise<LocalesScanResult> {
-    const result: LocalesScanResult = { fragments: [], skipped: [] };
+    const result: LocalesScanResult = {
+        fragments: [],
+        skipped: [],
+        index: new Map<string, LangIndexEntry>(),
+    };
     const preferred = options.preferredLocale ?? "en";
     const localesDir = path.join(root, "config", "locales");
     await walkYaml(localesDir, result, preferred);
@@ -149,6 +165,65 @@ async function scanFile(
         if (!isPlainObject(body)) continue;
         const isPreferred = locale === preferred;
         emitFromLocale(file, body, isPreferred, result);
+        // Index pass — record every leaf string under its
+        // locale-stripped dotted Rails I18n key so view-side
+        // `t('users.email')`-class lookups resolve. Locale priority:
+        // preferred wins; otherwise first-write-wins.
+        recordIndexLeaves(body, [], file, locale, preferred, result);
+    }
+}
+
+function recordIndexLeaves(
+    node: unknown,
+    keyStack: string[],
+    file: string,
+    locale: string,
+    preferred: string,
+    result: LocalesScanResult,
+): void {
+    if (typeof node === "string") {
+        if (keyStack.length === 0) return;
+        const dotted = keyStack.join(".");
+        const incoming: LangIndexEntry = {
+            label: node,
+            locale,
+            file,
+            line: 1, // js-yaml doesn't surface per-key positions; line = 1 is best-effort.
+        };
+        const existing = result.index.get(dotted);
+        if (existing === undefined) {
+            result.index.set(dotted, incoming);
+            return;
+        }
+        // Preferred locale wins; otherwise keep first-seen for stability.
+        if (existing.locale !== preferred && locale === preferred) {
+            result.index.set(dotted, incoming);
+        }
+        return;
+    }
+    if (typeof node === "number" || typeof node === "boolean") {
+        // Stringify scalars too — `t('users.count')` returning `0`
+        // is a valid lookup; the i18n binding consumer treats labels
+        // as strings.
+        if (keyStack.length === 0) return;
+        const dotted = keyStack.join(".");
+        const incoming: LangIndexEntry = {
+            label: String(node),
+            locale,
+            file,
+            line: 1,
+        };
+        const existing = result.index.get(dotted);
+        if (existing === undefined) {
+            result.index.set(dotted, incoming);
+        } else if (existing.locale !== preferred && locale === preferred) {
+            result.index.set(dotted, incoming);
+        }
+        return;
+    }
+    if (!isPlainObject(node)) return;
+    for (const [k, v] of Object.entries(node)) {
+        recordIndexLeaves(v, [...keyStack, k], file, locale, preferred, result);
     }
 }
 

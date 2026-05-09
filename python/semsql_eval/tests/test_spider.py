@@ -130,3 +130,71 @@ def test_bird_field_alias(tmp_path: Path) -> None:
     )
     s = SpiderSuite.load(manifest, db_root, name="bird")
     assert s.examples[0].gold_sql == "SELECT id FROM users"
+
+
+def test_spider2_lite_field_aliases(tmp_path: Path) -> None:
+    """Spider 2.0-lite uses `instruction` for the question and `db`
+    for the dataset name. Inline gold SQL appears under `query` for
+    the lite variants that ship inline; we accept that path. External
+    gold files are out of scope (operator must pre-resolve)."""
+    db_root = tmp_path / "db"
+    _make_db(db_root, "demo")
+    manifest = tmp_path / "spider2_lite.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "db": "demo",
+                    "instruction": "active users",
+                    "query": "SELECT id FROM users WHERE status = 2",
+                },
+                {
+                    "db": "demo",
+                    "instruction": "all users",
+                    "gold_sql": "SELECT id FROM users",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    s = SpiderSuite.load(manifest, db_root, name="spider2")
+    assert len(s.examples) == 2
+    assert s.examples[0].db_id == "demo"
+    assert s.examples[0].question == "active users"
+    assert s.examples[0].gold_sql == "SELECT id FROM users WHERE status = 2"
+    # `gold_sql` falls through the alias chain.
+    assert s.examples[1].gold_sql == "SELECT id FROM users"
+
+
+def test_load_rejects_entry_missing_db_id(tmp_path: Path) -> None:
+    db_root = tmp_path / "db"
+    _make_db(db_root, "demo")
+    manifest = tmp_path / "broken.json"
+    manifest.write_text(
+        json.dumps([{"question": "x", "query": "SELECT 1"}]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="missing db_id/db field"):
+        SpiderSuite.load(manifest, db_root)
+
+
+def test_load_rejects_spider2_external_gold(tmp_path: Path) -> None:
+    db_root = tmp_path / "db"
+    _make_db(db_root, "demo")
+    manifest = tmp_path / "spider2_external.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {
+                    "db": "demo",
+                    "instruction": "active users",
+                    # No inline gold — Spider 2.0-lite often stores it
+                    # in `evaluation_suite/gold/...`. Operator must
+                    # pre-resolve before loading.
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="external gold files are not yet supported"):
+        SpiderSuite.load(manifest, db_root, name="spider2")

@@ -37,7 +37,13 @@ import {
     type VocabFragment,
 } from "@semsql/extractor-sdk";
 
-import { extractMakeLabelChainsAst, type MakeLabelChain } from "./php-ast.js";
+import {
+    extractMakeI18nChainsAst,
+    extractMakeLabelChainsAst,
+    type MakeI18nChain,
+    type MakeLabelChain,
+} from "./php-ast.js";
+import type { LangIndex } from "./lang.js";
 
 /** Result of one walk. */
 export interface FilamentScanResult {
@@ -64,9 +70,10 @@ export type ClassToEntityIndex = ReadonlyMap<string, string>;
 export async function scanFilamentResources(
     root: string,
     classToEntity?: ClassToEntityIndex,
+    langIndex?: LangIndex,
 ): Promise<FilamentScanResult> {
     const result: FilamentScanResult = { fragments: [], skipped: [] };
-    await walk(path.join(root, "app", "Filament"), result, classToEntity);
+    await walk(path.join(root, "app", "Filament"), result, classToEntity, langIndex);
     return result;
 }
 
@@ -74,6 +81,7 @@ async function walk(
     dir: string,
     result: FilamentScanResult,
     classToEntity?: ClassToEntityIndex,
+    langIndex?: LangIndex,
 ): Promise<void> {
     let entries: string[];
     try {
@@ -86,9 +94,9 @@ async function walk(
         const stat = await fs.stat(full).catch(() => null);
         if (!stat) continue;
         if (stat.isDirectory()) {
-            await walk(full, result, classToEntity);
+            await walk(full, result, classToEntity, langIndex);
         } else if (entry.endsWith("Resource.php")) {
-            await scanResourceFile(full, result, classToEntity);
+            await scanResourceFile(full, result, classToEntity, langIndex);
         }
     }
 }
@@ -97,6 +105,7 @@ async function scanResourceFile(
     file: string,
     result: FilamentScanResult,
     classToEntity?: ClassToEntityIndex,
+    langIndex?: LangIndex,
 ): Promise<void> {
     const text = await fs.readFile(file, "utf8");
     if (!/extends\s+Resource\b/.test(text)) {
@@ -137,6 +146,16 @@ async function scanResourceFile(
     // Form / Table column `->label()` calls — column-level vocabulary.
     for (const fl of extractMakeLabelPairs(text, file, canonical)) {
         result.fragments.push(fl);
+    }
+
+    // i18n-bound `->label(__('key'))` chains. Resolved against the
+    // optional lang index — a chain whose key isn't in the index is
+    // surfaced via `skipped` so users see the gap in `semsql doctor`
+    // rather than silently lose vocabulary.
+    if (langIndex !== undefined) {
+        for (const fl of extractMakeI18nFragments(text, file, canonical, langIndex, result)) {
+            result.fragments.push(fl);
+        }
     }
 }
 
@@ -227,6 +246,73 @@ export function extractMakeLabelPairsRaw(text: string): MakeLabelHit[] {
             field: match[2]!,
             label: unescapePhp(match[5]!),
             line: lineOf(text, match.index ?? 0),
+        });
+    }
+    return out;
+}
+
+/**
+ * Resolve every `Type::make('field')->label(__('key'))` chain in `text`
+ * against the supplied `langIndex` and emit field-level vocabulary
+ * fragments at FormOrTableLabel layer.
+ *
+ * Chains whose i18n key is not in the index are recorded in
+ * `result.skipped` with `i18n key not in lang index: <key>` — this is
+ * the diagnostic users want when `semsql doctor` shows under-vocabulary
+ * coverage on a localised app.
+ *
+ * Without an AST walker, the regex fallback would need to recognise
+ * the `__(...)` pattern too. tree-sitter is the only path supported
+ * for now; if the AST walker isn't available the i18n pass is skipped
+ * silently (the literal-string walker still runs).
+ */
+function extractMakeI18nFragments(
+    text: string,
+    file: string,
+    entityCanonical: string,
+    langIndex: LangIndex,
+    result: FilamentScanResult,
+): VocabFragment[] {
+    const chains = extractMakeI18nChainsAst(text);
+    if (chains === null) {
+        return []; // no AST walker on this host; literal walker carries the load
+    }
+    const out: VocabFragment[] = [];
+    for (const chain of chains as MakeI18nChain[]) {
+        const entry = langIndex.get(chain.i18nKey);
+        if (entry === undefined) {
+            result.skipped.push({
+                file,
+                reason: `i18n key not in lang index: ${chain.i18nKey} (line ${chain.line})`,
+            });
+            continue;
+        }
+        let canonicalField: string;
+        let cleanedLabel: string;
+        try {
+            canonicalField = sanitiseCanonical(chain.field);
+            cleanedLabel = sanitiseLabel(entry.label);
+        } catch (e) {
+            if (e instanceof SanitiserError) {
+                result.skipped.push({ file, reason: e.message });
+                continue;
+            }
+            throw e;
+        }
+        out.push({
+            term: cleanedLabel.toLowerCase(),
+            canonical: { kind: "field", field: `${entityCanonical}.${canonicalField}` },
+            // Slightly lower than literal-string (`0.95`) to reflect
+            // the i18n indirection — if the lang file changes after
+            // extract, the binding is stale. Still well above the
+            // 0.85 layer-5 confidence used for raw lang-file emits.
+            confidence: 0.92,
+            locator: {
+                file,
+                line: chain.line,
+                layer: SourceLayer.FormOrTableLabel,
+                extractor: `extractor-laravel:filament:make-label-i18n:${entry.locale}`,
+            },
         });
     }
     return out;

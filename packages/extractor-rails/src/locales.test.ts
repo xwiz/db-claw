@@ -197,3 +197,111 @@ en:
         expect(r.skipped[0]?.reason).toContain("yaml parse");
     });
 });
+
+describe("scanLocales — lang index", () => {
+    it("populates the index with locale-stripped Rails I18n keys", async () => {
+        await write(
+            "config/locales/en.yml",
+            `en:
+  activerecord:
+    models:
+      user: "User"
+    attributes:
+      user:
+        email: "Email Address"
+        is_active: "Active"
+  helpers:
+    label:
+      user:
+        email: "Your email"
+`,
+        );
+        const r = await scanLocales(tmp);
+        expect(r.index.get("activerecord.models.user")?.label).toBe("User");
+        expect(
+            r.index.get("activerecord.attributes.user.email")?.label,
+        ).toBe("Email Address");
+        expect(r.index.get("helpers.label.user.email")?.label).toBe(
+            "Your email",
+        );
+        expect(r.index.get("activerecord.models.user")?.locale).toBe("en");
+    });
+
+    it("prefers `en` over other locales on conflicts", async () => {
+        await write(
+            "config/locales/fr.yml",
+            `fr:
+  activerecord:
+    models:
+      user: "Utilisateur"
+`,
+        );
+        await write(
+            "config/locales/en.yml",
+            `en:
+  activerecord:
+    models:
+      user: "User"
+`,
+        );
+        const r = await scanLocales(tmp);
+        const entry = r.index.get("activerecord.models.user");
+        expect(entry?.label).toBe("User");
+        expect(entry?.locale).toBe("en");
+    });
+
+    it("respects an alternative `preferredLocale`", async () => {
+        await write(
+            "config/locales/en.yml",
+            `en:
+  activerecord:
+    models:
+      user: "User"
+`,
+        );
+        await write(
+            "config/locales/de.yml",
+            `de:
+  activerecord:
+    models:
+      user: "Benutzer"
+`,
+        );
+        const r = await scanLocales(tmp, { preferredLocale: "de" });
+        const entry = r.index.get("activerecord.models.user");
+        expect(entry?.label).toBe("Benutzer");
+        expect(entry?.locale).toBe("de");
+    });
+
+    it("indexes scalars (numbers/booleans) as strings", async () => {
+        await write(
+            "config/locales/en.yml",
+            `en:
+  pagination:
+    items_per_page: 25
+    show_borders: true
+`,
+        );
+        const r = await scanLocales(tmp);
+        expect(r.index.get("pagination.items_per_page")?.label).toBe("25");
+        expect(r.index.get("pagination.show_borders")?.label).toBe("true");
+    });
+
+    it("indexes deeply nested keys", async () => {
+        await write(
+            "config/locales/en.yml",
+            `en:
+  views:
+    pages:
+      home:
+        title: "Home"
+        subtitle: "Welcome"
+`,
+        );
+        const r = await scanLocales(tmp);
+        expect(r.index.get("views.pages.home.title")?.label).toBe("Home");
+        expect(r.index.get("views.pages.home.subtitle")?.label).toBe(
+            "Welcome",
+        );
+    });
+});

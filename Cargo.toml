@@ -120,6 +120,7 @@ clap = { version = "4", features = ["derive", "env"] }
 # Test utilities
 proptest = "1"
 insta = { version = "1", features = ["yaml", "json"] }
+criterion = { version = "0.5", default-features = false, features = ["html_reports"] }
 
 [profile.release]
 lto = "thin"

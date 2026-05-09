@@ -37,7 +37,9 @@ __all__ = [
     "Manifest",
     "MANIFEST_SCHEMA_VERSION",
     "ExportConfig",
+    "CascadeExportConfig",
     "export_stage",
+    "export_cascade",
     "write_manifest",
     "read_manifest",
 ]
@@ -136,6 +138,13 @@ def export_stage(cfg: ExportConfig) -> StageArtifact:
     onnx_path = cfg.output_dir / onnx_filename
     tokenizer_path = cfg.output_dir / tokenizer_filename
 
+    # Export to a per-stage staging subdir so multi-file exports
+    # (T5 encoder/decoder split) and per-stage ORTQuantizer runs don't
+    # clobber each other.  We then promote the canonical artefact(s)
+    # to <output_dir>/<stage>.onnx (and split-file siblings) by copy.
+    stage_dir = cfg.output_dir / f"_{cfg.stage}_export"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
     # 1+2. Export the model.
     if cfg.stage == "skeleton":
         model_cls = ORTModelForSeq2SeqLM
@@ -146,38 +155,63 @@ def export_stage(cfg: ExportConfig) -> StageArtifact:
         export=True,
         provider="CPUExecutionProvider",
     )
-    model.save_pretrained(cfg.output_dir)
+    model.save_pretrained(stage_dir)
 
     # 3. Quantise. Optimum's ORTQuantizer does dynamic int8 by default
     # which is the right call for encoder-style models — no calibration
     # data required.
     if cfg.int8:
         try:
-            quantizer = ORTQuantizer.from_pretrained(cfg.output_dir)
+            quantizer = ORTQuantizer.from_pretrained(stage_dir)
             qconfig = AutoQuantizationConfig.avx512_vnni(is_static=False, per_channel=False)
-            quantizer.quantize(save_dir=cfg.output_dir, quantization_config=qconfig)
+            quantizer.quantize(save_dir=stage_dir, quantization_config=qconfig)
         except Exception as e:  # pragma: no cover — depends on optimum runtime
             # Quantisation is a perf optimisation; a failure here should
             # not lose the un-quantised export.
-            (cfg.output_dir / "quantisation_failed.txt").write_text(
+            (stage_dir / "quantisation_failed.txt").write_text(
                 f"int8 quantisation skipped: {type(e).__name__}: {e}\n",
                 encoding="utf-8",
             )
 
-    # 4. Tokenizer side-by-side.
+    # 4. Tokenizer side-by-side in the stage_dir, then promote.
     tokenizer = AutoTokenizer.from_pretrained(cfg.checkpoint)
-    tokenizer.save_pretrained(cfg.output_dir)
-    if not tokenizer_path.exists():
-        # Some tokenizers save under a different filename — link the
-        # canonical one so the manifest lookup is stable.
-        for cand in ("tokenizer.json", "vocab.json"):
-            src = cfg.output_dir / cand
+    tokenizer.save_pretrained(stage_dir)
+
+    # Promote canonical ONNX file(s) to <stage>.onnx in cfg.output_dir.
+    # T5 (skeleton) exports as encoder_model.onnx + decoder_model.onnx
+    # + decoder_with_past_model.onnx; we keep all three under
+    # `<stage>_<role>.onnx` and use the encoder as the manifest path.
+    promoted_main: Path | None = None
+    if cfg.stage == "skeleton":
+        for role in ("encoder_model", "decoder_model", "decoder_with_past_model"):
+            src = stage_dir / f"{role}.onnx"
             if src.exists():
-                try:
-                    tokenizer_path.write_bytes(src.read_bytes())
-                except OSError:
-                    pass
+                dst = cfg.output_dir / f"{cfg.stage}_{role.replace('_model','')}.onnx"
+                dst.write_bytes(src.read_bytes())
+                if role == "encoder_model":
+                    promoted_main = dst
+        # Manifest path = the encoder; runtime loads the trio.
+        if promoted_main is not None:
+            onnx_path.write_bytes(promoted_main.read_bytes())
+    else:
+        # Sequence classification → single model.onnx (or model_quantized.onnx).
+        # Prefer the quantised one when present, fall back to fp32.
+        for cand_name in ("model_quantized.onnx", "model.onnx"):
+            src = stage_dir / cand_name
+            if src.exists():
+                onnx_path.write_bytes(src.read_bytes())
+                promoted_main = onnx_path
                 break
+
+    # Promote tokenizer to <stage>.tok.json.
+    for cand in ("tokenizer.json", "vocab.json"):
+        src = stage_dir / cand
+        if src.exists():
+            try:
+                tokenizer_path.write_bytes(src.read_bytes())
+            except OSError:
+                pass
+            break
 
     params = _count_onnx_parameters(onnx_path)
     return StageArtifact(
@@ -208,6 +242,94 @@ def _count_onnx_parameters(onnx_path: Path) -> int:
             n *= int(d)
         total += n
     return total
+
+
+@dataclass
+class CascadeExportConfig:
+    """Knobs for an end-to-end three-stage cascade export.
+
+    `linker_checkpoint` / `skeleton_checkpoint` / `slot_filler_checkpoint`
+    point at the HF-format directories produced by each stage's trainer
+    (e.g. `train_skeleton`'s `output_dir`). Either all three are
+    supplied — full cascade export — or any subset can be set with the
+    rest left as `None` to skip that stage and reuse a previous artefact.
+
+    The `output_dir` ends up containing:
+
+        manifest.json
+        linker.onnx       linker.tok.json
+        skeleton.onnx     skeleton.tok.json
+        slot_filler.onnx  slot_filler.tok.json
+    """
+
+    output_dir: Path
+    cascade_version: str
+    linker_checkpoint: Path | None = None
+    skeleton_checkpoint: Path | None = None
+    slot_filler_checkpoint: Path | None = None
+    int8: bool = True
+    opset: int = 17
+    natsql_grammar: str = "natsql.lark"
+
+
+def export_cascade(cfg: CascadeExportConfig) -> Manifest:
+    """Export every supplied stage checkpoint to ONNX and write the
+    cascade manifest.
+
+    Reuses any pre-existing per-stage artefacts in `output_dir` when
+    the corresponding checkpoint is `None` — a partial re-export only
+    re-runs the stages whose weights actually changed. Each stage's
+    `StageArtifact` is read from disk if the on-disk filenames are
+    present and the params count is recoverable; otherwise a
+    placeholder with `params=0` is emitted.
+
+    Returns the written manifest. Raises `RuntimeError` when no stage
+    checkpoint is supplied AND no pre-existing artefacts are found —
+    that would produce a useless empty manifest.
+    """
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+
+    artefacts: dict[str, StageArtifact] = {}
+
+    def _resolve(stage: str, ckpt: Path | None) -> StageArtifact:
+        if ckpt is not None:
+            stage_cfg = ExportConfig(
+                checkpoint=ckpt,
+                output_dir=cfg.output_dir,
+                stage=stage,
+                int8=cfg.int8,
+                opset=cfg.opset,
+            )
+            return export_stage(stage_cfg)
+        # No checkpoint — try to reuse a pre-existing artefact.
+        onnx_filename = f"{stage}.onnx"
+        tok_filename = f"{stage}.tok.json"
+        onnx_path = cfg.output_dir / onnx_filename
+        if not onnx_path.exists():
+            raise RuntimeError(
+                f"no checkpoint supplied for {stage} AND no existing "
+                f"{onnx_filename} found in {cfg.output_dir}"
+            )
+        tok_present = (cfg.output_dir / tok_filename).exists()
+        return StageArtifact(
+            path=onnx_filename,
+            tokenizer=tok_filename if tok_present else "tokenizer.json",
+            params=_count_onnx_parameters(onnx_path),
+        )
+
+    artefacts["linker"] = _resolve("linker", cfg.linker_checkpoint)
+    artefacts["skeleton"] = _resolve("skeleton", cfg.skeleton_checkpoint)
+    artefacts["slot_filler"] = _resolve("slot_filler", cfg.slot_filler_checkpoint)
+
+    manifest = Manifest(
+        cascade_version=cfg.cascade_version,
+        linker=artefacts["linker"],
+        skeleton=artefacts["skeleton"],
+        slot_filler=artefacts["slot_filler"],
+        natsql_grammar=cfg.natsql_grammar,
+    )
+    write_manifest(manifest, cfg.output_dir / "manifest.json")
+    return manifest
 
 
 def write_manifest(manifest: Manifest, dest: Path) -> Path:

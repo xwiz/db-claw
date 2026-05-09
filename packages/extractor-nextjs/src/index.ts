@@ -31,6 +31,7 @@ import type { Extractor, ExtractCtx, VocabFragment } from "@semsql/extractor-sdk
 
 import { scanDrizzleSchemas } from "./drizzle.js";
 import { scanPrismaSchemas } from "./prisma.js";
+import { scanZodSchemas } from "./zod.js";
 
 export {
     scanDrizzleSchemas,
@@ -47,6 +48,14 @@ export {
     extractTableMap,
     type PrismaScanResult,
 } from "./prisma.js";
+
+export {
+    scanZodSchemas,
+    findZodObjectBlocks,
+    findFieldsWithDescribe,
+    entityFromSchemaName,
+    type ZodScanResult,
+} from "./zod.js";
 
 export class NextjsExtractor implements Extractor {
     public readonly name = "extractor-nextjs";
@@ -74,7 +83,9 @@ export class NextjsExtractor implements Extractor {
         for (const f of drizzle.fragments) yield f;
         const prisma = await scanPrismaSchemas(ctx.root);
         for (const f of prisma.fragments) yield f;
+        const zod = await scanZodSchemas(ctx.root);
+        for (const f of zod.fragments) yield f;
     }
 }
 
-export const NEXTJS_VERSION = "0.1.0-dev";
+export const NEXTJS_VERSION = "0.5.0-dev";

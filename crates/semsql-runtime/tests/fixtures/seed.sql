@@ -14,5 +14,9 @@ VALUES ('users', 'status_code', 'status_code', 'integer', 'Status', 'users.statu
 INSERT INTO fields (entity, field, db_column, type, display_label, enum_canonical, unit_canonical, proto_blob)
 VALUES ('users', 'created_at', 'created_at', 'timestamp', 'Joined Date', NULL, NULL, X'');
 
+-- Numeric field for comparison + ordering + Top-N patterns.
+INSERT INTO fields (entity, field, db_column, type, display_label, enum_canonical, unit_canonical, proto_blob)
+VALUES ('users', 'balance', 'balance', 'INTEGER', 'Account Balance', NULL, NULL, X'');
+
 INSERT INTO enums (canonical_name, proto_blob, _enum_values_json)
 VALUES ('users.status_code', X'', '{"1": "Pending", "2": "Active", "39": "Error"}');

@@ -16,6 +16,11 @@ default = ["postgres"]
 # Re-export the underlying extract-db backend toggle so users can opt out
 # of Postgres at the CLI level (smaller binary, fewer transitive deps).
 postgres = ["semsql-extract-db/postgres"]
+# Pass-through to enable Stage 1/3 ONNX inference in the cascade. With
+# this feature off, `--cascade-manifest` is silently ignored at query
+# time and `semsql doctor` warns when the manifest is supplied. Pulls
+# in onnxruntime + tokenizers + llguidance via semsql-runtime.
+onnx = ["semsql-runtime/onnx"]
 
 [dependencies]
 semsql-core       = { path = "../semsql-core" }
@@ -23,6 +28,7 @@ semsql-graph      = { path = "../semsql-graph" }
 semsql-intent     = { path = "../semsql-intent" }
 semsql-extract-db = { path = "../semsql-extract-db", default-features = false }
 semsql-runtime    = { path = "../semsql-runtime" }
+semsql-renderer   = { path = "../semsql-renderer" }
 clap.workspace    = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing.workspace = true

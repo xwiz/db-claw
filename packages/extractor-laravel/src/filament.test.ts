@@ -9,6 +9,7 @@ import {
     parseResourceProperties,
     scanFilamentResources,
 } from "./filament.js";
+import type { LangIndex } from "./lang.js";
 
 let tmp: string;
 
@@ -304,5 +305,100 @@ describe("scanFilamentResources", () => {
         // Empty label fails sanitisation; nothing emitted.
         expect(r.fragments).toEqual([]);
         expect(r.skipped.length).toBeGreaterThan(0);
+    });
+});
+
+describe("scanFilamentResources — i18n-bound labels", () => {
+    function indexFrom(entries: Record<string, string>): LangIndex {
+        const m: LangIndex = new Map();
+        for (const [k, v] of Object.entries(entries)) {
+            m.set(k, { label: v, locale: "en", file: "lang/en/users.php", line: 1 });
+        }
+        return m;
+    }
+
+    it("resolves ->label(__('lang.key')) chains via the lang index", async () => {
+        await write(
+            "app/Filament/Resources/UserResource.php",
+            `<?php
+            namespace App\\Filament\\Resources;
+
+            use App\\Models\\User;
+            use Filament\\Resources\\Resource;
+
+            class UserResource extends Resource {
+                protected static ?string $model = User::class;
+
+                public static function form($form) {
+                    return $form->schema([
+                        TextInput::make('full_name')
+                            ->required()
+                            ->label(__('users.full_name')),
+                    ]);
+                }
+            }`,
+        );
+        const langIndex = indexFrom({ "users.full_name": "Full Name" });
+        const r = await scanFilamentResources(tmp, undefined, langIndex);
+        const fieldFrags = r.fragments.filter(
+            (f) => f.canonical.kind === "field",
+        );
+        expect(fieldFrags).toHaveLength(1);
+        const frag = fieldFrags[0]!;
+        expect(frag.term).toBe("full name");
+        expect(frag.canonical).toEqual({
+            kind: "field",
+            field: "users.full_name",
+        });
+        expect(frag.locator.layer).toBe(6); // FormOrTableLabel
+        expect(frag.locator.extractor).toContain("make-label-i18n:en");
+        // Confidence reflects the indirection — between layer-5 raw
+        // (0.85) and layer-6 literal (0.95).
+        expect(frag.confidence).toBeGreaterThan(0.85);
+        expect(frag.confidence).toBeLessThan(0.95);
+    });
+
+    it("records unresolved i18n keys in skipped without crashing", async () => {
+        await write(
+            "app/Filament/Resources/UserResource.php",
+            `<?php
+            class UserResource extends Resource {
+                protected static ?string $model = User::class;
+                public static function form($form) {
+                    return $form->schema([
+                        TextInput::make('phantom')->label(__('users.does_not_exist')),
+                    ]);
+                }
+            }`,
+        );
+        const r = await scanFilamentResources(
+            tmp,
+            undefined,
+            indexFrom({ "users.full_name": "Full Name" }),
+        );
+        expect(r.fragments.filter((f) => f.canonical.kind === "field")).toEqual([]);
+        expect(
+            r.skipped.some((s) =>
+                s.reason.includes("i18n key not in lang index: users.does_not_exist"),
+            ),
+        ).toBe(true);
+    });
+
+    it("does nothing when no lang index supplied (back-compat)", async () => {
+        await write(
+            "app/Filament/Resources/UserResource.php",
+            `<?php
+            class UserResource extends Resource {
+                protected static ?string $model = User::class;
+                public static function form($form) {
+                    return $form->schema([
+                        TextInput::make('full_name')->label(__('users.full_name')),
+                    ]);
+                }
+            }`,
+        );
+        // No third arg → i18n pass skipped entirely.
+        const r = await scanFilamentResources(tmp);
+        expect(r.fragments.filter((f) => f.canonical.kind === "field")).toEqual([]);
     });
 });

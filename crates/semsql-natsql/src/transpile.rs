@@ -9,7 +9,9 @@
 //! renderer (`semsql-renderer`) handles last-mile per-engine emission
 //! after validation + injection.
 
-use crate::ast::{Aggregate, Comparator, Condition, Field, NatSql, OrderDir, SelectItem, Value};
+use crate::ast::{
+    Aggregate, Comparator, Condition, Field, JoinClause, NatSql, OrderDir, SelectItem, Value,
+};
 use semsql_core::{Result, SemsqlError};
 use std::fmt::Write;
 
@@ -18,11 +20,6 @@ pub fn to_sql_text(q: &NatSql) -> Result<String> {
     if q.entities.is_empty() {
         return Err(SemsqlError::validation(
             "natsql AST has no entities — cannot render FROM clause",
-        ));
-    }
-    if q.entities.len() > 1 {
-        return Err(SemsqlError::validation(
-            "natsql v0.2 transpile supports a single FROM entity",
         ));
     }
 
@@ -39,6 +36,10 @@ pub fn to_sql_text(q: &NatSql) -> Result<String> {
         }
     }
     write!(out, " FROM {}", q.entities[0].as_str()).expect("write");
+
+    for jc in &q.joins {
+        render_join(&mut out, jc);
+    }
 
     if !q.conditions.is_empty() {
         out.push_str(" WHERE ");
@@ -60,6 +61,16 @@ pub fn to_sql_text(q: &NatSql) -> Result<String> {
         }
     }
 
+    if !q.having.is_empty() {
+        out.push_str(" HAVING ");
+        for (i, c) in q.having.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" AND ");
+            }
+            render_condition(&mut out, c)?;
+        }
+    }
+
     if let Some((f, dir)) = &q.order_by {
         out.push_str(" ORDER BY ");
         render_field(&mut out, f);
@@ -73,8 +84,19 @@ pub fn to_sql_text(q: &NatSql) -> Result<String> {
     if let Some(n) = q.limit {
         write!(out, " LIMIT {n}").expect("write");
     }
+    if let Some(n) = q.offset {
+        write!(out, " OFFSET {n}").expect("write");
+    }
 
     Ok(out)
+}
+
+fn render_join(out: &mut String, jc: &JoinClause) {
+    write!(out, " INNER JOIN {}", jc.entity.as_str()).expect("write");
+    out.push_str(" ON ");
+    render_field(out, &jc.on_left);
+    out.push_str(" = ");
+    render_field(out, &jc.on_right);
 }
 
 fn render_select_item(out: &mut String, item: &SelectItem) -> Result<()> {
@@ -98,6 +120,7 @@ fn render_select_item(out: &mut String, item: &SelectItem) -> Result<()> {
             }
             out.push(')');
         }
+        SelectItem::Expr(raw) => out.push_str(raw),
     }
     Ok(())
 }
@@ -270,6 +293,22 @@ mod tests {
     }
 
     #[test]
+    fn limit_offset_round_trip() {
+        round_trip(
+            "SELECT * FROM users LIMIT 10 OFFSET 20",
+            "SELECT * FROM users LIMIT 10 OFFSET 20",
+        );
+    }
+
+    #[test]
+    fn offset_only_round_trip() {
+        round_trip(
+            "SELECT * FROM users OFFSET 5",
+            "SELECT * FROM users OFFSET 5",
+        );
+    }
+
+    #[test]
     fn between_clause() {
         round_trip(
             "SELECT * FROM users WHERE users.balance BETWEEN 1 AND 100",
@@ -286,6 +325,38 @@ mod tests {
     }
 
     #[test]
+    fn inner_join_round_trip() {
+        round_trip(
+            "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id",
+            "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id",
+        );
+    }
+
+    #[test]
+    fn two_inner_joins_round_trip() {
+        round_trip(
+            "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id INNER JOIN items ON items.order_id = orders.id",
+            "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id INNER JOIN items ON items.order_id = orders.id",
+        );
+    }
+
+    #[test]
+    fn having_clause_round_trip() {
+        round_trip(
+            "SELECT users.status_code FROM users GROUP BY users.status_code HAVING users.status_code > 2",
+            "SELECT users.status_code FROM users GROUP BY users.status_code HAVING users.status_code > 2",
+        );
+    }
+
+    #[test]
+    fn arithmetic_expr_round_trip() {
+        round_trip(
+            "SELECT CAST(frpm.free_meals AS REAL) / frpm.enrollment FROM frpm",
+            "SELECT CAST(frpm.free_meals AS REAL) / frpm.enrollment FROM frpm",
+        );
+    }
+
+    #[test]
     fn rejects_unsafe_param_name() {
         // Construct a NatSql AST with a hostile parameter name and try to
         // render — the renderer must refuse rather than emit `:bad-name`.
@@ -293,14 +364,17 @@ mod tests {
         let q = NatSql {
             select: vec![SelectItem::Star],
             entities: vec![semsql_core::EntityName::new("users").unwrap()],
+            joins: Vec::new(),
             conditions: vec![Condition::Compare(
                 Field::Bare(CanonicalName::new("name").unwrap()),
                 Comparator::Eq,
                 Value::Param("bad name".into()),
             )],
+            having: Vec::new(),
             group_by: Vec::new(),
             order_by: None,
             limit: None,
+            offset: None,
         };
         assert!(to_sql_text(&q).is_err());
     }

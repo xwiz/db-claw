@@ -1,9 +1,8 @@
 //! NatSQL — the intermediate representation Stage 2 generates.
 //!
-//! NatSQL strips JOIN ON / HAVING and disallows nested subqueries — the
-//! published research ([Findings of EMNLP
-//! 2021](https://aclanthology.org/2021.findings-emnlp.174/)) shows this
-//! materially improves NL→SQL accuracy on small models.
+//! NatSQL v0.3 supports single-entity queries AND up to 3 INNER JOIN chains,
+//! HAVING clauses, and arithmetic expressions in SELECT. Subqueries, OUTER
+//! JOIN, set operations, and CTEs remain out of scope (v1.0).
 //!
 //! ## Two surfaces
 //!
@@ -12,14 +11,10 @@
 //! - **Concrete NatSQL** — every placeholder filled by Stage 3. The
 //!   transpiler accepts this and emits a SQL string.
 //!
-//! The v0.2 cut accepts single-entity queries (one FROM table, no JOIN, no
-//! subquery, no HAVING). Multi-entity joins via relationship-graph
-//! inference land in v0.5.
-//!
-//! Parsing piggy-backs on `sqlparser-rs` because NatSQL at v0.2 is a strict
+//! Parsing piggy-backs on `sqlparser-rs` because NatSQL at v0.3 is a
 //! subset of standard SQL. We re-validate the AST against our grammar
-//! constraints (no JOINs, no subqueries, single FROM) and emit a typed
-//! [`NatSql`] for downstream consumers.
+//! constraints (no subqueries, no OUTER JOIN, ≤ 3 INNER JOINs) and emit a
+//! typed [`NatSql`] for downstream consumers.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -32,12 +27,16 @@ use sqlparser::parser::Parser;
 pub mod ast;
 pub mod transpile;
 
-pub use ast::{Aggregate, Comparator, Condition, Field, NatSql, OrderDir, SelectItem, Value};
+pub use ast::{Aggregate, Comparator, Condition, Field, JoinClause, NatSql, OrderDir, SelectItem, Value};
 
 /// Parse a concrete NatSQL string into the typed AST.
 ///
-/// Errors out on any construct outside the v0.2 NatSQL subset (multi-table
-/// FROM, JOIN, HAVING, subqueries, set operations).
+/// Accepts the NatSQL v0.3 subset of SQL:
+/// - Single SELECT statement, no CTEs, no set operations.
+/// - FROM with up to 1 primary table + up to 3 INNER JOINs.
+/// - HAVING is accepted (stored alongside WHERE conditions).
+/// - Simple arithmetic in SELECT is captured as `SelectItem::Expr(raw_sql)`.
+/// - Subqueries, OUTER JOIN, and set operations remain out of scope.
 pub fn parse(text: &str) -> Result<NatSql> {
     let dialect = GenericDialect {};
     let stmts = Parser::parse_sql(&dialect, text)
@@ -58,7 +57,7 @@ pub fn parse(text: &str) -> Result<NatSql> {
         }
     };
     if query.with.is_some() {
-        return Err(SemsqlError::validation("natsql v0.2 does not support CTEs"));
+        return Err(SemsqlError::validation("natsql v0.3 does not support CTEs"));
     }
     let select = match query.body.as_ref() {
         sql_ast::SetExpr::Select(s) => s.as_ref(),
@@ -69,13 +68,10 @@ pub fn parse(text: &str) -> Result<NatSql> {
         | sql_ast::SetExpr::Update(_)
         | sql_ast::SetExpr::Table(_) => {
             return Err(SemsqlError::validation(
-                "natsql v0.2 supports only single-statement SELECT (no UNION/CTE/etc.)",
+                "natsql v0.3 supports only single-statement SELECT (no UNION/CTE/etc.)",
             ));
         }
     };
-    if select.having.is_some() {
-        return Err(SemsqlError::validation("natsql v0.2 does not support HAVING"));
-    }
 
     convert::query_to_natsql(query, select)
 }
@@ -90,13 +86,17 @@ mod convert {
         query: &sql_ast::Query,
         select: &sql_ast::Select,
     ) -> Result<NatSql> {
-        let entities = collect_entities(select)?;
+        let (entities, joins) = collect_entities_and_joins(select)?;
         let select_items = select
             .projection
             .iter()
             .map(select_item_from)
             .collect::<Result<Vec<_>>>()?;
         let conditions = match &select.selection {
+            Some(expr) => flatten_and(expr)?,
+            None => Vec::new(),
+        };
+        let having = match &select.having {
             Some(expr) => flatten_and(expr)?,
             None => Vec::new(),
         };
@@ -112,61 +112,148 @@ mod convert {
             None => None,
         };
         let limit = limit_from(query.limit.as_ref())?;
+        let offset = offset_from(query.offset.as_ref())?;
 
         Ok(NatSql {
             select: select_items,
             entities,
+            joins,
             conditions,
+            having,
             group_by,
             order_by,
             limit,
+            offset,
         })
     }
 
-    fn collect_entities(select: &sql_ast::Select) -> Result<Vec<EntityName>> {
+    fn collect_entities_and_joins(
+        select: &sql_ast::Select,
+    ) -> Result<(Vec<EntityName>, Vec<JoinClause>)> {
         if select.from.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         if select.from.len() > 1 {
             return Err(SemsqlError::validation(
-                "natsql v0.2 supports a single FROM table; multi-entity joins land in v0.5",
+                "natsql v0.3 supports a single FROM clause (comma joins not supported)",
             ));
         }
         let twj = &select.from[0];
-        if !twj.joins.is_empty() {
-            return Err(SemsqlError::validation(
-                "natsql v0.2 does not support JOIN; relationship-graph join inference lands in v0.5",
-            ));
-        }
-        match &twj.relation {
-            sql_ast::TableFactor::Table { name, .. } => {
+        let primary_entity = match &twj.relation {
+            sql_ast::TableFactor::Table { name, alias, .. } => {
                 let last = name
                     .0
                     .last()
                     .ok_or_else(|| SemsqlError::validation("empty table name in FROM"))?;
-                Ok(vec![EntityName::new(strip_quotes(&last.to_string()))?])
+                // Prefer the alias name if present (e.g., `schools AS T2` → use `T2`)
+                let resolved = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| strip_quotes(&last.to_string()));
+                EntityName::new(resolved)?
             }
-            sql_ast::TableFactor::Derived { .. } => Err(SemsqlError::validation(
-                "natsql v0.2 does not support subqueries in FROM",
-            )),
-            other => Err(SemsqlError::validation(format!(
-                "unsupported FROM table-factor: {other:?}"
-            ))),
+            sql_ast::TableFactor::Derived { .. } => {
+                return Err(SemsqlError::validation(
+                    "natsql v0.3 does not support subqueries in FROM",
+                ))
+            }
+            other => {
+                return Err(SemsqlError::validation(format!(
+                    "unsupported FROM table-factor: {other:?}"
+                )))
+            }
+        };
+
+        let mut join_clauses = Vec::new();
+        for join in &twj.joins {
+            if join_clauses.len() >= 3 {
+                return Err(SemsqlError::validation(
+                    "natsql v0.3 supports at most 3 INNER JOINs",
+                ));
+            }
+            // Only INNER JOINs are supported.
+            let is_inner = matches!(
+                join.join_operator,
+                sql_ast::JoinOperator::Inner(_)
+            );
+            if !is_inner {
+                return Err(SemsqlError::validation(
+                    "natsql v0.3 only supports INNER JOIN (not LEFT, RIGHT, FULL, CROSS)",
+                ));
+            }
+            let joined_entity = match &join.relation {
+                sql_ast::TableFactor::Table { name, alias, .. } => {
+                    let last = name
+                        .0
+                        .last()
+                        .ok_or_else(|| SemsqlError::validation("empty JOIN table name"))?;
+                    let resolved = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| strip_quotes(&last.to_string()));
+                    EntityName::new(resolved)?
+                }
+                other => {
+                    return Err(SemsqlError::validation(format!(
+                        "unsupported JOIN table-factor: {other:?}"
+                    )))
+                }
+            };
+            // Extract ON condition: must be `left = right` where both sides are fields.
+            let (on_left, on_right) = match &join.join_operator {
+                sql_ast::JoinOperator::Inner(sql_ast::JoinConstraint::On(expr)) => {
+                    if let sql_ast::Expr::BinaryOp {
+                        left,
+                        op: sql_ast::BinaryOperator::Eq,
+                        right,
+                    } = expr
+                    {
+                        (field_from_expr(left)?, field_from_expr(right)?)
+                    } else {
+                        return Err(SemsqlError::validation(
+                            "natsql v0.3 JOIN ON must be a simple `field = field` equality",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(SemsqlError::validation(
+                        "natsql v0.3 JOIN must use ON condition",
+                    ))
+                }
+            };
+            join_clauses.push(JoinClause {
+                entity: joined_entity,
+                on_left,
+                on_right,
+            });
         }
+
+        let mut entities = vec![primary_entity];
+        for jc in &join_clauses {
+            entities.push(jc.entity.clone());
+        }
+
+        Ok((entities, join_clauses))
     }
 
     fn select_item_from(item: &sql_ast::SelectItem) -> Result<SelectItem> {
         match item {
             sql_ast::SelectItem::Wildcard(_) => Ok(SelectItem::Star),
-            sql_ast::SelectItem::UnnamedExpr(e) | sql_ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+            sql_ast::SelectItem::UnnamedExpr(e)
+            | sql_ast::SelectItem::ExprWithAlias { expr: e, .. } => {
                 if let Some((agg, inner)) = aggregate_from(e) {
                     let f = field_from_expr(&inner)?;
                     return Ok(SelectItem::Aggregate(agg, f));
                 }
-                Ok(SelectItem::Field(field_from_expr(e)?))
+                // Try plain field first; fall back to raw expression for
+                // arithmetic, CAST, and other complex constructs.
+                if let Ok(f) = field_from_expr(e) {
+                    return Ok(SelectItem::Field(f));
+                }
+                Ok(SelectItem::Expr(e.to_string()))
             }
             sql_ast::SelectItem::QualifiedWildcard(_, _) => Err(SemsqlError::validation(
-                "natsql v0.2 does not support qualified wildcards",
+                "natsql v0.3 does not support qualified wildcards",
             )),
         }
     }
@@ -371,6 +458,26 @@ mod convert {
         }
     }
 
+    fn offset_from(clause: Option<&sql_ast::Offset>) -> Result<Option<u32>> {
+        let off = match clause {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        match &off.value {
+            sql_ast::Expr::Value(sql_ast::Value::Number(n, _)) => n
+                .parse::<u32>()
+                .map(Some)
+                .map_err(|_| {
+                    SemsqlError::validation(format!(
+                        "OFFSET must be a non-negative integer, got `{n}`"
+                    ))
+                }),
+            other => Err(SemsqlError::validation(format!(
+                "OFFSET must be a literal, got {other}"
+            ))),
+        }
+    }
+
     fn strip_quotes(s: &str) -> String {
         let s = s.trim();
         let bytes = s.as_bytes();
@@ -434,9 +541,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_join() {
-        let r = parse("SELECT * FROM users JOIN posts ON posts.author_id = users.id");
-        assert!(r.is_err());
+    fn parses_limit_offset() {
+        let q = parse("SELECT * FROM users LIMIT 10 OFFSET 20").unwrap();
+        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.offset, Some(20));
+    }
+
+    #[test]
+    fn parses_offset_only() {
+        let q = parse("SELECT * FROM users OFFSET 5").unwrap();
+        assert_eq!(q.limit, None);
+        assert_eq!(q.offset, Some(5));
+    }
+
+    #[test]
+    fn accepts_inner_join() {
+        let q = parse(
+            "SELECT * FROM users INNER JOIN posts ON posts.author_id = users.id",
+        )
+        .expect("inner join should parse");
+        assert_eq!(q.joins.len(), 1);
+        assert_eq!(q.joins[0].entity.as_str(), "posts");
+    }
+
+    #[test]
+    fn rejects_left_join() {
+        let r = parse(
+            "SELECT * FROM users LEFT JOIN posts ON posts.author_id = users.id",
+        );
+        assert!(r.is_err(), "LEFT JOIN must be rejected");
     }
 
     #[test]

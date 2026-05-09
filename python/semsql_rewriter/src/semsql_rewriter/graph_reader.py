@@ -161,12 +161,30 @@ class EnumDef:
 
 
 @dataclass(frozen=True)
+class Relationship:
+    """One row from the ``relationships`` table.
+
+    Represents a FK-style edge between two entities. Surfaced so the
+    Stage 2 trainer can render JOIN structure into encoder input
+    (Phase C — see `docs/completion-plan.md` Decision 4).
+    """
+
+    from_entity: str
+    from_field: str
+    to_entity: str
+    to_field: str
+    kind: str
+    relation_name: str | None = None
+
+
+@dataclass(frozen=True)
 class GraphSnapshot:
     """Read-only snapshot of a `.semsql` file's domain model."""
 
     entities: tuple[Entity, ...]
     fields: tuple[Field, ...]
     enums: tuple[EnumDef, ...] = field(default_factory=tuple)
+    relationships: tuple[Relationship, ...] = field(default_factory=tuple)
 
     def fields_for(self, entity: str) -> tuple[Field, ...]:
         return tuple(f for f in self.fields if f.entity == entity)
@@ -233,7 +251,31 @@ def load_graph(path: str | Path) -> GraphSnapshot:
         except sqlite3.OperationalError:
             for r in conn.execute("SELECT canonical_name FROM enums").fetchall():
                 enum_rows.append(EnumDef(r["canonical_name"], {}))
+        rel_rows: list[Relationship] = []
+        try:
+            for r in conn.execute(
+                "SELECT from_entity, from_field, to_entity, to_field, kind, "
+                "relation_name FROM relationships"
+            ).fetchall():
+                rel_rows.append(
+                    Relationship(
+                        from_entity=r["from_entity"],
+                        from_field=r["from_field"],
+                        to_entity=r["to_entity"],
+                        to_field=r["to_field"],
+                        kind=r["kind"],
+                        relation_name=r["relation_name"],
+                    )
+                )
+        except sqlite3.OperationalError:
+            # Older graph files without the relationships table.
+            pass
     finally:
         conn.close()
 
-    return GraphSnapshot(entities=ents, fields=flds, enums=tuple(enum_rows))
+    return GraphSnapshot(
+        entities=ents,
+        fields=flds,
+        enums=tuple(enum_rows),
+        relationships=tuple(rel_rows),
+    )

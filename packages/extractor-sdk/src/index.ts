@@ -20,6 +20,8 @@ export {
     type Confidence,
     type Extractor,
     type ExtractCtx,
+    type LangIndex,
+    type LangIndexEntry,
     type Locator,
     SourceLayer,
     type VocabFragment,

@@ -22,7 +22,8 @@
 use ahash::{AHashMap, AHashSet};
 use semsql_core::{Result, SemsqlError};
 use sqlparser::ast::{
-    Cte, Expr, ObjectName, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins,
+    Cte, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins,
 };
 use sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
@@ -174,6 +175,109 @@ fn walk_select_for_scope(
     for twj in &select.from {
         check_table_with_joins(twj, inv, cte_names, &where_text)?;
     }
+
+    // Subqueries that live OUTSIDE the FROM clause — projection items,
+    // the WHERE expression itself, HAVING, ORDER BY exprs, and GROUP BY
+    // — also reference physical tables and must be scope-checked. Without
+    // this pass, an attacker can hide an unscoped `users` reference inside
+    // `SELECT (SELECT count(*) FROM users) ...` and bypass the walker.
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                walk_expr_for_subqueries(e, inv, cte_names)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+        }
+    }
+    if let Some(w) = &select.selection {
+        walk_expr_for_subqueries(w, inv, cte_names)?;
+    }
+    if let Some(h) = &select.having {
+        walk_expr_for_subqueries(h, inv, cte_names)?;
+    }
+    if let sqlparser::ast::GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for e in exprs {
+            walk_expr_for_subqueries(e, inv, cte_names)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively scan an expression tree for `Subquery` / `Exists` /
+/// `InSubquery` nodes and walk each as its own query so the
+/// `users`-references inside them get scope-checked too.
+fn walk_expr_for_subqueries(
+    expr: &Expr,
+    inv: &Invariants,
+    cte_names: &AHashSet<String>,
+) -> Result<()> {
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            walk_query_for_scope(q, inv, cte_names)?;
+        }
+        Expr::InSubquery { expr: inner, subquery, .. } => {
+            walk_expr_for_subqueries(inner, inv, cte_names)?;
+            walk_query_for_scope(subquery, inv, cte_names)?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr_for_subqueries(left, inv, cte_names)?;
+            walk_expr_for_subqueries(right, inv, cte_names)?;
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner) => {
+            walk_expr_for_subqueries(inner, inv, cte_names)?;
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(list) = &func.args {
+                for arg in &list.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) = arg
+                    {
+                        walk_expr_for_subqueries(e, inv, cte_names)?;
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                walk_expr_for_subqueries(o, inv, cte_names)?;
+            }
+            for c in conditions {
+                walk_expr_for_subqueries(c, inv, cte_names)?;
+            }
+            for r in results {
+                walk_expr_for_subqueries(r, inv, cte_names)?;
+            }
+            if let Some(e) = else_result {
+                walk_expr_for_subqueries(e, inv, cte_names)?;
+            }
+        }
+        Expr::Between { expr: inner, low, high, .. } => {
+            walk_expr_for_subqueries(inner, inv, cte_names)?;
+            walk_expr_for_subqueries(low, inv, cte_names)?;
+            walk_expr_for_subqueries(high, inv, cte_names)?;
+        }
+        Expr::InList { expr: inner, list, .. } => {
+            walk_expr_for_subqueries(inner, inv, cte_names)?;
+            for e in list {
+                walk_expr_for_subqueries(e, inv, cte_names)?;
+            }
+        }
+        // Identifiers, literals, etc. — leaves with no subqueries.
+        _ => {}
+    }
     Ok(())
 }
 
@@ -320,6 +424,70 @@ mod tests {
     fn detects_unscoped_users_inside_cte() {
         let r = verify(
             "WITH x AS (SELECT * FROM users) SELECT * FROM x",
+            &scope_users(),
+        );
+        assert!(matches!(r, Err(SemsqlError::ScopeLeak { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn detects_unscoped_users_inside_select_projection_subquery() {
+        // The outer entity is `tenants` (no rule); the inner subquery in
+        // the projection list references `users` without a scope. Without
+        // expression-tree traversal the walker would silently accept this.
+        let r = verify(
+            "SELECT id, (SELECT COUNT(*) FROM users) AS c FROM tenants",
+            &scope_users(),
+        );
+        assert!(matches!(r, Err(SemsqlError::ScopeLeak { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn accepts_scoped_users_inside_select_projection_subquery() {
+        verify(
+            "SELECT id, (SELECT COUNT(*) FROM users WHERE users.tenant_id = 1) AS c \
+             FROM tenants",
+            &scope_users(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn detects_unscoped_users_inside_in_subquery() {
+        // `IN (SELECT ... FROM users)` — the inner subquery's users
+        // reference is what needs scope.
+        let r = verify(
+            "SELECT id FROM tenants WHERE id IN (SELECT id FROM users)",
+            &scope_users(),
+        );
+        assert!(matches!(r, Err(SemsqlError::ScopeLeak { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn detects_unscoped_users_inside_exists() {
+        let r = verify(
+            "SELECT id FROM tenants WHERE EXISTS (SELECT 1 FROM users)",
+            &scope_users(),
+        );
+        assert!(matches!(r, Err(SemsqlError::ScopeLeak { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn accepts_scoped_users_inside_in_subquery() {
+        verify(
+            "SELECT id FROM tenants \
+             WHERE id IN (SELECT id FROM users WHERE users.tenant_id = 1)",
+            &scope_users(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn detects_unscoped_users_inside_self_join() {
+        // u1 has its predicate; u2 doesn't.
+        let r = verify(
+            "SELECT u1.id, u2.id FROM users u1 \
+             JOIN users u2 ON u1.manager_id = u2.id \
+             WHERE u1.tenant_id = 1",
             &scope_users(),
         );
         assert!(matches!(r, Err(SemsqlError::ScopeLeak { .. })), "{r:?}");

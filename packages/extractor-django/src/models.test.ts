@@ -639,11 +639,11 @@ class User(Timestamped):
         expect(entities).not.toContain("timestamped");
     });
 
-    it("first-wins on cross-file class-name collisions", async () => {
+    it("file-scoped resolution avoids cross-app first-wins collisions", async () => {
         // Two apps each declare a Status TextChoices with different
-        // members. The first encountered (file order = directory
-        // walk order) wins; the second is ignored. Operators see the
-        // collision via the SemanticGraph conflict log downstream.
+        // members. With file-scoped resolution, each model's
+        // `choices=Status.choices` resolves against its own file's
+        // Status — no silent over-merge across apps.
         await write(
             "apps/a/models.py",
             `from django.db import models
@@ -666,16 +666,101 @@ class Bar(models.Model):
         );
         const r = await scanDjangoModels(tmp);
         const enumFrags = r.fragments.filter((f) => f.canonical.kind === "enum_value");
-        // Both fields resolve against the *same* (first-wins) Status
-        // class. Two enum_value fragments per field × 1 member = 2.
         expect(enumFrags.length).toBe(2);
-        const raws = new Set(
-            enumFrags.map(
-                (f) => f.canonical.kind === "enum_value" && f.canonical.rawValue,
-            ),
+        const byEnum = new Map(
+            enumFrags.map((f) => [
+                f.canonical.kind === "enum_value" ? f.canonical.enumName : "",
+                f.canonical.kind === "enum_value" ? f.canonical.rawValue : "",
+            ]),
         );
-        // Only the first-wins member appears.
-        expect(raws).toEqual(new Set(["active"]));
+        // Each app's model resolves to its own file's Status class.
+        expect(byEnum.get("foo.status")).toBe("active");
+        expect(byEnum.get("bar.status")).toBe("archived");
+    });
+
+    it("resolves choices via explicit `from .x import Status` import", async () => {
+        // Sibling-file import. The resolver must walk
+        // `<importer_dir>/<modulePath>/models.py`.
+        await write(
+            "apps/users/choices/models.py",
+            `from django.db import models
+class Status(models.TextChoices):
+    ACTIVE = 'active', 'Active'
+    INACTIVE = 'inactive', 'Inactive'
+`,
+        );
+        await write(
+            "apps/users/models.py",
+            `from django.db import models
+from .choices import Status
+
+class User(models.Model):
+    status = models.CharField(max_length=10, choices=Status.choices)
+`,
+        );
+        const r = await scanDjangoModels(tmp);
+        const enumFrags = r.fragments.filter((f) => f.canonical.kind === "enum_value");
+        expect(enumFrags.length).toBe(2);
+        const byTerm = new Map(enumFrags.map((f) => [f.term, f]));
+        expect(byTerm.has("active")).toBe(true);
+        expect(byTerm.has("inactive")).toBe(true);
+    });
+
+    it("aliased imports resolve under the alias", async () => {
+        await write(
+            "apps/users/enums/models.py",
+            `from django.db import models
+class Status(models.TextChoices):
+    ACTIVE = 'active', 'Active'
+`,
+        );
+        await write(
+            "apps/users/models.py",
+            `from django.db import models
+from .enums import Status as UserStatus
+
+class User(models.Model):
+    status = models.CharField(max_length=10, choices=UserStatus.choices)
+`,
+        );
+        const r = await scanDjangoModels(tmp);
+        const enumFrags = r.fragments.filter((f) => f.canonical.kind === "enum_value");
+        expect(enumFrags.length).toBe(1);
+        expect(enumFrags[0]!.canonical.kind === "enum_value" && enumFrags[0]!.canonical.rawValue).toBe(
+            "active",
+        );
+    });
+
+    it("imported abstract base resolves through file-scoped registry", async () => {
+        // Cross-file inheritance via explicit relative import. The
+        // class resolver chases the import to the sibling file's
+        // Timestamped, picks up its fields onto User.
+        await write(
+            "apps/common/models.py",
+            `from django.db import models
+class Timestamped(models.Model):
+    created_at = models.DateTimeField(verbose_name="Created")
+    class Meta:
+        abstract = True
+`,
+        );
+        await write(
+            "apps/users/models.py",
+            `from django.db import models
+from ..common import Timestamped
+
+class User(Timestamped):
+    email = models.EmailField(verbose_name="Email")
+`,
+        );
+        const r = await scanDjangoModels(tmp);
+        const fields = new Set(
+            r.fragments
+                .filter((f) => f.canonical.kind === "field")
+                .map((f) => (f.canonical.kind === "field" ? f.canonical.field : "")),
+        );
+        expect(fields).toContain("user.email");
+        expect(fields).toContain("user.created_at");
     });
 
     it("returns empty for non-Django Python projects", async () => {

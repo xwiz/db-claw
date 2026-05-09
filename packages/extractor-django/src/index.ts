@@ -21,6 +21,7 @@ import path from "node:path";
 
 import type { Extractor, ExtractCtx, VocabFragment } from "@semsql/extractor-sdk";
 
+import { scanDjangoAdmin } from "./admin.js";
 import { scanDjangoModels } from "./models.js";
 import { scanDjangoSerializers } from "./serializers.js";
 
@@ -34,6 +35,11 @@ export {
     scanDjangoSerializers,
     type DjangoSerializersScanResult,
 } from "./serializers.js";
+
+export {
+    scanDjangoAdmin,
+    type DjangoAdminScanResult,
+} from "./admin.js";
 
 export class DjangoExtractor implements Extractor {
     public readonly name = "extractor-django";
@@ -60,6 +66,8 @@ export class DjangoExtractor implements Extractor {
         for (const f of models.fragments) yield f;
         const serializers = await scanDjangoSerializers(ctx.root);
         for (const f of serializers.fragments) yield f;
+        const admin = await scanDjangoAdmin(ctx.root);
+        for (const f of admin.fragments) yield f;
     }
 }
 
