@@ -156,6 +156,7 @@ They improve executability (bail\_rate 100 % → 0 %) but not semantic accuracy.
 | v3.3 | v3.0 | v3.1 | v3.2 | rich (gated) | 0.0 % | 0 % |
 | v3.3b | v3.0 | v3.1 | v3.2 | legacy | 1.0 % | 0 % |
 | **v3.5** | v3.0 | v3.1 | distilbert (13.5K v3-rich, 21min RTX 4060) | rich (active) | **0.0 %** | 0 % |
+| **v3.6** | v3.0 | v3.1 | v3.5 | rich + slot-context numeric filter | **0.0 %** | 0 % |
 
 ## What changed between baselines
 
@@ -183,6 +184,20 @@ cross-encoder learns to rank them below numerics + capitalised
 content. The v3.2 cascade now picks numerics + dates (`'400'`,
 `'500'`, `'5-17'`, `'K-12'`, `'2000/1/1'`) where v3.0 picked
 stop-words (`'highest'`, `'phone'`, `'opened'`).
+
+**v3.6 — slot-context numeric filter**: When the skeleton uses a
+`@valN` slot in a numeric-comparison position (`>`, `<`, `>=`, `<=`,
+`BETWEEN`, `LIMIT`, `OFFSET`), `build_slot_inputs` now filters the
+candidate pool down to numeric strings only — proper-noun acronyms
+like `'SAT'` and `'Math'` are dropped. v3.5's regression was caused
+by those acronyms beating numerics under the cross-encoder's score;
+distilbert is bidirectional so reordering does nothing — pool
+composition is the only lever. 13 of 100 BIRD predictions changed
+relative to v3.5 — every one of them flipped from a string-typed
+WHERE comparison (`> 'Math'`, `> 'SAT'`, `> 'K-12'`) to a numeric
+comparison (`> 400`, `> 500`, `> 560`, `> 0.1`). EX still 0/100
+because the upstream schema linking and JOIN emission are now the
+gating failures (Stage 1 + Stage 2 work without t5-base).
 
 **v3.5 — rich extractor + matched Stage 3 retrain**: Stage 3 retrained
 on the rich extractor's candidate distribution (13.5K rows, 21 min on

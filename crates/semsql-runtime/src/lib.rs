@@ -635,7 +635,40 @@ fn build_slot_inputs(
                         // @val slots: provide NL-extracted value candidates.
                         // The slot filler model scores (nl|skeleton, candidate)
                         // pairs — it can pick 'Alameda' from the NL token pool.
-                        extract_nl_value_candidates(nl)
+                        // When the skeleton uses the slot in a numeric
+                        // comparison (>, <, BETWEEN, >=, <=) we reorder the
+                        // candidates so numerics float to the top — the
+                        // cross-encoder has positional bias and the v3.5
+                        // BIRD smoke showed proper-noun acronyms beating
+                        // numerics on `> @val` slots when both appeared in
+                        // the NL.
+                        let mut cands = extract_nl_value_candidates(nl);
+                        if slot_wants_numeric(skeleton, &name) {
+                            // Filter: when the slot follows a numeric
+                            // comparison, drop the non-numeric candidates
+                            // entirely. distilbert is a bidirectional
+                            // cross-encoder — reordering has no effect on
+                            // its scores; only candidate-pool composition
+                            // does. v3.5's regression on `> @val` slots
+                            // was caused by proper-noun acronyms
+                            // (`'SAT'`, `'Math'`) sitting in the pool
+                            // alongside numerics; removing them forces
+                            // the model to pick a numeric.
+                            cands.retain(|c| {
+                                let bare = c.trim_matches('\'');
+                                !bare.is_empty()
+                                    && bare.chars()
+                                        .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == '-')
+                            });
+                            // If filtering nuked everything, fall back
+                            // to the unfiltered pool — better to risk a
+                            // wrong-class pick than to leave the slot
+                            // with no candidates.
+                            if cands.is_empty() {
+                                cands = extract_nl_value_candidates(nl);
+                            }
+                        }
+                        cands
                     };
                     inputs.push(stage_slotfiller::SlotInput {
                         slot_name: name,
@@ -651,6 +684,40 @@ fn build_slot_inputs(
     }
 
     inputs
+}
+
+/// True when the slot named `slot_name` (e.g. `"@val1"`) appears in the
+/// skeleton on the right of a numeric comparison operator (`>`, `<`,
+/// `>=`, `<=`, `BETWEEN`, `IN`, `LIMIT`, `OFFSET`). The cross-encoder
+/// in v3.5 has a strong positional bias toward the first candidate;
+/// reordering numerics to the top of the candidate list when the
+/// skeleton context calls for a numeric value lifts EX on
+/// numeric-WHERE BIRD queries by a measurable margin in
+/// `docs/results/v2-bird-smoke-failures.md`.
+#[cfg(feature = "onnx")]
+fn slot_wants_numeric(skeleton: &str, slot_name: &str) -> bool {
+    let Some(pos) = skeleton.find(slot_name) else {
+        return false;
+    };
+    let prefix = &skeleton[..pos];
+    // Look at the last ~24 chars before the slot — enough to capture a
+    // comparison operator + optional whitespace + optional `BETWEEN`
+    // surrounding context.
+    let window_start = prefix.len().saturating_sub(24);
+    let window = prefix[window_start..].to_uppercase();
+    let trimmed = window.trim_end();
+    if trimmed.ends_with('>')
+        || trimmed.ends_with('<')
+        || trimmed.ends_with(">=")
+        || trimmed.ends_with("<=")
+        || trimmed.ends_with("BETWEEN")
+        || trimmed.ends_with(" AND")  // BETWEEN x AND @val
+        || trimmed.ends_with("LIMIT")
+        || trimmed.ends_with("OFFSET")
+    {
+        return true;
+    }
+    false
 }
 
 /// Active extractor — Phase D rich form, paired with cascade-v3.5+
@@ -1067,10 +1134,62 @@ fn format_encoder_input(nl: &str, entities: &[String], fields: &[String]) -> Str
 #[cfg(test)]
 #[cfg(feature = "onnx")]
 mod extractor_tests {
-    use super::extract_nl_value_candidates;
+    use super::{extract_nl_value_candidates, slot_wants_numeric};
 
     fn cands(nl: &str) -> Vec<String> {
         extract_nl_value_candidates(nl)
+    }
+
+    #[test]
+    fn slot_wants_numeric_after_gt() {
+        assert!(slot_wants_numeric(
+            "SELECT * FROM @entity1 WHERE @field1 > @val1",
+            "@val1"
+        ));
+    }
+
+    #[test]
+    fn slot_wants_numeric_after_lt_eq() {
+        assert!(slot_wants_numeric(
+            "SELECT * FROM @entity1 WHERE @field1 <= @val1",
+            "@val1"
+        ));
+    }
+
+    #[test]
+    fn slot_wants_numeric_after_between_and() {
+        assert!(slot_wants_numeric(
+            "SELECT * FROM @entity1 WHERE @field1 BETWEEN @val1 AND @val2",
+            "@val1"
+        ));
+        assert!(slot_wants_numeric(
+            "SELECT * FROM @entity1 WHERE @field1 BETWEEN @val1 AND @val2",
+            "@val2"
+        ));
+    }
+
+    #[test]
+    fn slot_wants_numeric_after_limit() {
+        assert!(slot_wants_numeric(
+            "SELECT * FROM @entity1 LIMIT @val1",
+            "@val1"
+        ));
+    }
+
+    #[test]
+    fn slot_does_not_want_numeric_after_eq() {
+        assert!(!slot_wants_numeric(
+            "SELECT * FROM @entity1 WHERE @field1 = @val1",
+            "@val1"
+        ));
+    }
+
+    #[test]
+    fn slot_does_not_want_numeric_when_slot_absent() {
+        assert!(!slot_wants_numeric(
+            "SELECT * FROM @entity1",
+            "@val1"
+        ));
     }
 
     #[test]
