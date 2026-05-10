@@ -155,6 +155,7 @@ They improve executability (bail\_rate 100 % → 0 %) but not semantic accuracy.
 | **v3.2** | v3.0 | v3.1 | distilbert (10K v3, 3.5h CPU) | legacy | **1.0 %** | 0 % |
 | v3.3 | v3.0 | v3.1 | v3.2 | rich (gated) | 0.0 % | 0 % |
 | v3.3b | v3.0 | v3.1 | v3.2 | legacy | 1.0 % | 0 % |
+| **v3.5** | v3.0 | v3.1 | distilbert (13.5K v3-rich, 21min RTX 4060) | rich (active) | **0.0 %** | 0 % |
 
 ## What changed between baselines
 
@@ -182,6 +183,20 @@ cross-encoder learns to rank them below numerics + capitalised
 content. The v3.2 cascade now picks numerics + dates (`'400'`,
 `'500'`, `'5-17'`, `'K-12'`, `'2000/1/1'`) where v3.0 picked
 stop-words (`'highest'`, `'phone'`, `'opened'`).
+
+**v3.5 — rich extractor + matched Stage 3 retrain**: Stage 3 retrained
+on the rich extractor's candidate distribution (13.5K rows, 21 min on
+RTX 4060, train_loss 0.376) and the rich extractor swapped active in
+the orchestrator. 84 of 100 BIRD predictions changed vs v3.2. Net wins
+on multi-word phrase queries (`'Fresno County Office of Education'`
+correctly picked over `'Education.'`, `'Alameda County'` correctly
+picked over `'K-12'`). Net regressions on numeric WHERE-comparison
+queries (`> 'SAT'` instead of `> 500`, `> 'Math'` instead of `> 400`)
+because the cross-encoder ranks proper-noun acronyms above numerics
+when both are present in NL. EX 0/100 — statistical noise at the
+floor; the prediction profile is different from v3.2 but neither
+model exceeds the 1 % threshold without a bigger Stage 2 (t5-base)
+or slot-context-aware candidate ranking.
 
 **v3.3 vs v3.3b — extractor coupling**: A richer NL candidate
 extractor (`extract_nl_value_candidates_rich`) was added to surface

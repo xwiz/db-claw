@@ -653,52 +653,8 @@ fn build_slot_inputs(
     inputs
 }
 
-/// Active extractor — the simple v3.2 form. Returns quoted single-token
-/// candidates plus bare numerics. Locked in until Stage 3 is retrained
-/// against the candidate distribution emitted by
-/// [`extract_nl_value_candidates_rich`].
-#[cfg(feature = "onnx")]
-fn extract_nl_value_candidates(nl: &str) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out: Vec<String> = Vec::new();
-
-    for tok in nl.split_whitespace() {
-        let clean: String = tok
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '.')
-            .to_string();
-        if clean.len() < 2 {
-            continue;
-        }
-        let quoted = format!("'{clean}'");
-        if seen.insert(quoted.clone()) {
-            out.push(quoted);
-        }
-        if clean.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            if seen.insert(clean.clone()) {
-                out.push(clean);
-            }
-        }
-        if out.len() >= 30 {
-            break;
-        }
-    }
-    out
-}
-
-/// Extract SQL literal candidates from the NL question for `@val` slot filling.
-///
-/// **Phase D extractor — gated.** This richer extractor was found to
-/// regress EX on BIRD-100 (1% → 0%) because the Stage 3 cross-encoder
-/// in `cascade-v3.2` was trained on a simpler candidate distribution
-/// (stop-words + bare tokens). Re-enable only when Stage 3 has been
-/// retrained on the matching candidate set produced by this extractor
-/// (i.e. `python -m semsql_train derive-slot-pairs` should be re-run
-/// with the same logic baked into its NL scanner).
-///
-/// Until then we keep the legacy extractor active. The richer logic
-/// is preserved below as `extract_nl_value_candidates_rich` so the
-/// retrain path can swap it in by exposing it under the canonical
-/// name + bumping the cascade version.
+/// Active extractor — Phase D rich form, paired with cascade-v3.5+
+/// Stage 3 retrained on the matching candidate distribution.
 ///
 /// Produces high-signal candidates across
 /// the dimensions Stage 3's cross-encoder is most sensitive to:
@@ -727,7 +683,7 @@ fn extract_nl_value_candidates(nl: &str) -> Vec<String> {
 /// Capped at 40 candidates to keep the scoring batch manageable while
 /// giving the cross-encoder enough breadth on long questions.
 #[cfg(feature = "onnx")]
-fn extract_nl_value_candidates_rich(nl: &str) -> Vec<String> {
+fn extract_nl_value_candidates(nl: &str) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out: Vec<String> = Vec::new();
 
@@ -1111,10 +1067,10 @@ fn format_encoder_input(nl: &str, entities: &[String], fields: &[String]) -> Str
 #[cfg(test)]
 #[cfg(feature = "onnx")]
 mod extractor_tests {
-    use super::extract_nl_value_candidates_rich;
+    use super::extract_nl_value_candidates;
 
     fn cands(nl: &str) -> Vec<String> {
-        extract_nl_value_candidates_rich(nl)
+        extract_nl_value_candidates(nl)
     }
 
     #[test]
