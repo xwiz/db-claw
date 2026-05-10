@@ -91,6 +91,51 @@ pub fn field_db_column_map(
     Ok(out)
 }
 
+/// One row from the `relationships` table — a FK-style edge between
+/// two entities. Used by the Stage 4 JOIN injector to rewrite
+/// single-FROM skeletons into `INNER JOIN`-bearing SQL when Stage 1
+/// surfaces a cross-entity field reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationshipRow {
+    /// Source entity canonical name.
+    pub from_entity: String,
+    /// Source field on `from_entity` participating in the join.
+    pub from_field: String,
+    /// Target entity canonical name.
+    pub to_entity: String,
+    /// Target field on `to_entity` participating in the join.
+    pub to_field: String,
+    /// Relationship kind tag (`one_to_many`, `many_to_one`, etc.).
+    pub kind: String,
+}
+
+/// Read every relationship edge from the graph.
+pub fn relationships(path: impl AsRef<Path>) -> Result<Vec<RelationshipRow>> {
+    let conn = open(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT from_entity, from_field, to_entity, to_field, kind \
+             FROM relationships",
+        )
+        .map_err(|e| SemsqlError::Other(format!("relationships prepare: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RelationshipRow {
+                from_entity: row.get(0)?,
+                from_field: row.get(1)?,
+                to_entity: row.get(2)?,
+                to_field: row.get(3)?,
+                kind: row.get(4)?,
+            })
+        })
+        .map_err(|e| SemsqlError::Other(format!("relationships query: {e}")))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| SemsqlError::Other(format!("relationships row: {e}")))?);
+    }
+    Ok(out)
+}
+
 /// Read every enum and its raw → label map.
 ///
 /// Optional column `_enum_values_json` carries the value map; if missing

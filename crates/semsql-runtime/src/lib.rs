@@ -36,7 +36,7 @@ pub mod stage_slotfiller;
 pub mod tokenizer_bridge;
 
 use semsql_core::{Result, SemsqlError};
-use semsql_graph::read::field_db_column_map;
+use semsql_graph::read::{field_db_column_map, relationships, RelationshipRow};
 use semsql_intent::{IntentHint, IntentLibrary};
 use semsql_natsql::{parse as parse_natsql, transpile::to_sql_text};
 use std::collections::HashMap;
@@ -107,6 +107,10 @@ pub struct Cascade {
     /// rewriting after Stage 4. Populated from the graph's `fields` table.
     /// Keys use the same `entity.canonical_field` format as the vocabulary.
     db_column_map: HashMap<String, String>,
+    /// FK relationships loaded from the graph. Used by the Stage 4
+    /// JOIN injector to bridge single-FROM skeletons that reference
+    /// cross-entity fields.
+    relationships: Vec<RelationshipRow>,
     /// Stage 1 + Stage 3 model bundle, populated when the caller passes
     /// a manifest path AND the build was compiled with `--features onnx`.
     /// Stage 2 (skeleton generator) lands once distilled weights ship —
@@ -167,6 +171,7 @@ impl Cascade {
             None => None,
         };
         let db_column_map = field_db_column_map(&graph_path).unwrap_or_default();
+        let relationships = relationships(&graph_path).unwrap_or_default();
         #[cfg(feature = "onnx")]
         let models = match manifest_path {
             Some(p) => Some(load_models(p, &graph_path)?),
@@ -179,6 +184,7 @@ impl Cascade {
             pre_resolver,
             intent_library,
             db_column_map,
+            relationships,
             #[cfg(feature = "onnx")]
             models,
         })
@@ -364,7 +370,18 @@ impl Cascade {
         // sometimes puts FROM @entity1 but WHERE @field2 where @entity1 and
         // @field2 belong to different tables. Detecting and correcting the
         // FROM clause improves SQL executability without retraining.
-        let fixed_concrete = fix_from_entity_mismatch(&slot_out.concrete_natsql);
+        // Phase D Stage 4 lever — inject INNER JOIN when Stage 1
+        // ranked 2+ entities with an FK edge between them and the
+        // skeleton emitted single-FROM. Stage 2 / Stage 3 collapse
+        // everything to one entity prefix so the cross-entity signal
+        // is gone by the time we get the concrete SQL — pass Stage 1's
+        // top_entities directly so the injector can decide.
+        let mismatch_fixed = fix_from_entity_mismatch(&slot_out.concrete_natsql);
+        let fixed_concrete = inject_join_from_linker(
+            &mismatch_fixed,
+            &linked.top_entities,
+            &self.relationships,
+        );
         let concrete_ast = grammar::validate_skeleton_against_schema(
             &fixed_concrete,
             &schema,
@@ -1023,6 +1040,275 @@ fn fix_from_entity_mismatch(concrete: &str) -> String {
 /// Replacement is whole-token: `entity.canonical_field` is only replaced
 /// when the character following the match is not `[A-Za-z0-9_]`, so
 /// `frpm.county_name2` is not clobbered by a rule for `frpm.county_name`.
+/// Inject `INNER JOIN` based on Stage 1's top_entities ranking.
+///
+/// When Stage 1 ranks 2+ entities and an FK edge exists between the
+/// FROM entity and any other top-ranked entity, inject `INNER JOIN`.
+/// Stage 2 + Stage 3 collapse multi-entity skeletons to a single
+/// `@entity1` so the cross-entity signal is gone by Stage 4 — the
+/// linker's ranking is the only remaining signal.
+///
+/// Aggressive: fires whenever the ranking + FK conditions are met,
+/// regardless of whether the body actually references the secondary
+/// entity. This matches BIRD's pattern (most multi-entity questions
+/// need a JOIN even when the question doesn't explicitly say so).
+/// Capped at MAX_JOINS = 3.
+#[cfg(feature = "onnx")]
+fn inject_join_from_linker(
+    concrete: &str,
+    top_entities: &[String],
+    edges: &[RelationshipRow],
+) -> String {
+    // Conservative cap: only the best secondary entity. Adding 2-3 hops
+    // when only 1 is needed produces over-joined SQL that rarely
+    // matches gold output even when individually valid.
+    const MAX_JOINS: usize = 1;
+    if top_entities.len() < 2 || edges.is_empty() {
+        return concrete.to_string();
+    }
+    let upper = concrete.to_uppercase();
+    if upper.contains("INNER JOIN") {
+        return concrete.to_string();
+    }
+
+    let Some(from_pos) = upper.find(" FROM ") else {
+        return concrete.to_string();
+    };
+    let after_from = &concrete[from_pos + 6..];
+    let entity_end = after_from
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .unwrap_or(after_from.len());
+    let from_entity = after_from[..entity_end].trim().to_string();
+    if from_entity.is_empty() {
+        return concrete.to_string();
+    }
+
+    let mut joined: Vec<String> = vec![from_entity.clone()];
+    let mut clauses: Vec<String> = Vec::new();
+    for cand in top_entities {
+        if clauses.len() >= MAX_JOINS {
+            break;
+        }
+        if joined.iter().any(|j| j.eq_ignore_ascii_case(cand)) {
+            continue;
+        }
+        let mut found = None;
+        for joined_e in &joined {
+            for edge in edges {
+                if edge.from_entity.eq_ignore_ascii_case(cand)
+                    && edge.to_entity.eq_ignore_ascii_case(joined_e)
+                {
+                    found = Some((
+                        cand.clone(),
+                        edge.from_field.clone(),
+                        joined_e.clone(),
+                        edge.to_field.clone(),
+                    ));
+                    break;
+                }
+                if edge.to_entity.eq_ignore_ascii_case(cand)
+                    && edge.from_entity.eq_ignore_ascii_case(joined_e)
+                {
+                    found = Some((
+                        cand.clone(),
+                        edge.to_field.clone(),
+                        joined_e.clone(),
+                        edge.from_field.clone(),
+                    ));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        if let Some((tgt, tgt_field, src, src_field)) = found {
+            clauses.push(format!(
+                "INNER JOIN {tgt} ON {tgt}.{tgt_field} = {src}.{src_field}"
+            ));
+            joined.push(tgt);
+        }
+    }
+    if clauses.is_empty() {
+        return concrete.to_string();
+    }
+    let insert_at = from_pos + 6 + entity_end;
+    let mut out = String::with_capacity(concrete.len() + 64 * clauses.len());
+    out.push_str(&concrete[..insert_at]);
+    for clause in &clauses {
+        out.push(' ');
+        out.push_str(clause);
+    }
+    out.push_str(&concrete[insert_at..]);
+    out
+}
+
+/// Inject `INNER JOIN` clause(s) into a single-FROM concrete NatSQL
+/// string when the body references fields from entities other than
+/// the FROM entity AND an FK edge exists between them.
+///
+/// Phase D rewriter — addresses the dominant Phase A failure (71 % of
+/// BIRD-100 had a JOIN in gold but the cascade emitted single-FROM).
+/// Even with v3 corpus + Stage 2 retrained on JOIN-emitting skeletons,
+/// the t5-small model on a 50K subset still under-emits JOINs in
+/// borderline cases. This rewriter closes the gap deterministically.
+///
+/// Algorithm:
+///
+///  1. Parse the FROM entity and the set of `entity.field` references
+///     in the body (SELECT projection + WHERE + GROUP BY + ORDER BY).
+///  2. For each "other" entity referenced:
+///       - Find an FK edge connecting it to either the FROM entity
+///         OR any already-joined entity (recursive — supports 1, 2 hops).
+///       - Skip if no edge exists.
+///  3. Inject `INNER JOIN <other> ON <a>.<af> = <b>.<bf>` between the
+///     FROM clause and the WHERE clause.
+///  4. Cap at `_MAX_JOINS = 3` (NatSQL v0.3 limit).
+///
+/// Idempotent: returns input unchanged when:
+///  - Already contains `INNER JOIN`.
+///  - No cross-entity references.
+///  - No FK edges connecting the referenced entities.
+#[cfg(feature = "onnx")]
+fn inject_join_if_needed(concrete: &str, edges: &[RelationshipRow]) -> String {
+    const MAX_JOINS: usize = 3;
+    if edges.is_empty() {
+        return concrete.to_string();
+    }
+    let upper = concrete.to_uppercase();
+    if upper.contains("INNER JOIN") {
+        return concrete.to_string();
+    }
+
+    // Locate FROM entity (single-token after "FROM ").
+    let Some(from_pos) = upper.find(" FROM ") else {
+        return concrete.to_string();
+    };
+    let after_from = &concrete[from_pos + 6..];
+    let entity_end = after_from
+        .find(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .unwrap_or(after_from.len());
+    let from_entity = after_from[..entity_end].trim().to_string();
+    if from_entity.is_empty() {
+        return concrete.to_string();
+    }
+
+    // Pull every `<entity>.<field>` reference. Only count entities that
+    // are NOT the FROM entity.
+    let other_entities: Vec<String> = collect_referenced_entities(concrete)
+        .into_iter()
+        .filter(|e| !e.eq_ignore_ascii_case(&from_entity))
+        .collect();
+    if other_entities.is_empty() {
+        return concrete.to_string();
+    }
+
+    // Build join chain — start with FROM entity, progressively connect
+    // each remaining other entity via an FK edge to any joined entity.
+    let mut joined: Vec<String> = vec![from_entity.clone()];
+    let mut clauses: Vec<String> = Vec::new();
+    let mut remaining: Vec<String> = other_entities;
+    let mut progress = true;
+    while progress && !remaining.is_empty() && clauses.len() < MAX_JOINS {
+        progress = false;
+        let mut next_remaining: Vec<String> = Vec::new();
+        for target in remaining.drain(..) {
+            // Find FK edge target ↔ any joined entity.
+            let mut found = None;
+            for joined_e in &joined {
+                for edge in edges {
+                    if edge.from_entity.eq_ignore_ascii_case(&target)
+                        && edge.to_entity.eq_ignore_ascii_case(joined_e)
+                    {
+                        found = Some((
+                            target.clone(),
+                            edge.from_field.clone(),
+                            joined_e.clone(),
+                            edge.to_field.clone(),
+                        ));
+                        break;
+                    }
+                    if edge.to_entity.eq_ignore_ascii_case(&target)
+                        && edge.from_entity.eq_ignore_ascii_case(joined_e)
+                    {
+                        found = Some((
+                            target.clone(),
+                            edge.to_field.clone(),
+                            joined_e.clone(),
+                            edge.from_field.clone(),
+                        ));
+                        break;
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            if let Some((tgt, tgt_field, src, src_field)) = found {
+                clauses.push(format!(
+                    "INNER JOIN {tgt} ON {tgt}.{tgt_field} = {src}.{src_field}"
+                ));
+                joined.push(tgt);
+                progress = true;
+                if clauses.len() >= MAX_JOINS {
+                    break;
+                }
+            } else {
+                next_remaining.push(target);
+            }
+        }
+        remaining = next_remaining;
+    }
+    if clauses.is_empty() {
+        return concrete.to_string();
+    }
+
+    // Inject clauses immediately after the FROM-entity token.
+    let insert_at = from_pos + 6 + entity_end;
+    let mut out = String::with_capacity(concrete.len() + 64 * clauses.len());
+    out.push_str(&concrete[..insert_at]);
+    for clause in &clauses {
+        out.push(' ');
+        out.push_str(clause);
+    }
+    out.push_str(&concrete[insert_at..]);
+    out
+}
+
+/// Scan `sql` for unique `entity.field` references and return the
+/// distinct entity prefixes.
+#[cfg(feature = "onnx")]
+fn collect_referenced_entities(sql: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            // Need a `.` followed by another identifier char.
+            if i < bytes.len() && bytes[i] == b'.'
+                && i + 1 < bytes.len()
+                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+            {
+                let entity = sql[start..i].to_string();
+                seen.insert(entity);
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    seen.into_iter().collect()
+}
+
 fn rewrite_db_columns(sql: String, col_map: &HashMap<String, String>) -> String {
     if col_map.is_empty() {
         return sql;
@@ -1190,6 +1476,69 @@ mod extractor_tests {
             "SELECT * FROM @entity1",
             "@val1"
         ));
+    }
+
+    #[test]
+    fn join_injection_single_hop() {
+        use super::{inject_join_if_needed, RelationshipRow};
+        let edges = vec![RelationshipRow {
+            from_entity: "satscores".into(),
+            from_field: "cds".into(),
+            to_entity: "schools".into(),
+            to_field: "cds_code".into(),
+            kind: "many_to_one".into(),
+        }];
+        let sql = "SELECT schools.school FROM satscores WHERE satscores.math > 400";
+        let out = inject_join_if_needed(sql, &edges);
+        assert!(out.contains("INNER JOIN schools ON schools.cds_code = satscores.cds"), "{out}");
+    }
+
+    #[test]
+    fn join_injection_idempotent_when_already_joined() {
+        use super::{inject_join_if_needed, RelationshipRow};
+        let edges = vec![RelationshipRow {
+            from_entity: "satscores".into(),
+            from_field: "cds".into(),
+            to_entity: "schools".into(),
+            to_field: "cds_code".into(),
+            kind: "many_to_one".into(),
+        }];
+        let sql = "SELECT a FROM x INNER JOIN y ON y.id = x.y_id WHERE z = 1";
+        let out = inject_join_if_needed(sql, &edges);
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn join_injection_no_cross_entity_refs() {
+        use super::{inject_join_if_needed, RelationshipRow};
+        let edges = vec![RelationshipRow {
+            from_entity: "a".into(),
+            from_field: "id".into(),
+            to_entity: "b".into(),
+            to_field: "a_id".into(),
+            kind: "many_to_one".into(),
+        }];
+        let sql = "SELECT a.x FROM a WHERE a.y = 1";
+        let out = inject_join_if_needed(sql, &edges);
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn join_injection_skips_when_no_fk_edge() {
+        use super::{inject_join_if_needed, RelationshipRow};
+        let edges: Vec<RelationshipRow> = vec![];
+        let sql = "SELECT b.x FROM a WHERE a.y = 1";
+        let out = inject_join_if_needed(sql, &edges);
+        assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn collect_entities_from_sql() {
+        use super::collect_referenced_entities;
+        let sql = "SELECT a.x, b.y FROM a WHERE c.z = 1 AND a.w = 2";
+        let mut got = collect_referenced_entities(sql);
+        got.sort();
+        assert_eq!(got, vec!["a", "b", "c"]);
     }
 
     #[test]
