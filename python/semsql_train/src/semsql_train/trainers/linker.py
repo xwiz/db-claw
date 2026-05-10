@@ -240,7 +240,9 @@ def train_linker(cfg: LinkerTrainConfig) -> Path:
         lr_scheduler_type="linear",
         seed=cfg.seed,
         logging_steps=50,
-        save_strategy="no",
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=2,
         eval_strategy="no",
         report_to=[],
         bf16=bf16,
@@ -264,7 +266,15 @@ def train_linker(cfg: LinkerTrainConfig) -> Path:
         trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = transformers.Trainer(**trainer_kwargs)
-    trainer.train()
+    import glob, os
+    ckpts = sorted(
+        glob.glob(os.path.join(str(cfg.output_dir), "checkpoint-*")),
+        key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else 0,
+    )
+    resume = ckpts[-1] if ckpts else None
+    if resume:
+        print(f"resuming from {resume}", flush=True)
+    trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(cfg.output_dir))
     tokenizer.save_pretrained(str(cfg.output_dir))
     return cfg.output_dir

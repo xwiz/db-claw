@@ -408,7 +408,12 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
         lr_scheduler_type="cosine",
         seed=cfg.seed,
         logging_steps=10,
-        save_strategy="no",
+        # Periodic checkpoints — survives sleep / disconnect. Resume
+        # via `trainer.train(resume_from_checkpoint=True)` (the wrapper
+        # below auto-detects the latest `<output_dir>/checkpoint-N/`).
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=2,
         report_to=[],
         # Skip eval at end-of-step time during M1 — eval correctness
         # lands in `python/semsql_eval/per_stage.py::skeleton_exact`,
@@ -464,7 +469,16 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
     else:
         trainer = transformers.Seq2SeqTrainer(**trainer_kwargs)
 
-    trainer.train()
+    # Auto-resume from latest checkpoint if any exist in output_dir.
+    import glob, os
+    ckpts = sorted(
+        glob.glob(os.path.join(str(cfg.output_dir), "checkpoint-*")),
+        key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else 0,
+    )
+    resume = ckpts[-1] if ckpts else None
+    if resume:
+        print(f"resuming from {resume}", flush=True)
+    trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(cfg.output_dir))
     tokenizer.save_pretrained(str(cfg.output_dir))
     return cfg.output_dir
