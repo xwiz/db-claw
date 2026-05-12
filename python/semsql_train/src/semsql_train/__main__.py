@@ -581,6 +581,8 @@ def active_subset_cmd(
 @click.option("--batch-size", type=int, default=None)
 @click.option("--grad-accum", type=int, default=None, help="Gradient accumulation steps (skeleton only).")
 @click.option("--bf16", is_flag=True, default=False, help="bf16 mixed precision (skeleton).")
+@click.option("--fp16", is_flag=True, default=False,
+              help="fp16 mixed precision (skeleton). Use on Turing/T4 where bf16 unsupported.")
 @click.option("--flash-attn", "flash_attn", type=str, default=None,
               help="Attention backend: '2' or 'flash_attention_2', 'sdpa'. Skeleton only.")
 @click.option("--compile", "torch_compile", is_flag=True, default=False,
@@ -602,6 +604,7 @@ def train_cmd(
     batch_size: int | None,
     grad_accum: int | None,
     bf16: bool,
+    fp16: bool,
     flash_attn: str | None,
     torch_compile: bool,
     liger: bool,
@@ -631,6 +634,7 @@ def train_cmd(
             batch_size=batch_size or 16,
             gradient_accum=grad_accum or 1,
             bf16=bf16,
+            fp16=fp16,
             flash_attention=attn_impl,
             torch_compile=torch_compile,
             liger_kernel=liger,

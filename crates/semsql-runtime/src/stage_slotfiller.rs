@@ -220,13 +220,45 @@ impl SlotFiller {
         let mut escalations: Vec<String> = Vec::new();
         let mut score_sum = 0.0f32;
         let mut score_count = 0usize;
-        let context = format!("{nl} | {skeleton}");
 
-        for slot in slots {
+        // Resolution order: @val first, then @entity, then @field.
+        //
+        // Rationale: when a skeleton contains `WHERE @field2 = @val1`, the
+        // value (e.g. `'Alameda County'`) is a strong type signal for the
+        // field (column likely named `county_name`, not
+        // `percent_eligible_free_k12`). By resolving @val first and
+        // substituting it into the working skeleton before scoring @field,
+        // the cross-encoder sees the concrete value pair when judging
+        // field candidates — closing the loop the v3.5/v3.6 corpus could
+        // never capture (training time the value is in the input but
+        // there's no test-time mechanism to propagate it back to field
+        // scoring without this ordering).
+        //
+        // @entity resolved between @val and @field so @field scoring also
+        // sees a concrete table prefix.
+        fn slot_rank(name: &str) -> u8 {
+            if name.starts_with("@val") {
+                0
+            } else if name.starts_with("@entity") {
+                1
+            } else {
+                2 // @field and any future slot kind
+            }
+        }
+        let mut ordered: Vec<usize> = (0..slots.len()).collect();
+        ordered.sort_by_key(|&i| slot_rank(&slots[i].slot_name));
+
+        // Working skeleton that grows more concrete as @val/@entity slots
+        // resolve. Cross-encoder context is rebuilt from this each pass.
+        let mut working_skeleton = skeleton.to_string();
+
+        for &i in &ordered {
+            let slot = &slots[i];
             if slot.candidates.is_empty() {
                 escalations.push(slot.slot_name.clone());
                 continue;
             }
+            let context = format!("{nl} | {working_skeleton}");
             let pairs: Vec<(String, String)> = slot
                 .candidates
                 .iter()
@@ -242,7 +274,14 @@ impl SlotFiller {
             let best = pick_best_index(&biased);
             match best {
                 Some(idx) if scores[idx] >= self.abstain_threshold => {
-                    picks.push((slot.slot_name.clone(), slot.candidates[idx].clone()));
+                    let picked = slot.candidates[idx].clone();
+                    // Substitute into the working skeleton so subsequent
+                    // slots score against the more-concrete context.
+                    working_skeleton = substitute_slots(
+                        &working_skeleton,
+                        &[(slot.slot_name.as_str(), picked.as_str())],
+                    );
+                    picks.push((slot.slot_name.clone(), picked));
                     score_sum += scores[idx];
                     score_count += 1;
                 }

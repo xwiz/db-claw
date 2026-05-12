@@ -161,6 +161,11 @@ class SkeletonTrainConfig:
     4060+) / Hopper / TPU. Off by default so CPU CI doesn't trip on the
     half-tensor codepath."""
 
+    fp16: bool = False
+    """Mixed-precision fp16. Use on Turing (T4) / Volta where bf16 is
+    unsupported. Mutually-exclusive with ``bf16`` — ``bf16`` wins if both
+    are set."""
+
     flash_attention: str | None = None
     """One of ``"flash_attention_2"``, ``"sdpa"``, ``None``. Forwarded
     verbatim to ``AutoModelForSeq2SeqLM.from_pretrained(attn_implementation=...)``.
@@ -425,6 +430,15 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
         bf16=cfg.bf16
         and torch.cuda.is_available()
         and torch.cuda.is_bf16_supported(),
+        # fp16 fallback for Turing-class GPUs (T4 on Kaggle) where bf16
+        # is unsupported. Ignored if bf16 is already engaged.
+        fp16=cfg.fp16
+        and torch.cuda.is_available()
+        and not (
+            cfg.bf16
+            and torch.cuda.is_available()
+            and torch.cuda.is_bf16_supported()
+        ),
         # Suppress the pin-memory warning when running on CPU; HF
         # defaults this on, which is harmless but emits a warning that
         # CI's `-W error` policy treats as a failure.

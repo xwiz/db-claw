@@ -82,15 +82,18 @@ def derive_slot_pairs(
     """Yield Stage 3 training records derived from a v3 skeleton corpus.
 
     Two-pass over the input — first pass collects per-slot-kind value
-    pools so single-row candidate sets can be padded with cross-row
-    distractors. This ensures every emitted record has ≥ 2 candidates
-    even when the source row's ``ranked_schema`` only surfaced one
-    entity (common in NSText2SQL).
+    pools AND a ``table -> set(columns)`` index. Same-table sibling
+    columns become the primary @field hard-negative pool because the
+    Phase D BIRD-100 analysis showed Stage 3 mostly fails by picking
+    the wrong column FROM THE SAME TABLE (e.g. ``Percent ... K-12``
+    where gold needed ``County Name`` — both on ``frpm``).
     """
     rng = random.Random(cfg.seed)
     entity_pool: list[str] = []
     field_pool: list[str] = []
     val_pool: list[str] = []
+    # table_name -> set of column refs ("table.col") seen as @field gold
+    table_columns: dict[str, set[str]] = {}
     with in_jsonl.open("r", encoding="utf-8") as fh:
         for line in fh:
             try:
@@ -102,6 +105,9 @@ def derive_slot_pairs(
                     entity_pool.append(gold)
                 elif slot.startswith("@field"):
                     field_pool.append(gold)
+                    if isinstance(gold, str) and "." in gold:
+                        tbl = gold.split(".", 1)[0]
+                        table_columns.setdefault(tbl, set()).add(gold)
                 else:
                     val_pool.append(gold)
             if len(entity_pool) > 50000 and len(field_pool) > 50000:
@@ -127,6 +133,20 @@ def derive_slot_pairs(
             ranked = rec.get("ranked_schema") or []
             for slot, gold in slot_map.items():
                 cands = _make_candidates(slot, gold, nl, ranked, cfg, rng)
+                # For @field slots, inject up to 3 same-table sibling
+                # columns as hard negatives BEFORE generic pool padding.
+                # This forces the model to disambiguate within-table
+                # rather than just between tables — the real BIRD
+                # failure mode.
+                if slot.startswith("@field") and isinstance(gold, str) and "." in gold:
+                    tbl = gold.split(".", 1)[0]
+                    siblings = table_columns.get(tbl, set())
+                    sib_list = [s for s in siblings if s != gold and s not in cands]
+                    rng.shuffle(sib_list)
+                    for s in sib_list[:3]:
+                        if len(cands) >= cfg.candidates_per_slot:
+                            break
+                        cands.append(s)
                 if slot.startswith("@entity"):
                     pool = entity_pool
                 elif slot.startswith("@field"):
