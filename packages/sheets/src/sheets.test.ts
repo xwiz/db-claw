@@ -26,6 +26,7 @@ const BOM_CSV = `Item,Subsystem,Component,Specification,Quantity,Sourcing,Cost
 22,Ozone Catalyst Subsystem,Catalyst Material,Manganese dioxide powder,2-3 batteries (yield ~10g powder),Recycled,0
 23,Ozone Catalyst Subsystem,Catalyst Binder (optional),Small amount of water,10-20mL,N/A,0
 30,Power System,Battery Cables (solar panel side),12 AWG stranded copper,4-6m,Hardware store,1000-2000
+50,Assembly / Maintenance,M3 Stainless Screws,Assorted 8-16mm screws,24,Hardware store,1000
 47,Assembly / Maintenance,Distilled Water,For reservoir filling,5L,Supermarket,500-1000
 `;
 
@@ -96,7 +97,7 @@ describe("buildSheetDataset", () => {
 		expect(revenue?.roles).toContain("measure");
 		expect(orderDate?.kind).toBe("date");
 		expect(region?.roles).toContain("dimension");
-		expect(dataset.rowCount).toBe(12);
+		expect(dataset.rowCount).toBe(18);
 	});
 
 	it("does not infer ordinary titles as dates when they contain date text", () => {
@@ -124,7 +125,7 @@ describe("querySheet", () => {
 				"matched group column region",
 			]),
 		);
-		expect(result.rows[0]).toEqual({ Region: "LATAM", "SUM Revenue": 10500 });
+		expect(result.rows[0]).toEqual({ Region: "LATAM", "SUM Revenue": 13700 });
 	});
 
 	it("answers top-N grouped questions", () => {
@@ -132,7 +133,7 @@ describe("querySheet", () => {
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
 		expect(result.rows).toHaveLength(5);
-		expect(result.rows[0]?.Customer).toBe("Lumen Goods");
+		expect(result.rows[0]?.Customer).toBe("Northstar Energy");
 	});
 
 	it("lists top rows by a metric when no target grouping column exists", () => {
@@ -172,7 +173,7 @@ describe("querySheet", () => {
 		const result = querySheet(sampleDataset(), "average order value in May");
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
-		expect(result.scalar).toBeCloseTo(1650, 3);
+		expect(result.scalar).toBeCloseTo(1800, 3);
 		expect(result.queryFrame.filters).toContainEqual({
 			kind: "month",
 			column: "order_date",
@@ -187,7 +188,7 @@ describe("querySheet", () => {
 		);
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
-		expect(result.scalar).toBe(4);
+		expect(result.scalar).toBe(6);
 	});
 
 	it("keeps scalar counts scalar when a dimension name appears", () => {
@@ -203,12 +204,17 @@ describe("querySheet", () => {
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
 		expect(result.queryFrame.resultShape).toBe("scalar_metric");
-		expect(result.scalar).toBe(3);
+		expect(result.scalar).toBe(5);
 	});
 
 	it("runs every packaged practical use-case query without custom demo code", () => {
 		for (const useCase of SHEET_USE_CASES) {
 			const dataset = buildSheetDataset(parseCsv(useCase.csv));
+			expect(dataset.rowCount, `${useCase.id} row count`).toBeGreaterThan(12);
+			expect(
+				dataset.columns.length,
+				`${useCase.id} column count`,
+			).toBeGreaterThanOrEqual(8);
 			for (const question of useCase.questions) {
 				const result = querySheet(dataset, question);
 				expect(result.ok, `${useCase.id}: ${question}`).toBe(true);
@@ -219,130 +225,132 @@ describe("querySheet", () => {
 	it("returns expected results for every packaged practical use-case query", () => {
 		const expectations: Record<string, Record<string, unknown>> = {
 			"revenue_ops::total revenue by region": {
-				first: { Region: "LATAM", "SUM Revenue": 10500 },
+				first: { Region: "LATAM", "SUM Revenue": 13700 },
 			},
 			"revenue_ops::top 5 customers by sales": {
-				first: { Customer: "Lumen Goods", "SUM Revenue": 4000 },
+				first: { Customer: "Northstar Energy", "SUM Revenue": 5200 },
 				length: 5,
 			},
-			"revenue_ops::average order value in May": { scalar: 1650 },
-			"revenue_ops::how many paid invoices are overdue?": { scalar: 4 },
+			"revenue_ops::average order value in May": { scalar: 1800 },
+			"revenue_ops::how many paid invoices are overdue?": { scalar: 6 },
 			"revenue_ops::show active accounts in LATAM": {
 				first: { Customer: "Acme 4744" },
-				length: 4,
+				length: 6,
 			},
 			"support_queue::how many open tickets are high priority?": {
-				scalar: 3,
+				scalar: 5,
 			},
 			"support_queue::average response time hours by team": {
 				first: {
 					Team: "Billing",
-					"AVG Response Time Hours": 6.333333333333333,
+					"AVG Response Time Hours": 6.5,
 				},
 			},
 			"support_queue::show open tickets for Platform": {
 				first: { "Ticket ID": "T-1003" },
-				length: 2,
+				length: 3,
 			},
 			"support_queue::average satisfaction score in May": {
-				scalar: 3.8333333333333335,
+				scalar: 4,
 			},
 			"inventory::total units on hand by warehouse": {
-				first: { Warehouse: "Central", "SUM Units On Hand": 117 },
+				first: { Warehouse: "East", "SUM Units On Hand": 273 },
 			},
 			"inventory::show low stock products": {
 				first: { Product: "Cloud Backup Starter" },
-				length: 3,
+				length: 5,
 			},
 			"inventory::average unit cost by category": {
-				first: { Category: "Analytics", "AVG Unit Cost": 204 },
+				first: { Category: "Security", "AVG Unit Cost": 165 },
 			},
-			"inventory::how many products are backordered?": { scalar: 1 },
+			"inventory::how many products are backordered?": { scalar: 2 },
 			"marketing_campaigns::total spend by channel": {
-				first: { Channel: "Social", "SUM Spend": 2300 },
-				length: 3,
+				first: { Channel: "Search", "SUM Spend": 5250 },
+				length: 4,
 			},
 			"marketing_campaigns::top 5 campaigns by clicks": {
-				first: { Campaign: "Conference Promo", "SUM Clicks": 410 },
+				first: { Campaign: "Competitor Terms", "SUM Clicks": 520 },
 				length: 5,
 			},
 			"marketing_campaigns::show active campaigns": {
 				first: { Campaign: "Launch A" },
-				length: 4,
+				length: 11,
 			},
 			"marketing_campaigns::average leads by channel": {
-				first: { Channel: "Social", "AVG Leads": 43 },
-				length: 3,
+				first: { Channel: "Social", "AVG Leads": 44 },
+				length: 4,
 			},
-			"marketing_campaigns::how many paused campaigns?": { scalar: 2 },
-			"applicant_kyc::how many approved applicants?": { scalar: 3 },
+			"marketing_campaigns::how many paused campaigns?": { scalar: 4 },
+			"applicant_kyc::how many approved applicants?": { scalar: 7 },
 			"applicant_kyc::show applicants not from Nigeria": {
 				first: { Applicant: "Grace Hopper" },
-				length: 3,
+				length: 10,
 			},
 			"applicant_kyc::show applicants with wallet balance between 1000 and 2000":
 				{
 					first: { Applicant: "Ada Lovelace", "Wallet Balance": 1200 },
-					length: 3,
+					length: 5,
 				},
 			"applicant_kyc::how many unique countries are there?": {
-				scalar: 4,
+				scalar: 8,
 			},
 			"applicant_kyc::what is the maximum wallet balance?": {
-				scalar: 3000,
+				scalar: 4100,
 			},
 			"engineering_bom::what is the item needed in most quantity?": {
 				first: {
-					Component: "Catalyst Binder (optional)",
-					"MAX Quantity": 20,
-					Quantity: "10-20mL",
+					Component: "M3 Stainless Screws",
+					"MAX Quantity": 24,
+					Quantity: "24",
 				},
 				length: 1,
 			},
 			"engineering_bom::top 5 components by quantity": {
 				first: {
-					Component: "Catalyst Binder (optional)",
-					"SUM Quantity": 20,
+					Component: "M3 Stainless Screws",
+					"SUM Quantity": 24,
 				},
 				length: 5,
 			},
 			"engineering_bom::list subsystems": {
 				first: { Subsystem: "EHD Subsystem" },
-				length: 6,
+				length: 7,
 			},
 			"engineering_bom::show components not in EHD Subsystem": {
 				first: {
-					Item: "10",
+					Item: "5",
 					Subsystem: "Active Cooling Core",
 					Component: "Peltier Thermoelectric Module",
 				},
-				length: 8,
+				length: 15,
 			},
 			"engineering_bom::show components with quantity between 2 and 5": {
 				first: {
-					Item: "6",
+					Item: "4",
 					Component: "High-Voltage Silicone Wire",
 					Quantity: 2,
 				},
-				length: 5,
+				length: 6,
 			},
 			"clinic_visits::total visit cost by department": {
-				first: { Department: "Cardiology", "SUM Visit Cost": 500 },
-				length: 3,
+				first: { Department: "Orthopedics", "SUM Visit Cost": 930 },
+				length: 4,
 			},
 			"clinic_visits::average wait time minutes by department": {
 				first: {
-					Department: "Cardiology",
-					"AVG Wait Time Minutes": 25.666666666666668,
+					Department: "Orthopedics",
+					"AVG Wait Time Minutes": 54,
 				},
-				length: 3,
+				length: 4,
 			},
 			"clinic_visits::show no-show patients": {
 				first: { Patient: "Ibrahim Musa" },
-				length: 2,
+				length: 3,
 			},
-			"clinic_visits::how many completed appointments?": { scalar: 4 },
-			"clinic_visits::average wait time minutes in May": { scalar: 19 },
+			"clinic_visits::how many completed appointments?": { scalar: 10 },
+			"clinic_visits::average wait time minutes in May": {
+				scalar: 23.09090909090909,
+			},
 		};
 
 		for (const useCase of SHEET_USE_CASES) {
@@ -373,7 +381,7 @@ describe("querySheet", () => {
 		const result = querySheet(sampleDataset(), "show active accounts in LATAM");
 		expect(result.ok).toBe(true);
 		if (!result.ok) return;
-		expect(result.rows).toHaveLength(4);
+		expect(result.rows).toHaveLength(6);
 		expect(result.rows[0]?.Customer).toBe("Acme 4744");
 	});
 
@@ -619,9 +627,9 @@ describe("querySheet", () => {
 		expect(result.queryFrame.groupByColumn).toBe("component");
 		expect(result.queryFrame.limit).toBe(1);
 		expect(result.rows[0]).toEqual({
-			Component: "Catalyst Binder (optional)",
-			"MAX Quantity": 20,
-			Quantity: "10-20mL",
+			Component: "M3 Stainless Screws",
+			"MAX Quantity": 24,
+			Quantity: "24",
 		});
 	});
 });

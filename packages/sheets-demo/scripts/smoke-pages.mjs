@@ -40,7 +40,7 @@ if (!result.ok) {
 }
 if (
 	result.rows[0]?.Region !== "LATAM" ||
-	result.rows[0]?.["SUM Revenue"] !== 10500
+	result.rows[0]?.["SUM Revenue"] !== 13700
 ) {
 	throw new Error("Pages runtime returned the wrong smoke result");
 }
