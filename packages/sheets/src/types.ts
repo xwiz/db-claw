@@ -57,6 +57,12 @@ export type SheetFilter =
 			column: string;
 			month: number;
 			year?: number;
+	  }
+	| {
+			kind: "dateRange";
+			column: string;
+			start?: string;
+			end?: string;
 	  };
 
 export type AggregateFunction = "count" | "sum" | "avg" | "min" | "max";

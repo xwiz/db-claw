@@ -29,6 +29,24 @@ const BOM_CSV = `Item,Subsystem,Component,Specification,Quantity,Sourcing,Cost
 47,Assembly / Maintenance,Distilled Water,For reservoir filling,5L,Supermarket,500-1000
 `;
 
+const SOCIAL_CSV = `URL,Title,Author,Likes,Published Date,Status
+https://x.example/a,"@ana on X, Nov 21, 2025",ana,7,2025-11-21,Yes
+https://x.example/ben,"@ben on X, Dec 03, 2025",ben,15,2025-12-03,Yes
+https://x.example/cam,"@cam on X, Dec 06, 2025",cam,2,2025-12-06,No
+`;
+
+const TRIP_LIKE_CSV = `ID,Applicant,Gender,Partner Name,Wallet Balance,Created At
+1,Ada Lovelace,Female,,249.90,2025-10-19
+2,Grace Hopper,Female,,319.90,2025-10-18
+3,Alan Turing,Male,Chris,221.90,2025-10-17
+4,Katherine Johnson,Female,,800.00,2025-10-16
+`;
+
+const CREDENTIALISH_CSV = `email,password,role
+john@example.com,secret-1,admin
+jane@example.com,secret-2,user
+`;
+
 describe("parseCsv", () => {
 	it("handles quoted commas and escaped quotes", () => {
 		const parsed = parseCsv('Name,Note\n"Acme, Inc","said ""yes"""\n');
@@ -67,6 +85,16 @@ describe("buildSheetDataset", () => {
 		expect(region?.roles).toContain("dimension");
 		expect(dataset.rowCount).toBe(12);
 	});
+
+	it("does not infer ordinary titles as dates when they contain date text", () => {
+		const dataset = buildSheetDataset(parseCsv(SOCIAL_CSV));
+		const title = dataset.columns.find((column) => column.id === "title");
+		const published = dataset.columns.find(
+			(column) => column.id === "published_date",
+		);
+		expect(title?.kind).toBe("text");
+		expect(published?.kind).toBe("date");
+	});
 });
 
 describe("querySheet", () => {
@@ -92,6 +120,39 @@ describe("querySheet", () => {
 		if (!result.ok) return;
 		expect(result.rows).toHaveLength(5);
 		expect(result.rows[0]?.Customer).toBe("Lumen Goods");
+	});
+
+	it("lists top rows by a metric when no target grouping column exists", () => {
+		const dataset = buildSheetDataset(parseCsv(SOCIAL_CSV));
+		const result = querySheet(dataset, "show top 2 posts by likes");
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.queryFrame.operation).toBe("list");
+		expect(result.queryFrame.orderBy).toEqual({
+			column: "likes",
+			direction: "desc",
+		});
+		expect(result.rows).toHaveLength(2);
+		expect(result.rows[0]).toMatchObject({
+			Author: "ben",
+			Likes: 15,
+		});
+	});
+
+	it("anchors relative date filters to the latest date in the sheet", () => {
+		const dataset = buildSheetDataset(parseCsv(SOCIAL_CSV));
+		const result = querySheet(dataset, "total likes this month");
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.scalar).toBe(17);
+		expect(result.queryFrame.filters).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					kind: "dateRange",
+					column: "published_date",
+				}),
+			]),
+		);
 	});
 
 	it("answers average questions with month filters", () => {
@@ -268,6 +329,25 @@ describe("querySheet", () => {
 		expect(activeCampaigns.rows[0]).toMatchObject({
 			Campaign: "Launch A",
 		});
+	});
+
+	it("avoids sparse display columns in suggestions", () => {
+		const dataset = buildSheetDataset(parseCsv(TRIP_LIKE_CSV));
+		expect(suggestSheetQuestions(dataset)).toEqual(
+			expect.arrayContaining(["top 5 applicants by wallet balance"]),
+		);
+		expect(suggestSheetQuestions(dataset)).not.toEqual(
+			expect.arrayContaining(["top 5 partner names by wallet balance"]),
+		);
+	});
+
+	it("does not project sensitive columns by default", () => {
+		const dataset = buildSheetDataset(parseCsv(CREDENTIALISH_CSV));
+		const result = querySheet(dataset, "show first 2 rows");
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.rows[0]).toMatchObject({ email: "john@example.com" });
+		expect(result.rows[0]).not.toHaveProperty("password");
 	});
 
 	it("answers BOM quantity superlatives with mixed quantity units", () => {

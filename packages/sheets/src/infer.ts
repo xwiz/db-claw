@@ -18,6 +18,11 @@ const LINE_NUMBER_LABEL = /^(item|line|line number|line no|no|number|#)$/;
 const QUANTITY_LABEL = /\b(quantity|qty|count|unit|units|amount)\b/;
 const SPEC_NUMBER_WORDS =
 	/\b(kv|v|dc|ac|amp|amps|current|input|output|voltage|rated|watt|watts|hz)\b/;
+const ISO_DATE_VALUE =
+	/^\d{4}-\d{1,2}-\d{1,2}(?:[t\s]\d{1,2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:z|[+-]\d{2}:?\d{2})?)?$/i;
+const SLASH_DATE_VALUE = /^\d{1,2}\/\d{1,2}\/\d{2,4}$/;
+const MONTH_DATE_VALUE =
+	/^(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+\d{1,2},?\s+\d{4}$/i;
 
 function valueAt(row: string[], idx: number): string {
 	return row[idx]?.trim() ?? "";
@@ -42,6 +47,7 @@ function parseSpreadsheetNumber(raw: string): number | null {
 	const trimmed = raw.trim();
 	if (trimmed.length === 0) return null;
 	const fallback = parseNumber(raw);
+	if (!/^\s*\(?[-$Â£â‚¬]?\d/.test(trimmed)) return fallback;
 	const negative = /^\(.*\)$/.test(trimmed);
 	const cleaned = trimmed
 		.replace(/^\(/, "")
@@ -74,10 +80,11 @@ function parseQuantityNumber(raw: string): number | null {
 }
 
 function looksDateLike(raw: string): boolean {
+	const trimmed = raw.trim();
 	return (
-		/\d{4}-\d{1,2}-\d{1,2}/.test(raw) ||
-		/\d{1,2}\/\d{1,2}\/\d{2,4}/.test(raw) ||
-		/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(raw)
+		ISO_DATE_VALUE.test(trimmed) ||
+		SLASH_DATE_VALUE.test(trimmed) ||
+		MONTH_DATE_VALUE.test(trimmed)
 	);
 }
 
