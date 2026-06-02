@@ -47,6 +47,12 @@ john@example.com,secret-1,admin
 jane@example.com,secret-2,user
 `;
 
+const PEOPLE_CSV = `ID,Applicant,Email,Has Passport,Wallet Balance,Created At
+1000,Ada Lovelace,,No,1200,2025-10-19
+1001,Grace Hopper,grace@example.com,Yes,900,2025-10-18
+1002,Katherine Johnson,,Yes,3000,2025-10-17
+`;
+
 describe("parseCsv", () => {
 	it("handles quoted commas and escaped quotes", () => {
 		const parsed = parseCsv('Name,Note\n"Acme, Inc","said ""yes"""\n');
@@ -348,6 +354,82 @@ describe("querySheet", () => {
 		if (!result.ok) return;
 		expect(result.rows[0]).toMatchObject({ email: "john@example.com" });
 		expect(result.rows[0]).not.toHaveProperty("password");
+	});
+
+	it("filters rows by missing fields with useful row context", () => {
+		const dataset = buildSheetDataset(parseCsv(PEOPLE_CSV));
+		const result = querySheet(
+			dataset,
+			"show applicants where email is missing",
+		);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.queryFrame.filters).toEqual(
+			expect.arrayContaining([
+				{ kind: "presence", column: "email", present: false },
+			]),
+		);
+		expect(result.rows).toHaveLength(2);
+		expect(result.rows[0]).toMatchObject({
+			Applicant: "Ada Lovelace",
+			Email: null,
+		});
+	});
+
+	it("maps without/with wording to boolean and numeric filters", () => {
+		const dataset = buildSheetDataset(parseCsv(PEOPLE_CSV));
+		const withoutPassport = querySheet(
+			dataset,
+			"show applicants without passport",
+		);
+		expect(withoutPassport.ok).toBe(true);
+		if (!withoutPassport.ok) return;
+		expect(withoutPassport.queryFrame.filters).toContainEqual({
+			kind: "equals",
+			column: "has_passport",
+			value: false,
+		});
+		expect(withoutPassport.rows[0]).toMatchObject({
+			Applicant: "Ada Lovelace",
+		});
+
+		const overBalance = querySheet(
+			dataset,
+			"show applicants with wallet balance over 1000",
+		);
+		expect(overBalance.ok).toBe(true);
+		if (!overBalance.ok) return;
+		expect(overBalance.queryFrame.filters).toContainEqual({
+			kind: "number",
+			column: "wallet_balance",
+			operator: "gt",
+			value: 1000,
+		});
+		expect(overBalance.queryFrame.filters).not.toContainEqual({
+			kind: "equals",
+			column: "id",
+			value: "1000",
+		});
+		expect(overBalance.rows).toHaveLength(2);
+	});
+
+	it("uses sorted row lists for explicit high-cardinality show-top prompts", () => {
+		const dataset = buildSheetDataset(parseCsv(PEOPLE_CSV));
+		const result = querySheet(
+			dataset,
+			"show top 2 applicants by wallet balance",
+		);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.queryFrame.operation).toBe("list");
+		expect(result.queryFrame.orderBy).toEqual({
+			column: "wallet_balance",
+			direction: "desc",
+		});
+		expect(result.rows[0]).toMatchObject({
+			Applicant: "Katherine Johnson",
+			"Wallet Balance": 3000,
+		});
 	});
 
 	it("answers BOM quantity superlatives with mixed quantity units", () => {

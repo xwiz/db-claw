@@ -101,6 +101,19 @@ const LONG_TEXT_LABEL =
 	/\b(description|reasoning|content|body|message|notes?|comment|email to send)\b/;
 const PREFERRED_DISPLAY_LABEL =
 	/\b(applicant|author|company|customer|client|account|contact|name|title|subject|component|product|part|campaign|country|region|market|team|owner|rep)\b/;
+const LABEL_WORD_STOPWORDS = new Set([
+	"has",
+	"have",
+	"is",
+	"are",
+	"requires",
+	"required",
+	"total",
+	"count",
+	"sum",
+	"avg",
+	"average",
+]);
 
 interface RouteContext {
 	raw: string;
@@ -226,6 +239,12 @@ function aliasesFor(column: SheetColumn): string[] {
 	const label = normalizeText(column.label);
 	const id = normalizeText(column.id.replace(/_/g, " "));
 	const aliases = new Set([label, id, singularize(label), singularize(id)]);
+	for (const token of [...words(label), ...words(id)]) {
+		if (token.length > 2 && !LABEL_WORD_STOPWORDS.has(token)) {
+			aliases.add(token);
+			aliases.add(singularize(token));
+		}
+	}
 	for (const [concept, terms] of Object.entries(DIMENSION_SYNONYMS)) {
 		if (terms.some((term) => hasPhrase(label, term) || hasPhrase(id, term))) {
 			aliases.add(concept);
@@ -345,6 +364,10 @@ function findExplicitGroupByColumn(
 			questionWords: words(byMatch[1]),
 			singularQuestionWords: words(byMatch[1]).map((word) => singularize(word)),
 		};
+		const byMeasure = findBestColumn(dataset, byCtx, (column) =>
+			column.roles.includes("measure"),
+		);
+		if (byMeasure) return undefined;
 		const byColumn = findBestColumn(
 			dataset,
 			byCtx,
@@ -576,6 +599,27 @@ function listOrder(
 	return undefined;
 }
 
+function shouldUseRankedList(
+	ctx: RouteContext,
+	target: SheetColumn | undefined,
+	measure: SheetColumn | undefined,
+): boolean {
+	if (!target || !measure || !isListIntent(ctx) || !wantsRank(ctx))
+		return false;
+	const explicitlyListLike =
+		hasPhrase(ctx.normalized, "show") ||
+		hasPhrase(ctx.normalized, "list") ||
+		hasPhrase(ctx.normalized, "find");
+	if (!explicitlyListLike) return false;
+	const uniqueRatio =
+		target.nonEmptyCount === 0 ? 0 : target.uniqueCount / target.nonEmptyCount;
+	return (
+		target.uniqueCount > 30 ||
+		uniqueRatio >= 0.7 ||
+		isIdentifierishColumn(target)
+	);
+}
+
 function isLikelyLineNumberColumn(column: SheetColumn): boolean {
 	const label = normalizeText(column.label);
 	return (
@@ -796,6 +840,90 @@ function uniqueRawValues(dataset: SheetDataset, column: SheetColumn): string[] {
 	return out;
 }
 
+function contextForPhrase(phrase: string): RouteContext {
+	return {
+		raw: phrase,
+		normalized: normalizeText(phrase),
+		questionWords: words(phrase),
+		singularQuestionWords: words(phrase).map((word) => singularize(word)),
+	};
+}
+
+function findMentionedColumn(
+	dataset: SheetDataset,
+	phrase: string,
+	predicate: (column: SheetColumn) => boolean = () => true,
+): SheetColumn | undefined {
+	const phraseCtx = contextForPhrase(phrase);
+	return findBestColumn(
+		dataset,
+		phraseCtx,
+		(column) => !isSensitiveColumn(column) && predicate(column),
+	);
+}
+
+function booleanPresenceFilter(
+	column: SheetColumn,
+	present: boolean,
+): SheetFilter {
+	if (column.kind === "boolean") {
+		return { kind: "equals", column: column.id, value: present };
+	}
+	const yesNo = column.examples
+		.map((example) => normalizeText(example))
+		.filter((example) => example.length > 0);
+	if (
+		yesNo.length > 0 &&
+		yesNo.every((example) =>
+			["yes", "no", "true", "false", "y", "n"].includes(example),
+		)
+	) {
+		const value = present
+			? column.examples.find((example) =>
+					["yes", "true", "y"].includes(normalizeText(example)),
+				)
+			: column.examples.find((example) =>
+					["no", "false", "n"].includes(normalizeText(example)),
+				);
+		if (value) return { kind: "equals", column: column.id, value };
+	}
+	return { kind: "presence", column: column.id, present };
+}
+
+function findPresenceFilters(
+	dataset: SheetDataset,
+	ctx: RouteContext,
+): SheetFilter[] {
+	const filters: SheetFilter[] = [];
+	const missingPatterns = [
+		/\b(?:where\s+)?(.+?)\s+(?:is|are)\s+(?:missing|blank|empty|null)\b/,
+		/\b(?:missing|blank|empty|null)\s+(.+?)\b/,
+	];
+	const presentPatterns = [
+		/\b(?:where\s+)?(.+?)\s+(?:is|are)\s+(?:present|filled|set|available)\b/,
+		/\b(?:with|has|have)\s+(.+?)\b/,
+	];
+	const withoutMatch = ctx.normalized.match(/\bwithout\s+(.+?)\b/);
+	if (withoutMatch?.[1]) {
+		const column = findMentionedColumn(dataset, withoutMatch[1]);
+		if (column) filters.push(booleanPresenceFilter(column, false));
+	}
+	for (const pattern of missingPatterns) {
+		const match = ctx.normalized.match(pattern);
+		if (!match?.[1]) continue;
+		const column = findMentionedColumn(dataset, match[1]);
+		if (column)
+			filters.push({ kind: "presence", column: column.id, present: false });
+	}
+	for (const pattern of presentPatterns) {
+		const match = ctx.normalized.match(pattern);
+		if (!match?.[1]) continue;
+		const column = findMentionedColumn(dataset, match[1]);
+		if (column) filters.push(booleanPresenceFilter(column, true));
+	}
+	return filters;
+}
+
 function findEqualityFilters(
 	dataset: SheetDataset,
 	ctx: RouteContext,
@@ -803,6 +931,7 @@ function findEqualityFilters(
 	const filters: SheetFilter[] = [];
 	const filteredColumns = new Set<string>();
 	const requestedLimit = topLimit(ctx);
+	const comparedNumber = parseNumberComparison(ctx)?.value;
 	for (const column of dataset.columns) {
 		const filterable =
 			column.roles.includes("dimension") ||
@@ -824,6 +953,13 @@ function findEqualityFilters(
 				requestedLimit !== undefined &&
 				/^\d+$/.test(normalized) &&
 				Number(normalized) === requestedLimit
+			) {
+				continue;
+			}
+			if (
+				comparedNumber !== undefined &&
+				/^-?\d+(?:\.\d+)?$/.test(normalized) &&
+				Number(normalized) === comparedNumber
 			) {
 				continue;
 			}
@@ -1032,6 +1168,7 @@ function buildFrame(
 	const filters = dedupeFilters(
 		[
 			...findEqualityFilters(dataset, ctx),
+			...findPresenceFilters(dataset, ctx),
 			findDateRangeFilter(dataset, ctx),
 			findMonthFilter(dataset, ctx),
 			findNumberFilter(dataset, ctx),
@@ -1045,24 +1182,35 @@ function buildFrame(
 	const orderMeasure = findMeasureColumn(dataset, ctx);
 	const order = listOrder(dataset, ctx, orderMeasure);
 	const explicitAggregate = aggregateIntent(ctx);
+	const rankedList = shouldUseRankedList(ctx, rankTargetGroup, orderMeasure);
 
 	if (
 		isListIntent(ctx) &&
 		!explicitAggregate &&
 		!wantsDistribution(ctx) &&
 		!explicitGroupBy &&
-		!rankTargetGroup
+		(!rankTargetGroup || rankedList)
 	) {
 		const explicit = explicitProjection(dataset, ctx);
-		const hasContextColumn = explicit.some(
-			(columnId) => columnId !== orderMeasure?.id && columnId !== order?.column,
-		);
+		const filterColumns = new Set(filters.map((filter) => filter.column));
+		const hasContextColumn = explicit.some((columnId) => {
+			const column = columnById(dataset, columnId);
+			return (
+				columnId !== orderMeasure?.id &&
+				columnId !== order?.column &&
+				!filterColumns.has(columnId) &&
+				column !== undefined &&
+				!isLongTextColumn(column)
+			);
+		});
 		const baseProjection = hasContextColumn
 			? explicit
 			: defaultProjection(dataset);
 		const projection = withProjectionColumns(baseProjection, [
+			rankedList ? rankTargetGroup?.id : undefined,
 			orderMeasure?.id,
 			order?.column === "__row_index" ? undefined : order?.column,
+			...filters.map((filter) => filter.column),
 		]);
 		const frame: Omit<SheetQueryFrame, "confidence"> = {
 			question,
@@ -1158,6 +1306,12 @@ function matchesFilter(row: SheetRow, filter: SheetFilter): boolean {
 	const cell = row.cells[filter.column];
 	if (!cell) return false;
 	if (filter.kind === "equals") {
+		if (
+			(typeof filter.value === "boolean" || typeof filter.value === "number") &&
+			cell.value === filter.value
+		) {
+			return true;
+		}
 		return cell.normalized === normalizeText(String(filter.value));
 	}
 	if (filter.kind === "number") {
@@ -1176,6 +1330,10 @@ function matchesFilter(row: SheetRow, filter: SheetFilter): boolean {
 		if (start !== undefined && timestamp < start) return false;
 		if (end !== undefined && timestamp >= end) return false;
 		return true;
+	}
+	if (filter.kind === "presence") {
+		const present = cell.raw.trim().length > 0 && cell.value !== null;
+		return filter.present ? present : !present;
 	}
 	if (!(cell.value instanceof Date)) return false;
 	const month = cell.value.getMonth() + 1;

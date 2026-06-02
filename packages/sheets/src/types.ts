@@ -63,6 +63,11 @@ export type SheetFilter =
 			column: string;
 			start?: string;
 			end?: string;
+	  }
+	| {
+			kind: "presence";
+			column: string;
+			present: boolean;
 	  };
 
 export type AggregateFunction = "count" | "sum" | "avg" | "min" | "max";
