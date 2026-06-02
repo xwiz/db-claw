@@ -12,8 +12,12 @@ import type {
 
 const IDISH = /\b(id|uuid|guid|code|zip|postal|phone|account number)\b/;
 const DIMENSIONISH =
-	/\b(customer|client|account|company|campaign|project|name|title|region|market|territory|status|category|type|product|item|channel|source|warehouse|location|rep|owner|team|department|country|city)\b/;
+	/\b(customer|client|account|company|campaign|project|name|title|region|market|territory|status|category|type|product|component|part|item|channel|source|warehouse|location|rep|owner|team|department|country|city)\b/;
 const BOOLEAN_LABEL = /^(is|has|can|should|enabled|disabled)\b/;
+const LINE_NUMBER_LABEL = /^(item|line|line number|line no|no|number|#)$/;
+const QUANTITY_LABEL = /\b(quantity|qty|count|unit|units|amount)\b/;
+const SPEC_NUMBER_WORDS =
+	/\b(kv|v|dc|ac|amp|amps|current|input|output|voltage|rated|watt|watts|hz)\b/;
 
 function valueAt(row: string[], idx: number): string {
 	return row[idx]?.trim() ?? "";
@@ -50,6 +54,23 @@ function parseSpreadsheetNumber(raw: string): number | null {
 	const parsed = Number(cleaned);
 	if (!Number.isFinite(parsed)) return fallback;
 	return negative ? -parsed : parsed;
+}
+
+function parseQuantityNumber(raw: string): number | null {
+	const trimmed = raw.trim();
+	if (trimmed.length === 0) return null;
+	const withoutParenthetical = trimmed.replace(/\([^)]*\)/g, "").trim();
+	const normalized = normalizeText(withoutParenthetical);
+	if (SPEC_NUMBER_WORDS.test(normalized)) return null;
+
+	const range = withoutParenthetical.match(
+		/^\s*(-?\d+(?:\.\d+)?)(?:\s*[-–]\s*(-?\d+(?:\.\d+)?))?/,
+	);
+	if (!range?.[1]) return parseSpreadsheetNumber(raw);
+	const lower = Number(range[1]);
+	const upper = range[2] ? Number(range[2]) : lower;
+	if (!Number.isFinite(lower) || !Number.isFinite(upper)) return null;
+	return Math.max(lower, upper);
 }
 
 function looksDateLike(raw: string): boolean {
@@ -94,7 +115,8 @@ function inferKind(
 	if (nonEmpty.length === 0) return { kind: "text", confidence: 0 };
 
 	const normalizedLabel = normalizeText(label);
-	const protectedText = IDISH.test(normalizedLabel);
+	const protectedText =
+		IDISH.test(normalizedLabel) || LINE_NUMBER_LABEL.test(normalizedLabel);
 	const dateCount = nonEmpty.filter(
 		(value) => parseDate(value) !== null,
 	).length;
@@ -104,9 +126,21 @@ function inferKind(
 	const spreadsheetNumberCount = nonEmpty.filter(
 		(value) => parseSpreadsheetNumber(value) !== null,
 	).length;
+	const quantityNumberCount = nonEmpty.filter(
+		(value) => parseQuantityNumber(value) !== null,
+	).length;
 
 	if (!protectedText && dateCount / nonEmpty.length >= 0.7) {
 		return { kind: "date", confidence: dateCount / nonEmpty.length };
+	}
+	if (
+		QUANTITY_LABEL.test(normalizedLabel) &&
+		quantityNumberCount / nonEmpty.length >= 0.65
+	) {
+		return {
+			kind: "number",
+			confidence: quantityNumberCount / nonEmpty.length,
+		};
 	}
 	if (!protectedText && spreadsheetNumberCount / nonEmpty.length >= 0.8) {
 		return {
@@ -130,6 +164,9 @@ function rolesFor(
 	values: string[],
 ): ColumnRole[] {
 	const normalizedLabel = normalizeText(label);
+	if (LINE_NUMBER_LABEL.test(normalizedLabel)) {
+		return ["display"];
+	}
 	if (kind === "number" && !IDISH.test(normalizedLabel)) return ["measure"];
 	if (kind === "date") return ["date", "dimension"];
 	if (kind === "boolean") return ["dimension"];
@@ -149,12 +186,16 @@ function rolesFor(
 	return roles;
 }
 
-function cellFor(kind: ColumnKind, raw: string): CellValue {
+function cellFor(kind: ColumnKind, label: string, raw: string): CellValue {
 	const trimmed = raw.trim();
+	const normalizedLabel = normalizeText(label);
 	let value: SheetPrimitive = trimmed.length === 0 ? null : trimmed;
 	if (trimmed.length > 0) {
-		if (kind === "number") value = parseSpreadsheetNumber(trimmed);
-		else if (kind === "date") value = parseDate(trimmed);
+		if (kind === "number") {
+			value = QUANTITY_LABEL.test(normalizedLabel)
+				? parseQuantityNumber(trimmed)
+				: parseSpreadsheetNumber(trimmed);
+		} else if (kind === "date") value = parseDate(trimmed);
 		else if (kind === "boolean") value = parseBoolean(trimmed);
 	}
 	return {
@@ -193,7 +234,11 @@ export function buildSheetDataset(csv: CsvData): SheetDataset {
 	const rows: SheetRow[] = csv.rows.map((row, rowIdx) => {
 		const cells: Record<string, CellValue> = {};
 		for (const [colIdx, column] of columns.entries()) {
-			cells[column.id] = cellFor(column.kind, valueAt(row, colIdx));
+			cells[column.id] = cellFor(
+				column.kind,
+				column.label,
+				valueAt(row, colIdx),
+			);
 		}
 		return { index: rowIdx, cells };
 	});

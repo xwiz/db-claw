@@ -37,14 +37,39 @@ function isGroupable(column: SheetColumn): boolean {
 	);
 }
 
+function isLikelyLineNumberColumn(column: SheetColumn): boolean {
+	const label = column.label.trim().toLowerCase();
+	return (
+		["item", "line", "line number", "line no", "no", "number"].includes(
+			label,
+		) &&
+		column.examples.length > 0 &&
+		column.examples.every((example) => /^\d+$/.test(example.trim()))
+	);
+}
+
 function displayDimension(dataset: SheetDataset): SheetColumn | undefined {
 	return (
+		dataset.columns.find((column) => {
+			const label = column.label.trim().toLowerCase();
+			return (
+				isGroupable(column) &&
+				column.roles.includes("display") &&
+				column.uniqueCount > 1 &&
+				!isLikelyLineNumberColumn(column) &&
+				/\b(component|product|part|name|campaign|customer|account)\b/.test(
+					label,
+				)
+			);
+		}) ??
 		dataset.columns.find(
 			(column) =>
 				isGroupable(column) &&
 				column.roles.includes("display") &&
-				column.uniqueCount > 1,
-		) ?? dataset.columns.find(isGroupable)
+				column.uniqueCount > 1 &&
+				!isLikelyLineNumberColumn(column),
+		) ??
+		dataset.columns.find(isGroupable)
 	);
 }
 

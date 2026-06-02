@@ -66,7 +66,16 @@ const DIMENSION_SYNONYMS: Record<string, string[]> = {
 		"territory",
 		"territories",
 	],
-	product: ["product", "products", "item", "items"],
+	product: [
+		"product",
+		"products",
+		"component",
+		"components",
+		"part",
+		"parts",
+		"item",
+		"items",
+	],
 	campaign: ["campaign", "campaigns", "initiative", "initiatives"],
 	channel: ["channel", "channels", "source", "sources"],
 	status: ["status", "state"],
@@ -74,6 +83,15 @@ const DIMENSION_SYNONYMS: Record<string, string[]> = {
 	team: ["team", "teams", "department", "departments"],
 	warehouse: ["warehouse", "warehouses", "location", "locations"],
 };
+
+const LINE_NUMBER_LABELS = new Set([
+	"item",
+	"line",
+	"line number",
+	"line no",
+	"no",
+	"number",
+]);
 
 interface RouteContext {
 	normalized: string;
@@ -87,6 +105,8 @@ interface GroupAccumulator {
 	sum: number;
 	min: number;
 	max: number;
+	minRaw?: string;
+	maxRaw?: string;
 }
 
 function columnById(
@@ -234,6 +254,15 @@ function findImplicitRankGroupColumn(
 	dataset: SheetDataset,
 	ctx: RouteContext,
 ): SheetColumn | undefined {
+	const nonIdentifier = findBestColumn(dataset, ctx, (column) => {
+		return (
+			(column.roles.includes("dimension") ||
+				column.roles.includes("display")) &&
+			column.kind !== "date" &&
+			!isLikelyLineNumberColumn(column)
+		);
+	});
+	if (nonIdentifier) return nonIdentifier;
 	return findBestColumn(dataset, ctx, (column) => {
 		return (
 			(column.roles.includes("dimension") ||
@@ -286,7 +315,18 @@ function topLimit(ctx: RouteContext): number | undefined {
 	if (top?.[1]) return Number(top[1]);
 	const which = ctx.normalized.match(/\bwhich\s+(\d{1,3})\b/);
 	if (which?.[1]) return Number(which[1]);
+	if (wantsTop(ctx) || wantsBottom(ctx)) return 1;
 	return undefined;
+}
+
+function wantsTop(ctx: RouteContext): boolean {
+	return (
+		hasPhrase(ctx.normalized, "most") ||
+		hasPhrase(ctx.normalized, "highest") ||
+		hasPhrase(ctx.normalized, "maximum") ||
+		hasPhrase(ctx.normalized, "largest") ||
+		hasPhrase(ctx.normalized, "greatest")
+	);
 }
 
 function wantsBottom(ctx: RouteContext): boolean {
@@ -294,6 +334,15 @@ function wantsBottom(ctx: RouteContext): boolean {
 		hasPhrase(ctx.normalized, "bottom") ||
 		hasPhrase(ctx.normalized, "lowest") ||
 		hasPhrase(ctx.normalized, "least")
+	);
+}
+
+function isLikelyLineNumberColumn(column: SheetColumn): boolean {
+	const label = normalizeText(column.label);
+	return (
+		LINE_NUMBER_LABELS.has(label) &&
+		column.examples.length > 0 &&
+		column.examples.every((example) => /^\d+$/.test(example.trim()))
 	);
 }
 
@@ -510,7 +559,13 @@ function buildFrame(
 
 	const limit = topLimit(ctx);
 	const topOrBottom = limit !== undefined || wantsBottom(ctx);
-	const aggregate = aggregateIntent(ctx) ?? (topOrBottom ? "sum" : undefined);
+	const aggregate =
+		aggregateIntent(ctx) ??
+		(topOrBottom
+			? wantsTop(ctx) || wantsBottom(ctx)
+				? "max"
+				: "sum"
+			: undefined);
 	const measure =
 		aggregate && aggregate !== "count"
 			? findMeasureColumn(dataset, ctx)
@@ -683,13 +738,20 @@ function groupedRows(
 			max: Number.NEGATIVE_INFINITY,
 		};
 		current.count += 1;
-		const numeric = numberValue(
-			frame.measureColumn ? row.cells[frame.measureColumn] : undefined,
-		);
+		const measureCell = frame.measureColumn
+			? row.cells[frame.measureColumn]
+			: undefined;
+		const numeric = numberValue(measureCell);
 		if (numeric !== undefined) {
 			current.sum += numeric;
-			current.min = Math.min(current.min, numeric);
-			current.max = Math.max(current.max, numeric);
+			if (numeric < current.min) {
+				current.min = numeric;
+				if (measureCell?.raw) current.minRaw = measureCell.raw;
+			}
+			if (numeric > current.max) {
+				current.max = numeric;
+				if (measureCell?.raw) current.maxRaw = measureCell.raw;
+			}
 		}
 		groups.set(label, current);
 	}
@@ -698,14 +760,18 @@ function groupedRows(
 	const groupLabel = labelFor(dataset, groupColumn);
 	const materialized = [...groups.values()].map((group) => {
 		let metric = group.count;
+		let raw: string | undefined;
 		if (aggregate === "sum") metric = group.sum;
 		else if (aggregate === "avg")
 			metric = group.count === 0 ? 0 : group.sum / group.count;
-		else if (aggregate === "min")
+		else if (aggregate === "min") {
 			metric = Number.isFinite(group.min) ? group.min : 0;
-		else if (aggregate === "max")
+			raw = group.minRaw;
+		} else if (aggregate === "max") {
 			metric = Number.isFinite(group.max) ? group.max : 0;
-		return { group: group.label, metric };
+			raw = group.maxRaw;
+		}
+		return { group: group.label, metric, raw };
 	});
 
 	const direction = frame.orderBy?.direction ?? "desc";
@@ -716,10 +782,16 @@ function groupedRows(
 		frame.limit !== undefined
 			? materialized.slice(0, frame.limit)
 			: materialized;
-	const outRows = limited.map((row) => ({
-		[groupLabel]: row.group,
-		[metricLabel]: row.metric,
-	}));
+	const outRows = limited.map((row) => {
+		const out: Record<string, string | number | boolean | null> = {
+			[groupLabel]: row.group,
+			[metricLabel]: row.metric,
+		};
+		if (row.raw && frame.measureColumn) {
+			out[labelFor(dataset, frame.measureColumn)] = row.raw;
+		}
+		return out;
+	});
 	return {
 		rows: outRows,
 		chart: {

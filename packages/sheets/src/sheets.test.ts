@@ -18,6 +18,17 @@ Evergreen,Search,paused,$500,150,2024-04-20
 Partner Push,Email,active,$300,90,2024-05-08
 `;
 
+const BOM_CSV = `Item,Subsystem,Component,Specification,Quantity,Sourcing,Cost
+1,EHD Subsystem,HV Power Module,12V DC input,20-30kV DC output,minimum 3A input current,1
+2,EHD Subsystem,Needle Emitter,Sharp steel needle,1,Local market,100-500
+6,EHD Subsystem,High-Voltage Silicone Wire,20kV rated silicone insulation,2m,Online,2000-5000
+19,Water Cooling Loop,Hose Clamps,10-12mm stainless steel,4,Hardware store,500-1000
+22,Ozone Catalyst Subsystem,Catalyst Material,Manganese dioxide powder,2-3 batteries (yield ~10g powder),Recycled,0
+23,Ozone Catalyst Subsystem,Catalyst Binder (optional),Small amount of water,10-20mL,N/A,0
+30,Power System,Battery Cables (solar panel side),12 AWG stranded copper,4-6m,Hardware store,1000-2000
+47,Assembly / Maintenance,Distilled Water,For reservoir filling,5L,Supermarket,500-1000
+`;
+
 describe("parseCsv", () => {
 	it("handles quoted commas and escaped quotes", () => {
 		const parsed = parseCsv('Name,Note\n"Acme, Inc","said ""yes"""\n');
@@ -256,6 +267,32 @@ describe("querySheet", () => {
 		expect(activeCampaigns.rows).toHaveLength(3);
 		expect(activeCampaigns.rows[0]).toMatchObject({
 			Campaign: "Launch A",
+		});
+	});
+
+	it("answers BOM quantity superlatives with mixed quantity units", () => {
+		const dataset = buildSheetDataset(parseCsv(BOM_CSV));
+		const item = dataset.columns.find((column) => column.id === "item");
+		const quantity = dataset.columns.find((column) => column.id === "quantity");
+		expect(item?.roles).not.toContain("measure");
+		expect(quantity?.roles).toContain("measure");
+		expect(suggestSheetQuestions(dataset)).toEqual(
+			expect.arrayContaining(["top 5 components by quantity"]),
+		);
+
+		const result = querySheet(
+			dataset,
+			"what is the item needed in most quantity?",
+		);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.queryFrame.measureColumn).toBe("quantity");
+		expect(result.queryFrame.groupByColumn).toBe("component");
+		expect(result.queryFrame.limit).toBe(1);
+		expect(result.rows[0]).toEqual({
+			Component: "Catalyst Binder (optional)",
+			"MAX Quantity": 20,
+			Quantity: "10-20mL",
 		});
 	});
 });
