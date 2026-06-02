@@ -48,4 +48,22 @@ if (result.confidence.level !== "high") {
 	throw new Error(`Expected high confidence, got ${result.confidence.level}`);
 }
 
+if (runtime.SHEET_USE_CASES.length < 7) {
+	throw new Error("Expected the Pages demo to include varied practical CSVs");
+}
+
+for (const useCase of runtime.SHEET_USE_CASES) {
+	const useCaseDataset = runtime.buildSheetDataset(
+		runtime.parseCsv(useCase.csv),
+	);
+	for (const question of useCase.questions) {
+		const useCaseResult = runtime.querySheet(useCaseDataset, question);
+		if (!useCaseResult.ok) {
+			throw new Error(
+				`Use case question failed (${useCase.id}): ${question} - ${useCaseResult.rejectionReason}`,
+			);
+		}
+	}
+}
+
 console.log("Pages artifact smoke passed");

@@ -14,6 +14,7 @@ function matchesFilter(row: SheetRow, filter: SheetFilter): boolean {
 		return cell.normalized === normalizeText(String(filter.value));
 	}
 	if (filter.kind === "notEquals") {
+		if (cell.raw.trim().length === 0 || cell.value === null) return false;
 		if (
 			(typeof filter.value === "boolean" || typeof filter.value === "number") &&
 			cell.value === filter.value

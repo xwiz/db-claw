@@ -258,6 +258,91 @@ describe("querySheet", () => {
 				first: { Category: "Analytics", "AVG Unit Cost": 204 },
 			},
 			"inventory::how many products are backordered?": { scalar: 1 },
+			"marketing_campaigns::total spend by channel": {
+				first: { Channel: "Social", "SUM Spend": 2300 },
+				length: 3,
+			},
+			"marketing_campaigns::top 5 campaigns by clicks": {
+				first: { Campaign: "Conference Promo", "SUM Clicks": 410 },
+				length: 5,
+			},
+			"marketing_campaigns::show active campaigns": {
+				first: { Campaign: "Launch A" },
+				length: 4,
+			},
+			"marketing_campaigns::average leads by channel": {
+				first: { Channel: "Social", "AVG Leads": 43 },
+				length: 3,
+			},
+			"marketing_campaigns::how many paused campaigns?": { scalar: 2 },
+			"applicant_kyc::how many approved applicants?": { scalar: 3 },
+			"applicant_kyc::show applicants not from Nigeria": {
+				first: { Applicant: "Grace Hopper" },
+				length: 3,
+			},
+			"applicant_kyc::show applicants with wallet balance between 1000 and 2000":
+				{
+					first: { Applicant: "Ada Lovelace", "Wallet Balance": 1200 },
+					length: 3,
+				},
+			"applicant_kyc::how many unique countries are there?": {
+				scalar: 4,
+			},
+			"applicant_kyc::what is the maximum wallet balance?": {
+				scalar: 3000,
+			},
+			"engineering_bom::what is the item needed in most quantity?": {
+				first: {
+					Component: "Catalyst Binder (optional)",
+					"MAX Quantity": 20,
+					Quantity: "10-20mL",
+				},
+				length: 1,
+			},
+			"engineering_bom::top 5 components by quantity": {
+				first: {
+					Component: "Catalyst Binder (optional)",
+					"SUM Quantity": 20,
+				},
+				length: 5,
+			},
+			"engineering_bom::list subsystems": {
+				first: { Subsystem: "EHD Subsystem" },
+				length: 6,
+			},
+			"engineering_bom::show components not in EHD Subsystem": {
+				first: {
+					Item: "10",
+					Subsystem: "Active Cooling Core",
+					Component: "Peltier Thermoelectric Module",
+				},
+				length: 8,
+			},
+			"engineering_bom::show components with quantity between 2 and 5": {
+				first: {
+					Item: "6",
+					Component: "High-Voltage Silicone Wire",
+					Quantity: 2,
+				},
+				length: 5,
+			},
+			"clinic_visits::total visit cost by department": {
+				first: { Department: "Cardiology", "SUM Visit Cost": 500 },
+				length: 3,
+			},
+			"clinic_visits::average wait time minutes by department": {
+				first: {
+					Department: "Cardiology",
+					"AVG Wait Time Minutes": 25.666666666666668,
+				},
+				length: 3,
+			},
+			"clinic_visits::show no-show patients": {
+				first: { Patient: "Ibrahim Musa" },
+				length: 2,
+			},
+			"clinic_visits::how many completed appointments?": { scalar: 4 },
+			"clinic_visits::average wait time minutes in May": { scalar: 19 },
 		};
 
 		for (const useCase of SHEET_USE_CASES) {
@@ -472,6 +557,11 @@ describe("querySheet", () => {
 		expect(notNigeria.rows).not.toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ Applicant: "Ada Lovelace" }),
+			]),
+		);
+		expect(notNigeria.rows).not.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ Applicant: "Alan Turing" }),
 			]),
 		);
 
