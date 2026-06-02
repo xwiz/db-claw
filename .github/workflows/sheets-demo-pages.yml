@@ -1,0 +1,59 @@
+name: Sheets demo Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sheets-demo-pages.yml"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "packages/sheets/**"
+      - "packages/sheets-demo/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: sheets-demo-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/configure-pages@v5
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Test sheets runtime
+        run: pnpm --filter @semsql/sheets test
+      - name: Typecheck demo
+        run: pnpm --filter @semsql/sheets-demo typecheck
+      - name: Build Pages artifact
+        run: pnpm --filter @semsql/sheets-demo build:pages
+      - name: Smoke Pages artifact
+        run: pnpm --filter @semsql/sheets-demo smoke:pages
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/sheets-demo-pages
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

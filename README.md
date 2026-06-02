@@ -63,6 +63,27 @@ semsql query --graph my-app.semsql "active students who joined last month"
 semsql doctor --graph my-app.semsql
 ```
 
+## Browser spreadsheet demo
+
+A browser-only CSV and public Google Sheets demo lives in `packages/sheets-demo`. It imports `@semsql/sheets` and supports packaged use cases, public CSV/Google Sheets URLs, and local CSV uploads.
+
+```bash
+pnpm --filter @semsql/sheets-demo build
+python -m http.server 4173 --bind 127.0.0.1
+# http://127.0.0.1:4173/packages/sheets-demo/index.html
+```
+
+For GitHub Pages:
+
+```bash
+pnpm --filter @semsql/sheets-demo build:pages
+pnpm --filter @semsql/sheets-demo smoke:pages
+python -m http.server 4173 --bind 127.0.0.1 -d target/sheets-demo-pages
+# http://127.0.0.1:4173/
+```
+
+The `Sheets demo Pages` workflow deploys the artifact to `https://xwiz.github.io/db-claw/`.
+
 ## Security
 
 SemanticSQL is designed with multi-tenant isolation as a hard requirement. Every generated query is:

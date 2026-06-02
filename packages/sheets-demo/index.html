@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>SemanticSQL Sheets</title>
+		<link
+			rel="icon"
+			href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b6bcb'/%3E%3Cpath d='M3 4h10v2H3zm0 4h10v2H3zm0 4h7v2H3z' fill='white'/%3E%3C/svg%3E"
+		/>
+		<link rel="stylesheet" href="./src/styles.css" />
+		<script type="importmap">
+			{
+				"imports": {
+					"@semsql/sheets": "../sheets/dist/index.js"
+				}
+			}
+		</script>
+	</head>
+	<body>
+		<div class="app">
+			<header class="topbar">
+				<div>
+					<h1>SemanticSQL Sheets</h1>
+					<p>Query CSVs and public Google Sheets in the browser.</p>
+				</div>
+				<div id="status" class="status">Loading</div>
+			</header>
+			<main>
+				<section class="panel controls" aria-label="Spreadsheet controls">
+					<div class="field">
+						<label for="use-case">Practical Use Case</label>
+						<select id="use-case"></select>
+						<p id="use-case-description" class="hint"></p>
+					</div>
+					<div class="field">
+						<label for="sheet-url">Public Sheet or CSV URL</label>
+						<div class="row">
+							<input
+								id="sheet-url"
+								type="url"
+								placeholder="https://docs.google.com/spreadsheets/..."
+							/>
+							<button id="load-url" type="button">Load</button>
+						</div>
+					</div>
+					<div class="field">
+						<label for="csv-file">Local CSV</label>
+						<div class="row">
+							<input id="csv-file" type="file" accept=".csv,text/csv" />
+							<button id="reload-use-case" type="button">Reset</button>
+						</div>
+					</div>
+					<div class="field query-field">
+						<label for="question">Question</label>
+						<div class="row">
+							<input id="question" type="text" />
+							<button id="run" class="primary" type="button">Run</button>
+						</div>
+						<div id="quick" class="quick"></div>
+					</div>
+					<div class="field preview-field">
+						<label>Detected Sheet</label>
+						<div id="preview" class="table-wrap"></div>
+					</div>
+					<div class="field">
+						<label>Detected Columns</label>
+						<div id="schema" class="schema-list"></div>
+					</div>
+				</section>
+				<section class="panel results" aria-label="Query results">
+					<div class="result-head">
+						<div id="message" class="message ok">Ready</div>
+						<div id="shape" class="status">unknown</div>
+					</div>
+					<div id="chart"></div>
+					<div id="result-table" class="table-wrap"></div>
+					<details>
+						<summary>QueryFrame</summary>
+						<pre id="debug">{}</pre>
+					</details>
+				</section>
+			</main>
+		</div>
+		<script type="module" src="./dist/app.js"></script>
+	</body>
+</html>
