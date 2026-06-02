@@ -1,4 +1,6 @@
+import { toChartJsConfig } from "../chartjs.js";
 import type {
+	ChartJsConfig,
 	ChartSeries,
 	SheetDataset,
 	SheetQueryFrame,
@@ -24,6 +26,7 @@ export function groupedRows(
 ): {
 	rows: Record<string, string | number | boolean | null>[];
 	chart: ChartSeries;
+	chartJs: ChartJsConfig;
 } {
 	const groupColumn = frame.groupByColumn!;
 	const aggregate = frame.aggregate ?? "count";
@@ -93,11 +96,15 @@ export function groupedRows(
 		}
 		return out;
 	});
+	const chart: ChartSeries = {
+		labels: limited.map((row) => row.group),
+		values: limited.map((row) => row.metric),
+		label: metricLabel,
+		groupLabel,
+	};
 	return {
 		rows: outRows,
-		chart: {
-			labels: limited.map((row) => row.group),
-			values: limited.map((row) => row.metric),
-		},
+		chart,
+		chartJs: toChartJsConfig(chart),
 	};
 }

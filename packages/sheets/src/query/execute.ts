@@ -24,6 +24,7 @@ export function executeFrame(
 				message: `${grouped.rows.length} grouped result${grouped.rows.length === 1 ? "" : "s"}.`,
 				rows: grouped.rows,
 				chart: grouped.chart,
+				chartJs: grouped.chartJs,
 				confidence: frame.confidence,
 				warnings: dataset.warnings,
 			};

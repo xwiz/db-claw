@@ -120,6 +120,27 @@ export interface SheetQueryFrame {
 export interface ChartSeries {
 	labels: string[];
 	values: number[];
+	label: string;
+	groupLabel: string;
+}
+
+export type ChartJsType = "bar";
+
+export interface ChartJsDataset {
+	label: string;
+	data: number[];
+	backgroundColor?: string | string[];
+	borderColor?: string | string[];
+	borderWidth?: number;
+}
+
+export interface ChartJsConfig {
+	type: ChartJsType;
+	data: {
+		labels: string[];
+		datasets: ChartJsDataset[];
+	};
+	options: Record<string, unknown>;
 }
 
 export interface SheetQuerySuccess {
@@ -130,6 +151,7 @@ export interface SheetQuerySuccess {
 	rows: Record<string, string | number | boolean | null>[];
 	scalar?: number;
 	chart?: ChartSeries;
+	chartJs?: ChartJsConfig;
 	confidence: QueryConfidence;
 	warnings: string[];
 }

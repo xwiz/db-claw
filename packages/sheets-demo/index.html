@@ -71,13 +71,23 @@
 				<section class="panel results" aria-label="Query results">
 					<div class="result-head">
 						<div id="message" class="message ok">Ready</div>
-						<div id="shape" class="status">unknown</div>
+						<div class="result-tools">
+							<div id="view-toggle" class="view-toggle" hidden>
+								<button id="view-table" type="button" class="active">Table</button>
+								<button id="view-chart" type="button">Chart</button>
+							</div>
+							<div id="shape" class="status">unknown</div>
+						</div>
 					</div>
 					<div id="chart"></div>
 					<div id="result-table" class="table-wrap"></div>
 					<details>
 						<summary>QueryFrame</summary>
 						<pre id="debug">{}</pre>
+					</details>
+					<details id="chart-config-details" hidden>
+						<summary>Chart.js</summary>
+						<pre id="chart-config">{}</pre>
 					</details>
 				</section>
 			</main>

@@ -258,37 +258,43 @@ export function suggestSheetQuestions(
 	if (measure && group) {
 		pushUnique(
 			out,
-			`total ${questionLabel(measure)} by ${questionLabel(group)}`,
+			`Compare total ${questionLabel(measure)} by ${questionLabel(group)}`,
 		);
 	}
 	if (measure && display) {
 		pushUnique(
 			out,
-			`top 5 ${pluralize(display.label)} by ${questionLabel(measure)}`,
+			`What are the top 5 ${pluralize(display.label)} by ${questionLabel(measure)}?`,
 		);
 	}
 	if (nextMeasure && group) {
 		pushUnique(
 			out,
-			`average ${questionLabel(nextMeasure)} by ${questionLabel(group)}`,
+			`Compare average ${questionLabel(nextMeasure)} by ${questionLabel(group)}`,
 		);
 	}
 	if (measure && month) {
-		pushUnique(out, `average ${questionLabel(measure)} in ${month}`);
-	}
-	if (value && display) {
-		pushUnique(out, `show ${value.toLowerCase()} ${pluralize(display.label)}`);
+		pushUnique(
+			out,
+			`What was the average ${questionLabel(measure)} in ${month}?`,
+		);
 	}
 	if (value && display) {
 		pushUnique(
 			out,
-			`how many ${value.toLowerCase()} ${pluralize(display.label)}?`,
+			`Show ${value.toLowerCase()} ${pluralize(display.label)} that need attention`,
+		);
+	}
+	if (value && display) {
+		pushUnique(
+			out,
+			`How many ${value.toLowerCase()} ${pluralize(display.label)} are in this sheet?`,
 		);
 	}
 	if (display) {
-		pushUnique(out, `show first 5 ${pluralize(display.label)}`);
+		pushUnique(out, `Show first 5 ${pluralize(display.label)} with key fields`);
 	}
-	pushUnique(out, "how many rows are there?");
+	pushUnique(out, "How many rows are in this sheet?");
 
 	return out.slice(0, limit);
 }

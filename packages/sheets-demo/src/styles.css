@@ -244,6 +244,32 @@ th {
 	gap: 12px;
 }
 
+.result-tools {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.view-toggle {
+	display: flex;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	overflow: hidden;
+	background: #fff;
+}
+
+.view-toggle button {
+	border: 0;
+	border-radius: 0;
+	padding: 7px 10px;
+	font-size: 12px;
+}
+
+.view-toggle button.active {
+	background: var(--accent);
+	color: #fff;
+}
+
 .message {
 	font-weight: 700;
 }
@@ -263,6 +289,20 @@ th {
 	background: var(--soft);
 	border: 1px solid var(--line);
 	border-radius: 6px;
+}
+
+.chart-panel {
+	height: min(420px, 52vh);
+	min-height: 260px;
+	padding: 10px;
+	background: var(--soft);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+}
+
+.chart-panel canvas {
+	width: 100%;
+	height: 100%;
 }
 
 .bar-row {

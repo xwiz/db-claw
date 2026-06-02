@@ -1,4 +1,5 @@
 export { parseCsv } from "./csv.js";
+export { toChartJsConfig } from "./chartjs.js";
 export { toGoogleSheetsCsvUrl, loadCsvFromUrl } from "./google.js";
 export { buildSheetDataset } from "./infer.js";
 export { querySheet } from "./query.js";
@@ -8,6 +9,9 @@ export { suggestSheetQuestions } from "./suggest.js";
 export type {
 	AggregateFunction,
 	CellValue,
+	ChartJsConfig,
+	ChartJsDataset,
+	ChartJsType,
 	ChartSeries,
 	ColumnKind,
 	ColumnRole,

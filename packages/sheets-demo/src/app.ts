@@ -1,4 +1,5 @@
 import {
+	type ChartJsConfig,
 	SHEET_USE_CASES,
 	type SheetDataset,
 	type SheetQueryResult,
@@ -18,6 +19,26 @@ interface DemoState {
 	questions: string[];
 }
 
+type ResultView = "table" | "chart";
+
+interface ChartInstance {
+	destroy(): void;
+}
+
+type ChartConstructor = new (
+	context: HTMLCanvasElement | CanvasRenderingContext2D,
+	config: ChartJsConfig,
+) => ChartInstance;
+
+declare global {
+	interface Window {
+		Chart?: ChartConstructor;
+	}
+}
+
+const CHART_JS_URL =
+	"https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js";
+
 const els = {
 	status: required<HTMLDivElement>("status"),
 	useCase: required<HTMLSelectElement>("use-case"),
@@ -33,12 +54,21 @@ const els = {
 	schema: required<HTMLDivElement>("schema"),
 	message: required<HTMLDivElement>("message"),
 	shape: required<HTMLDivElement>("shape"),
+	viewToggle: required<HTMLDivElement>("view-toggle"),
+	viewTable: required<HTMLButtonElement>("view-table"),
+	viewChart: required<HTMLButtonElement>("view-chart"),
 	chart: required<HTMLDivElement>("chart"),
 	table: required<HTMLDivElement>("result-table"),
 	debug: required<HTMLPreElement>("debug"),
+	chartConfigDetails: required<HTMLDetailsElement>("chart-config-details"),
+	chartConfig: required<HTMLPreElement>("chart-config"),
 };
 
 let state = loadUseCase(SHEET_USE_CASES[0]!);
+let currentResult: SheetQueryResult | undefined;
+let preferredView: ResultView = "table";
+let chartInstance: ChartInstance | undefined;
+let chartLoadPromise: Promise<ChartConstructor | undefined> | undefined;
 
 function required<T extends HTMLElement>(id: string): T {
 	const element = document.getElementById(id);
@@ -142,7 +172,27 @@ function confidenceText(result: SheetQueryResult): string {
 	return `${confidence.level} confidence ${Math.round(confidence.score * 100)}%`;
 }
 
-function renderChart(result: SheetQueryResult): void {
+function destroyChart(): void {
+	chartInstance?.destroy();
+	chartInstance = undefined;
+}
+
+function loadChartJs(): Promise<ChartConstructor | undefined> {
+	if (window.Chart) return Promise.resolve(window.Chart);
+	if (chartLoadPromise) return chartLoadPromise;
+	chartLoadPromise = new Promise((resolve) => {
+		const script = document.createElement("script");
+		script.src = CHART_JS_URL;
+		script.async = true;
+		script.onload = () => resolve(window.Chart);
+		script.onerror = () => resolve(undefined);
+		document.head.append(script);
+	});
+	return chartLoadPromise;
+}
+
+function renderFallbackChart(result: SheetQueryResult): void {
+	destroyChart();
 	if (!result.ok || !result.chart || result.chart.values.length === 0) {
 		els.chart.innerHTML = "";
 		return;
@@ -157,7 +207,37 @@ function renderChart(result: SheetQueryResult): void {
 		.join("")}</div>`;
 }
 
+async function renderChart(result: SheetQueryResult): Promise<void> {
+	if (!result.ok || !result.chartJs) {
+		renderFallbackChart(result);
+		return;
+	}
+	destroyChart();
+	els.chart.innerHTML = `<div class="chart-panel"></div>`;
+	const panel = els.chart.querySelector<HTMLDivElement>(".chart-panel");
+	if (!panel) return;
+	const canvas = document.createElement("canvas");
+	panel.append(canvas);
+	const Chart = await loadChartJs();
+	if (currentResult !== result || preferredView !== "chart") return;
+	if (!Chart) {
+		renderFallbackChart(result);
+		return;
+	}
+	chartInstance = new Chart(canvas, result.chartJs);
+}
+
+function hasChart(result: SheetQueryResult): boolean {
+	return result.ok && Boolean(result.chartJs);
+}
+
+function updateViewButtons(view: ResultView): void {
+	els.viewTable.classList.toggle("active", view === "table");
+	els.viewChart.classList.toggle("active", view === "chart");
+}
+
 function renderResult(result: SheetQueryResult): void {
+	currentResult = result;
 	els.debug.textContent = JSON.stringify(
 		result.ok ? result.queryFrame : result,
 		null,
@@ -170,12 +250,31 @@ function renderResult(result: SheetQueryResult): void {
 		els.shape.textContent = confidenceText(result);
 		els.chart.innerHTML = "";
 		els.table.innerHTML = "";
+		els.chart.hidden = true;
+		els.table.hidden = false;
+		els.viewToggle.hidden = true;
+		els.chartConfigDetails.hidden = true;
+		els.chartConfig.textContent = "{}";
+		destroyChart();
 		return;
 	}
 	els.message.textContent = result.message;
 	els.shape.textContent = `${result.queryFrame.resultShape} | ${confidenceText(result)}`;
-	renderChart(result);
 	renderTable(result.rows, els.table);
+	const chartable = hasChart(result);
+	els.viewToggle.hidden = !chartable;
+	els.chartConfigDetails.hidden = !chartable;
+	els.chartConfig.textContent = JSON.stringify(result.chartJs ?? {}, null, 2);
+	const view = chartable ? preferredView : "table";
+	updateViewButtons(view);
+	els.table.hidden = view !== "table";
+	els.chart.hidden = view !== "chart";
+	if (view === "chart") {
+		void renderChart(result);
+	} else {
+		destroyChart();
+		els.chart.innerHTML = "";
+	}
 }
 
 function runQuery(question = els.question.value): void {
@@ -250,6 +349,14 @@ function bindEvents(): void {
 	els.loadUrl.addEventListener("click", () => void loadUrl());
 	els.file.addEventListener("change", () => void loadFile());
 	els.run.addEventListener("click", () => runQuery());
+	els.viewTable.addEventListener("click", () => {
+		preferredView = "table";
+		if (currentResult) renderResult(currentResult);
+	});
+	els.viewChart.addEventListener("click", () => {
+		preferredView = "chart";
+		if (currentResult) renderResult(currentResult);
+	});
 	els.question.addEventListener("keydown", (event) => {
 		if (event.key === "Enter") runQuery();
 	});

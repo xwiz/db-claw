@@ -33,7 +33,10 @@ const runtime = await import(
 );
 
 const dataset = runtime.buildSheetDataset(runtime.parseCsv(runtime.SAMPLE_CSV));
-const result = runtime.querySheet(dataset, "total revenue by region");
+const result = runtime.querySheet(
+	dataset,
+	"Show total revenue by region for the leadership review",
+);
 
 if (!result.ok) {
 	throw new Error(`Expected smoke query to pass: ${result.rejectionReason}`);
@@ -46,6 +49,12 @@ if (
 }
 if (result.confidence.level !== "high") {
 	throw new Error(`Expected high confidence, got ${result.confidence.level}`);
+}
+if (
+	result.chartJs?.type !== "bar" ||
+	result.chartJs.data?.datasets?.[0]?.label !== "SUM Revenue"
+) {
+	throw new Error("Pages runtime did not return a Chart.js-compatible config");
 }
 
 if (runtime.SHEET_USE_CASES.length < 7) {

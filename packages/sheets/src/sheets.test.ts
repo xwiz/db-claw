@@ -126,6 +126,35 @@ describe("querySheet", () => {
 			]),
 		);
 		expect(result.rows[0]).toEqual({ Region: "LATAM", "SUM Revenue": 13700 });
+		expect(result.chart).toMatchObject({
+			label: "SUM Revenue",
+			groupLabel: "Region",
+			labels: ["LATAM", "NA", "EMEA", "APAC"],
+			values: [13700, 9050, 8300, 5250],
+		});
+		expect(result.chartJs).toMatchObject({
+			type: "bar",
+			data: {
+				labels: ["LATAM", "NA", "EMEA", "APAC"],
+				datasets: [
+					{
+						label: "SUM Revenue",
+						data: [13700, 9050, 8300, 5250],
+					},
+				],
+			},
+		});
+	});
+
+	it("keeps realistic show-total prompts on the aggregate route", () => {
+		const result = querySheet(
+			sampleDataset(),
+			"Show total revenue by region for the leadership review",
+		);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.queryFrame.routeReason).toBe("aggregate_grouped");
+		expect(result.rows[0]).toEqual({ Region: "LATAM", "SUM Revenue": 13700 });
 	});
 
 	it("answers top-N grouped questions", () => {
@@ -224,80 +253,92 @@ describe("querySheet", () => {
 
 	it("returns expected results for every packaged practical use-case query", () => {
 		const expectations: Record<string, Record<string, unknown>> = {
-			"revenue_ops::total revenue by region": {
+			"revenue_ops::Compare total revenue by region for the pipeline review": {
 				first: { Region: "LATAM", "SUM Revenue": 13700 },
 			},
-			"revenue_ops::top 5 customers by sales": {
+			"revenue_ops::What are the top 5 customers by revenue?": {
 				first: { Customer: "Northstar Energy", "SUM Revenue": 5200 },
 				length: 5,
 			},
-			"revenue_ops::average order value in May": { scalar: 1800 },
-			"revenue_ops::how many paid invoices are overdue?": { scalar: 6 },
-			"revenue_ops::show active accounts in LATAM": {
+			"revenue_ops::What was the average order value in May?": {
+				scalar: 1800,
+			},
+			"revenue_ops::How many overdue invoices have already been paid?": {
+				scalar: 6,
+			},
+			"revenue_ops::Show me active LATAM accounts that need follow-up": {
 				first: { Customer: "Acme 4744" },
 				length: 6,
 			},
-			"support_queue::how many open tickets are high priority?": {
+			"support_queue::How many high priority tickets are still open?": {
 				scalar: 5,
 			},
-			"support_queue::average response time hours by team": {
+			"support_queue::Compare average response time hours by team": {
 				first: {
 					Team: "Billing",
 					"AVG Response Time Hours": 6.5,
 				},
 			},
-			"support_queue::show open tickets for Platform": {
+			"support_queue::Show me open Platform tickets for triage": {
 				first: { "Ticket ID": "T-1003" },
 				length: 3,
 			},
-			"support_queue::average satisfaction score in May": {
-				scalar: 4,
-			},
-			"inventory::total units on hand by warehouse": {
+			"support_queue::What was the average satisfaction score for tickets created in May?":
+				{
+					scalar: 4,
+				},
+			"inventory::Compare total units on hand by warehouse": {
 				first: { Warehouse: "East", "SUM Units On Hand": 273 },
 			},
-			"inventory::show low stock products": {
+			"inventory::Show low stock products that need replenishment": {
 				first: { Product: "Cloud Backup Starter" },
 				length: 5,
 			},
-			"inventory::average unit cost by category": {
+			"inventory::Compare average unit cost by category": {
 				first: { Category: "Security", "AVG Unit Cost": 165 },
 			},
-			"inventory::how many products are backordered?": { scalar: 2 },
-			"marketing_campaigns::total spend by channel": {
+			"inventory::How many products are currently backordered?": {
+				scalar: 2,
+			},
+			"marketing_campaigns::Compare total spend by channel": {
 				first: { Channel: "Search", "SUM Spend": 5250 },
 				length: 4,
 			},
-			"marketing_campaigns::top 5 campaigns by clicks": {
+			"marketing_campaigns::What are the top 5 campaigns by clicks?": {
 				first: { Campaign: "Competitor Terms", "SUM Clicks": 520 },
 				length: 5,
 			},
-			"marketing_campaigns::show active campaigns": {
+			"marketing_campaigns::Show active campaigns for the weekly review": {
 				first: { Campaign: "Launch A" },
 				length: 11,
 			},
-			"marketing_campaigns::average leads by channel": {
+			"marketing_campaigns::Compare average leads by channel": {
 				first: { Channel: "Social", "AVG Leads": 44 },
 				length: 4,
 			},
-			"marketing_campaigns::how many paused campaigns?": { scalar: 4 },
-			"applicant_kyc::how many approved applicants?": { scalar: 7 },
-			"applicant_kyc::show applicants not from Nigeria": {
+			"marketing_campaigns::How many campaigns are paused right now?": {
+				scalar: 4,
+			},
+			"applicant_kyc::How many applicants have been approved?": {
+				scalar: 7,
+			},
+			"applicant_kyc::Show applicants whose country is not Nigeria": {
 				first: { Applicant: "Grace Hopper" },
 				length: 10,
 			},
-			"applicant_kyc::show applicants with wallet balance between 1000 and 2000":
+			"applicant_kyc::Show applicants with wallet balance between 1000 and 2000":
 				{
 					first: { Applicant: "Ada Lovelace", "Wallet Balance": 1200 },
 					length: 5,
 				},
-			"applicant_kyc::how many unique countries are there?": {
+			"applicant_kyc::How many unique countries are represented?": {
 				scalar: 8,
 			},
-			"applicant_kyc::what is the maximum wallet balance?": {
-				scalar: 4100,
-			},
-			"engineering_bom::what is the item needed in most quantity?": {
+			"applicant_kyc::What is the maximum wallet balance in the applicant pool?":
+				{
+					scalar: 4100,
+				},
+			"engineering_bom::Which component is needed in the highest quantity?": {
 				first: {
 					Component: "M3 Stainless Screws",
 					"MAX Quantity": 24,
@@ -305,18 +346,18 @@ describe("querySheet", () => {
 				},
 				length: 1,
 			},
-			"engineering_bom::top 5 components by quantity": {
+			"engineering_bom::What are the top 5 components by quantity?": {
 				first: {
 					Component: "M3 Stainless Screws",
 					"SUM Quantity": 24,
 				},
 				length: 5,
 			},
-			"engineering_bom::list subsystems": {
+			"engineering_bom::List the subsystems represented in this BOM": {
 				first: { Subsystem: "EHD Subsystem" },
 				length: 7,
 			},
-			"engineering_bom::show components not in EHD Subsystem": {
+			"engineering_bom::Show components not in EHD Subsystem": {
 				first: {
 					Item: "5",
 					Subsystem: "Active Cooling Core",
@@ -324,31 +365,32 @@ describe("querySheet", () => {
 				},
 				length: 15,
 			},
-			"engineering_bom::show components with quantity between 2 and 5": {
-				first: {
-					Item: "4",
-					Component: "High-Voltage Silicone Wire",
-					Quantity: 2,
+			"engineering_bom::Show components with quantity between 2 and 5 for batch planning":
+				{
+					first: {
+						Item: "4",
+						Component: "High-Voltage Silicone Wire",
+						Quantity: 2,
+					},
+					length: 6,
 				},
-				length: 6,
-			},
-			"clinic_visits::total visit cost by department": {
+			"clinic_visits::Compare total visit cost by department": {
 				first: { Department: "Orthopedics", "SUM Visit Cost": 930 },
 				length: 4,
 			},
-			"clinic_visits::average wait time minutes by department": {
+			"clinic_visits::Compare average wait time minutes by department": {
 				first: {
 					Department: "Orthopedics",
 					"AVG Wait Time Minutes": 54,
 				},
 				length: 4,
 			},
-			"clinic_visits::show no-show patients": {
+			"clinic_visits::Show no-show patients for follow-up": {
 				first: { Patient: "Ibrahim Musa" },
 				length: 3,
 			},
-			"clinic_visits::how many completed appointments?": { scalar: 10 },
-			"clinic_visits::average wait time minutes in May": {
+			"clinic_visits::How many appointments were completed?": { scalar: 10 },
+			"clinic_visits::What was the average wait time minutes for May visits?": {
 				scalar: 23.09090909090909,
 			},
 		};
@@ -405,12 +447,16 @@ describe("querySheet", () => {
 
 	it("handles an uploaded-style CSV without custom use-case code", () => {
 		const dataset = buildSheetDataset(parseCsv(MARKETING_CSV));
-		expect(suggestSheetQuestions(dataset)).toEqual(
+		const suggestions = suggestSheetQuestions(dataset);
+		expect(suggestions).toEqual(
 			expect.arrayContaining([
-				"total spend by channel",
-				"top 5 campaigns by spend",
+				"Compare total spend by channel",
+				"What are the top 5 campaigns by spend?",
 			]),
 		);
+		for (const question of suggestions) {
+			expect(querySheet(dataset, question).ok, question).toBe(true);
+		}
 
 		const byChannel = querySheet(dataset, "total spend by channel");
 		expect(byChannel.ok).toBe(true);
@@ -440,10 +486,14 @@ describe("querySheet", () => {
 	it("avoids sparse display columns in suggestions", () => {
 		const dataset = buildSheetDataset(parseCsv(TRIP_LIKE_CSV));
 		expect(suggestSheetQuestions(dataset)).toEqual(
-			expect.arrayContaining(["top 5 applicants by wallet balance"]),
+			expect.arrayContaining([
+				"What are the top 5 applicants by wallet balance?",
+			]),
 		);
 		expect(suggestSheetQuestions(dataset)).not.toEqual(
-			expect.arrayContaining(["top 5 partner names by wallet balance"]),
+			expect.arrayContaining([
+				"What are the top 5 partner names by wallet balance?",
+			]),
 		);
 	});
 
@@ -614,7 +664,7 @@ describe("querySheet", () => {
 		expect(item?.roles).not.toContain("measure");
 		expect(quantity?.roles).toContain("measure");
 		expect(suggestSheetQuestions(dataset)).toEqual(
-			expect.arrayContaining(["top 5 components by quantity"]),
+			expect.arrayContaining(["What are the top 5 components by quantity?"]),
 		);
 
 		const result = querySheet(

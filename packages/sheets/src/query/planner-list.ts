@@ -83,12 +83,25 @@ export function planPrimaryListFrame(
 export function planDistinctListFrame(
 	state: FramePlanningState,
 ): SheetQueryFrame | undefined {
-	const { question, ctx, filters, order, distinctColumn } = state;
+	const {
+		question,
+		ctx,
+		filters,
+		order,
+		distinctColumn,
+		explicitAggregate,
+		explicitGroupBy,
+		rankTargetGroup,
+	} = state;
 	if (
 		!listDistinctIntent(ctx) ||
 		!distinctColumn ||
 		filters.length > 0 ||
-		order
+		order ||
+		explicitAggregate ||
+		explicitGroupBy ||
+		rankTargetGroup ||
+		wantsDistribution(ctx)
 	) {
 		return undefined;
 	}
