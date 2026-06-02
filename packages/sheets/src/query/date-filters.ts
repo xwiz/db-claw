@@ -1,7 +1,18 @@
 import { hasPhrase } from "../normalize.js";
-import type { SheetColumn, SheetDataset, SheetFilter } from "../types.js";
+import type { SheetDataset, SheetFilter } from "../types.js";
 import { findBestColumn, findDateColumn } from "./columns.js";
 import type { RouteContext } from "./context.js";
+import {
+	addDays,
+	addMonths,
+	addYears,
+	dateRangeFilter,
+	latestDateInColumn,
+	parseQuestionDate,
+	startOfDay,
+	startOfMonth,
+	startOfYear,
+} from "./date-utils.js";
 
 const MONTHS = [
 	"january",
@@ -38,86 +49,6 @@ export function findMonthFilter(
 	};
 	if (yearMatch?.[1]) filter.year = Number(yearMatch[1]);
 	return filter;
-}
-
-function dateValues(dataset: SheetDataset, column: SheetColumn): Date[] {
-	const values: Date[] = [];
-	for (const row of dataset.rows) {
-		const value = row.cells[column.id]?.value;
-		if (value instanceof Date && !Number.isNaN(value.getTime())) {
-			values.push(value);
-		}
-	}
-	return values;
-}
-
-function latestDateInColumn(
-	dataset: SheetDataset,
-	column: SheetColumn,
-): Date | undefined {
-	let latest: Date | undefined;
-	for (const value of dateValues(dataset, column)) {
-		if (!latest || value.getTime() > latest.getTime()) latest = value;
-	}
-	return latest;
-}
-
-function startOfDay(date: Date): Date {
-	return new Date(
-		Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()),
-	);
-}
-
-function addDays(date: Date, days: number): Date {
-	const out = new Date(date);
-	out.setUTCDate(out.getUTCDate() + days);
-	return out;
-}
-
-function startOfMonth(date: Date): Date {
-	return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
-}
-
-function addMonths(date: Date, months: number): Date {
-	return new Date(
-		Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, 1),
-	);
-}
-
-function startOfYear(date: Date): Date {
-	return new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
-}
-
-function addYears(date: Date, years: number): Date {
-	return new Date(Date.UTC(date.getUTCFullYear() + years, 0, 1));
-}
-
-function isoDate(date: Date): string {
-	return date.toISOString();
-}
-
-function dateRangeFilter(
-	column: SheetColumn,
-	start?: Date,
-	end?: Date,
-): SheetFilter {
-	const filter: SheetFilter = { kind: "dateRange", column: column.id };
-	if (start) filter.start = isoDate(start);
-	if (end) filter.end = isoDate(end);
-	return filter;
-}
-
-function parseQuestionDate(raw: string): Date | undefined {
-	const month =
-		"(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)";
-	const match =
-		raw.match(/\b(\d{4}-\d{1,2}-\d{1,2})\b/) ??
-		raw.match(/\b(\d{1,2}\/\d{1,2}\/\d{2,4})\b/) ??
-		raw.match(new RegExp(`\\b(${month}\\s+\\d{1,2},?\\s+\\d{4})\\b`, "i"));
-	if (!match?.[1]) return undefined;
-	const parsed = new Date(match[1]);
-	if (Number.isNaN(parsed.getTime())) return undefined;
-	return startOfDay(parsed);
 }
 
 export function findDateRangeFilter(
