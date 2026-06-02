@@ -1,6 +1,7 @@
 export { aggregateForRank, aggregateIntent } from "./aggregate-intents.js";
 export {
 	wantsBottom,
+	wantsComparison,
 	wantsDistinct,
 	wantsDistribution,
 	wantsFirst,

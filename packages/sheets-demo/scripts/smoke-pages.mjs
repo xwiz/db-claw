@@ -35,15 +35,15 @@ const runtime = await import(
 const dataset = runtime.buildSheetDataset(runtime.parseCsv(runtime.SAMPLE_CSV));
 const result = runtime.querySheet(
 	dataset,
-	"Show total revenue by region for the leadership review",
+	"Compare unpaid overdue revenue by region",
 );
 
 if (!result.ok) {
 	throw new Error(`Expected smoke query to pass: ${result.rejectionReason}`);
 }
 if (
-	result.rows[0]?.Region !== "LATAM" ||
-	result.rows[0]?.["SUM Revenue"] !== 13700
+	result.rows[0]?.Region !== "NA" ||
+	result.rows[0]?.["SUM Revenue"] !== 5900
 ) {
 	throw new Error("Pages runtime returned the wrong smoke result");
 }

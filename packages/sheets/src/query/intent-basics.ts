@@ -42,10 +42,21 @@ export function wantsOldest(ctx: RouteContext): boolean {
 export function wantsDistribution(ctx: RouteContext): boolean {
 	return (
 		hasPhrase(ctx.normalized, "breakdown") ||
+		hasPhrase(ctx.normalized, "break down") ||
 		hasPhrase(ctx.normalized, "distribution") ||
 		hasPhrase(ctx.normalized, "group by") ||
 		hasPhrase(ctx.normalized, "count by") ||
 		hasPhrase(ctx.normalized, "most common")
+	);
+}
+
+export function wantsComparison(ctx: RouteContext): boolean {
+	return (
+		hasPhrase(ctx.normalized, "compare") ||
+		hasPhrase(ctx.normalized, "comparison") ||
+		hasPhrase(ctx.normalized, "breakdown") ||
+		hasPhrase(ctx.normalized, "break down") ||
+		hasPhrase(ctx.normalized, "distribution")
 	);
 }
 

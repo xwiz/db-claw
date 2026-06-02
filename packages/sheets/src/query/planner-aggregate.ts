@@ -4,6 +4,7 @@ import { withConfidence } from "./confidence.js";
 import {
 	aggregateForRank,
 	wantsBottom,
+	wantsComparison,
 	wantsDistinct,
 	wantsDistribution,
 } from "./intents.js";
@@ -53,6 +54,14 @@ export function planAggregateFrame(
 		(aggregate && wantsDistribution(ctx)
 			? findImplicitRankGroupColumn(dataset, ctx)
 			: undefined);
+
+	if (!aggregate && groupBy && orderMeasure) {
+		aggregate = "sum";
+		measure = orderMeasure;
+	}
+	if (!aggregate && groupBy && wantsComparison(ctx)) {
+		aggregate = "count";
+	}
 
 	if (!aggregate && rankIntent) {
 		groupBy =

@@ -157,6 +157,60 @@ describe("querySheet", () => {
 		expect(result.rows[0]).toEqual({ Region: "LATAM", "SUM Revenue": 13700 });
 	});
 
+	it("grounds deeper analyst prompts without losing filters or grouping", () => {
+		const byRep = querySheet(
+			sampleDataset(),
+			"Compare overdue revenue by sales rep",
+		);
+		expect(byRep.ok).toBe(true);
+		if (!byRep.ok) return;
+		expect(byRep.queryFrame.groupByColumn).toBe("sales_rep");
+		expect(byRep.queryFrame.filters).toContainEqual({
+			kind: "equals",
+			column: "due_status",
+			value: "overdue",
+		});
+		expect(byRep.rows[0]).toEqual({ "Sales Rep": "Ada", "SUM Revenue": 12900 });
+		expect(byRep.chartJs).toBeDefined();
+
+		const highRisk = querySheet(
+			sampleDataset(),
+			"Show high renewal risk LATAM accounts with revenue over 2000",
+		);
+		expect(highRisk.ok).toBe(true);
+		if (!highRisk.ok) return;
+		expect(highRisk.queryFrame.operation).toBe("list");
+		expect(highRisk.scalar).toBeUndefined();
+		expect(highRisk.queryFrame.filters).toEqual(
+			expect.arrayContaining([
+				{ kind: "equals", column: "region", value: "LATAM" },
+				{ kind: "equals", column: "renewal_risk", value: "high" },
+				{ kind: "number", column: "revenue", operator: "gt", value: 2000 },
+			]),
+		);
+		expect(highRisk.rows[0]).toMatchObject({
+			Customer: "Futura",
+			Revenue: 3000,
+		});
+
+		const inventory = SHEET_USE_CASES.find(
+			(candidate) => candidate.id === "inventory",
+		);
+		expect(inventory).toBeDefined();
+		if (!inventory) return;
+		const byCategory = querySheet(
+			buildSheetDataset(parseCsv(inventory.csv)),
+			"Compare average unit cost by product category",
+		);
+		expect(byCategory.ok).toBe(true);
+		if (!byCategory.ok) return;
+		expect(byCategory.queryFrame.groupByColumn).toBe("category");
+		expect(byCategory.rows[0]).toEqual({
+			Category: "Security",
+			"AVG Unit Cost": 165,
+		});
+	});
+
 	it("answers top-N grouped questions", () => {
 		const result = querySheet(sampleDataset(), "top 5 customers by sales");
 		expect(result.ok).toBe(true);
@@ -256,88 +310,151 @@ describe("querySheet", () => {
 			"revenue_ops::Compare total revenue by region for the pipeline review": {
 				first: { Region: "LATAM", "SUM Revenue": 13700 },
 			},
+			"revenue_ops::Compare unpaid overdue revenue by region": {
+				first: { Region: "NA", "SUM Revenue": 5900 },
+				length: 2,
+			},
+			"revenue_ops::Compare average order value by segment for active accounts":
+				{
+					first: {
+						Segment: "Enterprise",
+						"AVG Order Value": 3216.6666666666665,
+					},
+					length: 3,
+				},
 			"revenue_ops::What are the top 5 customers by revenue?": {
 				first: { Customer: "Northstar Energy", "SUM Revenue": 5200 },
 				length: 5,
 			},
-			"revenue_ops::What was the average order value in May?": {
-				scalar: 1800,
-			},
-			"revenue_ops::How many overdue invoices have already been paid?": {
-				scalar: 6,
-			},
-			"revenue_ops::Show me active LATAM accounts that need follow-up": {
-				first: { Customer: "Acme 4744" },
-				length: 6,
-			},
-			"support_queue::How many high priority tickets are still open?": {
-				scalar: 5,
-			},
-			"support_queue::Compare average response time hours by team": {
-				first: {
-					Team: "Billing",
-					"AVG Response Time Hours": 6.5,
-				},
-			},
-			"support_queue::Show me open Platform tickets for triage": {
-				first: { "Ticket ID": "T-1003" },
-				length: 3,
-			},
-			"support_queue::What was the average satisfaction score for tickets created in May?":
+			"revenue_ops::Show high renewal risk LATAM accounts with revenue over 2000":
 				{
-					scalar: 4,
+					first: { Customer: "Futura", Revenue: 3000 },
+					length: 2,
 				},
-			"inventory::Compare total units on hand by warehouse": {
-				first: { Warehouse: "East", "SUM Units On Hand": 273 },
+			"revenue_ops::How many active annual accounts are high renewal risk?": {
+				scalar: 3,
 			},
-			"inventory::Show low stock products that need replenishment": {
-				first: { Product: "Cloud Backup Starter" },
-				length: 5,
+			"support_queue::Which team has the most open high priority tickets?": {
+				first: { Team: "Billing", Count: 3 },
+				length: 1,
 			},
-			"inventory::Compare average unit cost by category": {
-				first: { Category: "Security", "AVG Unit Cost": 165 },
-			},
-			"inventory::How many products are currently backordered?": {
-				scalar: 2,
-			},
-			"marketing_campaigns::Compare total spend by channel": {
-				first: { Channel: "Search", "SUM Spend": 5250 },
-				length: 4,
-			},
-			"marketing_campaigns::What are the top 5 campaigns by clicks?": {
-				first: { Campaign: "Competitor Terms", "SUM Clicks": 520 },
-				length: 5,
-			},
-			"marketing_campaigns::Show active campaigns for the weekly review": {
-				first: { Campaign: "Launch A" },
-				length: 11,
-			},
-			"marketing_campaigns::Compare average leads by channel": {
-				first: { Channel: "Social", "AVG Leads": 44 },
-				length: 4,
-			},
-			"marketing_campaigns::How many campaigns are paused right now?": {
-				scalar: 4,
-			},
-			"applicant_kyc::How many applicants have been approved?": {
+			"support_queue::Compare average response time hours by team for breached SLA tickets":
+				{
+					first: {
+						Team: "Platform",
+						"AVG Response Time Hours": 10,
+					},
+					length: 3,
+				},
+			"support_queue::Show open high priority tickets with response time over 8":
+				{
+					first: { "Ticket ID": "T-1003", Priority: "high" },
+					length: 3,
+				},
+			"support_queue::Compare average satisfaction score by product area for closed tickets":
+				{
+					first: {
+						"Product Area": "API",
+						"AVG Satisfaction Score": 5,
+					},
+					length: 6,
+				},
+			"support_queue::How many open tickets breached first reply SLA?": {
 				scalar: 7,
 			},
-			"applicant_kyc::Show applicants whose country is not Nigeria": {
-				first: { Applicant: "Grace Hopper" },
-				length: 10,
+			"inventory::Compare low stock units on hand by warehouse": {
+				first: { Warehouse: "East", "SUM Units On Hand": 30 },
+				length: 3,
 			},
-			"applicant_kyc::Show applicants with wallet balance between 1000 and 2000":
+			"inventory::Compare total units on hand by category for East warehouse": {
+				first: {
+					Category: "Backup",
+					"SUM Units On Hand": 178,
+				},
+				length: 3,
+			},
+			"inventory::Show low stock products with units on hand below 15": {
+				first: { Product: "Security Shield", "Units On Hand": 12 },
+				length: 4,
+			},
+			"inventory::Which supplier has the highest average unit cost?": {
+				first: { Supplier: "IronGate", "AVG Unit Cost": 165 },
+				length: 1,
+			},
+			"inventory::How many security products are backordered?": { scalar: 1 },
+			"marketing_campaigns::Compare active campaign spend by channel": {
+				first: { Channel: "Search", "SUM Spend": 4750 },
+				length: 4,
+			},
+			"marketing_campaigns::Compare average leads by region for active campaigns":
 				{
-					first: { Applicant: "Ada Lovelace", "Wallet Balance": 1200 },
+					first: { Region: "APAC", "AVG Leads": 48.5 },
+					length: 4,
+				},
+			"marketing_campaigns::Show active campaigns with conversions over 10": {
+				first: { Campaign: "Launch A", Conversions: 11 },
+				length: 6,
+			},
+			"marketing_campaigns::Compare total conversions by owner": {
+				first: { Owner: "Max", "SUM Conversions": 44 },
+				length: 4,
+			},
+			"marketing_campaigns::How many paused Search campaigns are there?": {
+				scalar: 1,
+			},
+			"applicant_kyc::Compare total wallet balance by country for approved applicants":
+				{
+					first: { Country: "United States", "SUM Wallet Balance": 4580 },
 					length: 5,
 				},
-			"applicant_kyc::How many unique countries are represented?": {
-				scalar: 8,
+			"applicant_kyc::How many high risk applicants by reviewer?": {
+				first: { Reviewer: "Mina", Count: 3 },
+				length: 1,
+			},
+			"applicant_kyc::Show review applicants with wallet balance over 1500": {
+				first: { Applicant: "Hedy Lamarr", "Wallet Balance": 1750 },
+				length: 2,
+			},
+			"applicant_kyc::How many approved applicants have passport?": {
+				scalar: 5,
+			},
+			"applicant_kyc::Show partner applicants not from Nigeria": {
+				first: { Applicant: "Alan Turing" },
+				length: 4,
 			},
 			"applicant_kyc::What is the maximum wallet balance in the applicant pool?":
 				{
 					scalar: 4100,
 				},
+			"engineering_bom::Compare total cost by subsystem for high criticality components":
+				{
+					first: { Subsystem: "EHD Subsystem", "SUM Cost": 22000 },
+					length: 4,
+				},
+			"engineering_bom::Compare average lead time days by sourcing option": {
+				first: { Sourcing: "Machine shop", "AVG Lead Time Days": 18 },
+				length: 9,
+			},
+			"engineering_bom::Show high criticality components with lead time days over 10":
+				{
+					first: {
+						Item: "1",
+						Component: "HV Power Module",
+						"Lead Time Days": 21,
+					},
+					length: 1,
+				},
+			"engineering_bom::Compare total quantity by subsystem for hardware store components":
+				{
+					first: {
+						Subsystem: "Assembly / Maintenance",
+						"SUM Quantity": 24,
+					},
+					length: 3,
+				},
+			"engineering_bom::How many online components are high criticality?": {
+				scalar: 3,
+			},
 			"engineering_bom::Which component is needed in the highest quantity?": {
 				first: {
 					Component: "M3 Stainless Screws",
@@ -346,35 +463,7 @@ describe("querySheet", () => {
 				},
 				length: 1,
 			},
-			"engineering_bom::What are the top 5 components by quantity?": {
-				first: {
-					Component: "M3 Stainless Screws",
-					"SUM Quantity": 24,
-				},
-				length: 5,
-			},
-			"engineering_bom::List the subsystems represented in this BOM": {
-				first: { Subsystem: "EHD Subsystem" },
-				length: 7,
-			},
-			"engineering_bom::Show components not in EHD Subsystem": {
-				first: {
-					Item: "5",
-					Subsystem: "Active Cooling Core",
-					Component: "Peltier Thermoelectric Module",
-				},
-				length: 15,
-			},
-			"engineering_bom::Show components with quantity between 2 and 5 for batch planning":
-				{
-					first: {
-						Item: "4",
-						Component: "High-Voltage Silicone Wire",
-						Quantity: 2,
-					},
-					length: 6,
-				},
-			"clinic_visits::Compare total visit cost by department": {
+			"clinic_visits::Compare completed visit cost by department": {
 				first: { Department: "Orthopedics", "SUM Visit Cost": 930 },
 				length: 4,
 			},
@@ -385,14 +474,23 @@ describe("querySheet", () => {
 				},
 				length: 4,
 			},
-			"clinic_visits::Show no-show patients for follow-up": {
-				first: { Patient: "Ibrahim Musa" },
+			"clinic_visits::Show completed visits with wait time minutes over 40": {
+				first: { "Wait Time Minutes": 45, "Visit Date": "2024-05-08" },
+				length: 4,
+			},
+			"clinic_visits::Which provider has the highest average wait time minutes?":
+				{
+					first: { Provider: "Dr Stone", "AVG Wait Time Minutes": 54 },
+					length: 1,
+				},
+			"clinic_visits::Compare no-show patients by department": {
+				first: { Department: "Pediatrics", Count: 1 },
 				length: 3,
 			},
-			"clinic_visits::How many appointments were completed?": { scalar: 10 },
-			"clinic_visits::What was the average wait time minutes for May visits?": {
-				scalar: 23.09090909090909,
-			},
+			"clinic_visits::How many private insurance appointments were completed?":
+				{
+					scalar: 7,
+				},
 		};
 
 		for (const useCase of SHEET_USE_CASES) {
@@ -401,6 +499,10 @@ describe("querySheet", () => {
 				const result = querySheet(dataset, question);
 				expect(result.ok, `${useCase.id}: ${question}`).toBe(true);
 				if (!result.ok) continue;
+				if (result.queryFrame.resultShape === "categorical_chart") {
+					expect(result.chartJs, `${useCase.id}: ${question}`).toBeDefined();
+					expect(result.chartJs?.data.labels.length).toBe(result.rows.length);
+				}
 				const expected = expectations[`${useCase.id}::${question}`];
 				expect(expected, `${useCase.id}: ${question}`).toBeDefined();
 				if (!expected) continue;

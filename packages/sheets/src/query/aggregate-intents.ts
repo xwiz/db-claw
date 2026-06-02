@@ -19,11 +19,7 @@ export function aggregateIntent(
 	) {
 		return "avg";
 	}
-	if (
-		hasPhrase(ctx.normalized, "total") ||
-		hasPhrase(ctx.normalized, "sum") ||
-		hasPhrase(ctx.normalized, "revenue")
-	) {
+	if (hasPhrase(ctx.normalized, "total") || hasPhrase(ctx.normalized, "sum")) {
 		return "sum";
 	}
 	if (
