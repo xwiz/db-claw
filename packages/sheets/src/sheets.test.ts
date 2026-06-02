@@ -53,6 +53,13 @@ const PEOPLE_CSV = `ID,Applicant,Email,Has Passport,Wallet Balance,Created At
 1002,Katherine Johnson,,Yes,3000,2025-10-17
 `;
 
+const COUNTRY_CSV = `Applicant,Country,Wallet Balance
+Ada Lovelace,Nigeria,1200
+Grace Hopper,Ghana,900
+Katherine Johnson,Nigeria,3000
+Alan Turing,,1800
+`;
+
 describe("parseCsv", () => {
 	it("handles quoted commas and escaped quotes", () => {
 		const parsed = parseCsv('Name,Note\n"Acme, Inc","said ""yes"""\n');
@@ -430,6 +437,76 @@ describe("querySheet", () => {
 			Applicant: "Katherine Johnson",
 			"Wallet Balance": 3000,
 		});
+	});
+
+	it("counts and lists distinct non-empty column values", () => {
+		const dataset = buildSheetDataset(parseCsv(COUNTRY_CSV));
+		const count = querySheet(dataset, "how many unique countries are there?");
+		expect(count.ok).toBe(true);
+		if (!count.ok) return;
+		expect(count.queryFrame.aggregate).toBe("distinctCount");
+		expect(count.scalar).toBe(2);
+
+		const list = querySheet(dataset, "list countries");
+		expect(list.ok).toBe(true);
+		if (!list.ok) return;
+		expect(list.queryFrame.routeReason).toBe("distinct_list");
+		expect(list.rows).toEqual([{ Country: "Nigeria" }, { Country: "Ghana" }]);
+	});
+
+	it("supports negative equality filters and numeric ranges", () => {
+		const dataset = buildSheetDataset(parseCsv(COUNTRY_CSV));
+		const notNigeria = querySheet(dataset, "show applicants not from Nigeria");
+		expect(notNigeria.ok).toBe(true);
+		if (!notNigeria.ok) return;
+		expect(notNigeria.queryFrame.filters).toContainEqual({
+			kind: "notEquals",
+			column: "country",
+			value: "Nigeria",
+		});
+		expect(notNigeria.rows).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ Applicant: "Grace Hopper" }),
+			]),
+		);
+		expect(notNigeria.rows).not.toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ Applicant: "Ada Lovelace" }),
+			]),
+		);
+
+		const between = querySheet(
+			dataset,
+			"show applicants with wallet balance between 1000 and 2000",
+		);
+		expect(between.ok).toBe(true);
+		if (!between.ok) return;
+		expect(between.queryFrame.filters).toEqual(
+			expect.arrayContaining([
+				{
+					kind: "number",
+					column: "wallet_balance",
+					operator: "gte",
+					value: 1000,
+				},
+				{
+					kind: "number",
+					column: "wallet_balance",
+					operator: "lte",
+					value: 2000,
+				},
+			]),
+		);
+		expect(between.rows).toHaveLength(2);
+	});
+
+	it("keeps scalar max/min questions scalar when no target column is named", () => {
+		const dataset = buildSheetDataset(parseCsv(COUNTRY_CSV));
+		const result = querySheet(dataset, "what is the maximum wallet balance?");
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.queryFrame.resultShape).toBe("scalar_metric");
+		expect(result.scalar).toBe(3000);
 	});
 
 	it("answers BOM quantity superlatives with mixed quantity units", () => {

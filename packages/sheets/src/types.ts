@@ -47,6 +47,11 @@ export type SheetFilter =
 			value: string | number | boolean;
 	  }
 	| {
+			kind: "notEquals";
+			column: string;
+			value: string | number | boolean;
+	  }
+	| {
 			kind: "number";
 			column: string;
 			operator: NumberOperator;
@@ -70,7 +75,13 @@ export type SheetFilter =
 			present: boolean;
 	  };
 
-export type AggregateFunction = "count" | "sum" | "avg" | "min" | "max";
+export type AggregateFunction =
+	| "count"
+	| "distinctCount"
+	| "sum"
+	| "avg"
+	| "min"
+	| "max";
 
 export type ResultShape =
 	| "scalar_metric"

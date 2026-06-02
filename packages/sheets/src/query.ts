@@ -900,6 +900,7 @@ function findPresenceFilters(
 		/\b(?:missing|blank|empty|null)\s+(.+?)\b/,
 	];
 	const presentPatterns = [
+		/\b(?:where\s+)?(.+?)\s+(?:is|are)\s+not\s+(?:missing|blank|empty|null)\b/,
 		/\b(?:where\s+)?(.+?)\s+(?:is|are)\s+(?:present|filled|set|available)\b/,
 		/\b(?:with|has|have)\s+(.+?)\b/,
 	];
@@ -924,6 +925,30 @@ function findPresenceFilters(
 	return filters;
 }
 
+function comparedNumberValues(ctx: RouteContext): number[] {
+	const values: number[] = [];
+	const comparison = parseNumberComparison(ctx);
+	if (comparison) values.push(comparison.value);
+	const range = parseNumberRange(ctx);
+	if (range) values.push(range.min, range.max);
+	return values;
+}
+
+function isNegativeValueMention(
+	normalizedQuestion: string,
+	normalizedValue: string,
+): boolean {
+	const escaped = normalizedValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const patterns = [
+		new RegExp(
+			`\\bnot\\s+(?:in\\s+|from\\s+|equal\\s+to\\s+|equals\\s+)?${escaped}\\b`,
+		),
+		new RegExp(`\\b(?:except|excluding|exclude)\\s+${escaped}\\b`),
+		new RegExp(`\\b(?:not|without)\\s+.*\\b${escaped}\\b`),
+	];
+	return patterns.some((pattern) => pattern.test(normalizedQuestion));
+}
+
 function findEqualityFilters(
 	dataset: SheetDataset,
 	ctx: RouteContext,
@@ -931,7 +956,7 @@ function findEqualityFilters(
 	const filters: SheetFilter[] = [];
 	const filteredColumns = new Set<string>();
 	const requestedLimit = topLimit(ctx);
-	const comparedNumber = parseNumberComparison(ctx)?.value;
+	const comparedNumbers = comparedNumberValues(ctx);
 	for (const column of dataset.columns) {
 		const filterable =
 			column.roles.includes("dimension") ||
@@ -957,15 +982,20 @@ function findEqualityFilters(
 				continue;
 			}
 			if (
-				comparedNumber !== undefined &&
 				/^-?\d+(?:\.\d+)?$/.test(normalized) &&
-				Number(normalized) === comparedNumber
+				comparedNumbers.some((value) => Number(normalized) === value)
 			) {
 				continue;
 			}
 			if (!hasPhrase(ctx.normalized, normalized)) continue;
 			if (filteredColumns.has(column.id)) continue;
-			filters.push({ kind: "equals", column: column.id, value: raw });
+			filters.push({
+				kind: isNegativeValueMention(ctx.normalized, normalized)
+					? "notEquals"
+					: "equals",
+				column: column.id,
+				value: raw,
+			});
 			filteredColumns.add(column.id);
 		}
 	}
@@ -996,20 +1026,53 @@ function parseNumberComparison(ctx: RouteContext):
 	return { operator: "eq", value };
 }
 
-function findNumberFilter(
+function parseNumberRange(
+	ctx: RouteContext,
+): { min: number; max: number } | undefined {
+	const match = ctx.normalized.match(
+		/\bbetween\s+(-?\d+(?:\.\d+)?)\s+(?:and|to)\s+(-?\d+(?:\.\d+)?)\b/,
+	);
+	if (!match?.[1] || !match[2]) return undefined;
+	const left = Number(match[1]);
+	const right = Number(match[2]);
+	if (!Number.isFinite(left) || !Number.isFinite(right)) return undefined;
+	return { min: Math.min(left, right), max: Math.max(left, right) };
+}
+
+function findNumberFilters(
 	dataset: SheetDataset,
 	ctx: RouteContext,
-): SheetFilter | undefined {
+): SheetFilter[] {
+	const filters: SheetFilter[] = [];
+	const range = parseNumberRange(ctx);
+	if (range) {
+		const column = findMeasureColumn(dataset, ctx);
+		if (!column) return filters;
+		filters.push({
+			kind: "number",
+			column: column.id,
+			operator: "gte",
+			value: range.min,
+		});
+		filters.push({
+			kind: "number",
+			column: column.id,
+			operator: "lte",
+			value: range.max,
+		});
+		return filters;
+	}
 	const comparison = parseNumberComparison(ctx);
-	if (!comparison) return undefined;
+	if (!comparison) return filters;
 	const column = findMeasureColumn(dataset, ctx);
-	if (!column) return undefined;
-	return {
+	if (!column) return filters;
+	filters.push({
 		kind: "number",
 		column: column.id,
 		operator: comparison.operator,
 		value: comparison.value,
-	};
+	});
+	return filters;
 }
 
 function dedupeFilters(filters: SheetFilter[]): SheetFilter[] {
@@ -1081,6 +1144,45 @@ function withProjectionColumns(
 		out.push(column);
 	}
 	return out.slice(0, limit);
+}
+
+function wantsDistinct(ctx: RouteContext): boolean {
+	return (
+		hasPhrase(ctx.normalized, "unique") ||
+		hasPhrase(ctx.normalized, "distinct") ||
+		hasPhrase(ctx.normalized, "different")
+	);
+}
+
+function listDistinctIntent(ctx: RouteContext): boolean {
+	return (
+		/^\s*(?:list|show)\b/.test(ctx.normalized) &&
+		!wantsRank(ctx) &&
+		!wantsFirst(ctx) &&
+		!wantsLast(ctx) &&
+		!wantsLatest(ctx) &&
+		!wantsOldest(ctx)
+	);
+}
+
+function findColumnMention(
+	dataset: SheetDataset,
+	ctx: RouteContext,
+): SheetColumn | undefined {
+	let best: { column: SheetColumn; score: number } | undefined;
+	for (const column of dataset.columns) {
+		if (isSensitiveColumn(column) || column.nonEmptyCount === 0) continue;
+		const score = scoreColumn(ctx, column);
+		if (score === 0) continue;
+		const adjusted =
+			score +
+			(column.roles.includes("dimension") || column.roles.includes("display")
+				? 8
+				: 0) -
+			(isIdentifierishColumn(column) ? 12 : 0);
+		if (!best || adjusted > best.score) best = { column, score: adjusted };
+	}
+	return best?.column;
 }
 
 function confidenceLevel(score: number): QueryConfidence["level"] {
@@ -1171,7 +1273,7 @@ function buildFrame(
 			...findPresenceFilters(dataset, ctx),
 			findDateRangeFilter(dataset, ctx),
 			findMonthFilter(dataset, ctx),
-			findNumberFilter(dataset, ctx),
+			...findNumberFilters(dataset, ctx),
 		].filter((filter): filter is SheetFilter => filter !== undefined),
 	);
 	const rankIntent = wantsRank(ctx);
@@ -1183,11 +1285,29 @@ function buildFrame(
 	const order = listOrder(dataset, ctx, orderMeasure);
 	const explicitAggregate = aggregateIntent(ctx);
 	const rankedList = shouldUseRankedList(ctx, rankTargetGroup, orderMeasure);
+	const distinctColumn =
+		wantsDistinct(ctx) || listDistinctIntent(ctx)
+			? findColumnMention(dataset, ctx)
+			: undefined;
+
+	if (wantsDistinct(ctx) && distinctColumn) {
+		return withConfidence({
+			question,
+			operation: "aggregate",
+			aggregate: "distinctCount",
+			measureColumn: distinctColumn.id,
+			projectionColumns: [],
+			filters,
+			resultShape: "scalar_metric",
+			routeReason: "aggregate_scalar",
+		});
+	}
 
 	if (
 		isListIntent(ctx) &&
 		!explicitAggregate &&
 		!wantsDistribution(ctx) &&
+		!listDistinctIntent(ctx) &&
 		!explicitGroupBy &&
 		(!rankTargetGroup || rankedList)
 	) {
@@ -1200,7 +1320,8 @@ function buildFrame(
 				columnId !== order?.column &&
 				!filterColumns.has(columnId) &&
 				column !== undefined &&
-				!isLongTextColumn(column)
+				!isLongTextColumn(column) &&
+				isUsableDisplayColumn(dataset, column, { allowIdentifiers: true })
 			);
 		});
 		const baseProjection = hasContextColumn
@@ -1225,13 +1346,32 @@ function buildFrame(
 		return withConfidence(frame);
 	}
 
+	if (
+		listDistinctIntent(ctx) &&
+		distinctColumn &&
+		filters.length === 0 &&
+		!order
+	) {
+		return withConfidence({
+			question,
+			operation: "list",
+			projectionColumns: [distinctColumn.id],
+			filters,
+			resultShape: "tabular",
+			routeReason: "distinct_list",
+		});
+	}
+
 	let aggregate =
 		explicitAggregate ?? (wantsDistribution(ctx) ? "count" : undefined);
-	let measure = aggregate && aggregate !== "count" ? orderMeasure : undefined;
+	let measure =
+		aggregate && aggregate !== "count" && aggregate !== "distinctCount"
+			? orderMeasure
+			: undefined;
 	let groupBy =
 		explicitGroupBy ??
 		rankTargetGroup ??
-		(aggregate && rankIntent
+		(aggregate && wantsDistribution(ctx)
 			? findImplicitRankGroupColumn(dataset, ctx)
 			: undefined);
 
@@ -1248,7 +1388,12 @@ function buildFrame(
 		}
 	}
 
-	if (aggregate && aggregate !== "count" && !measure) {
+	if (
+		aggregate &&
+		aggregate !== "count" &&
+		aggregate !== "distinctCount" &&
+		!measure
+	) {
 		return withConfidence({
 			question,
 			operation: "aggregate",
@@ -1314,6 +1459,15 @@ function matchesFilter(row: SheetRow, filter: SheetFilter): boolean {
 		}
 		return cell.normalized === normalizeText(String(filter.value));
 	}
+	if (filter.kind === "notEquals") {
+		if (
+			(typeof filter.value === "boolean" || typeof filter.value === "number") &&
+			cell.value === filter.value
+		) {
+			return false;
+		}
+		return cell.normalized !== normalizeText(String(filter.value));
+	}
 	if (filter.kind === "number") {
 		if (typeof cell.value !== "number") return false;
 		if (filter.operator === "gt") return cell.value > filter.value;
@@ -1363,6 +1517,16 @@ function aggregateValues(
 	measureColumn: string | undefined,
 ): number {
 	if (aggregate === "count") return rows.length;
+	if (aggregate === "distinctCount") {
+		if (!measureColumn) return 0;
+		const seen = new Set<string>();
+		for (const row of rows) {
+			const cell = row.cells[measureColumn];
+			if (!cell || cell.normalized.length === 0) continue;
+			seen.add(cell.normalized);
+		}
+		return seen.size;
+	}
 	const values = rows
 		.map((row) =>
 			numberValue(measureColumn ? row.cells[measureColumn] : undefined),
@@ -1391,6 +1555,12 @@ function labelFor(dataset: SheetDataset, columnId: string): string {
 
 function aggregateLabel(frame: SheetQueryFrame, dataset: SheetDataset): string {
 	if (frame.aggregate === "count") return "Count";
+	if (frame.aggregate === "distinctCount") {
+		const measure = frame.measureColumn
+			? labelFor(dataset, frame.measureColumn)
+			: "Value";
+		return `Distinct ${measure}`;
+	}
 	const measure = frame.measureColumn
 		? labelFor(dataset, frame.measureColumn)
 		: "Value";
@@ -1512,14 +1682,30 @@ function listRows(
 			return String(left).localeCompare(String(right)) * direction;
 		});
 	}
-	const limited = ordered.slice(0, frame.limit ?? 50);
-	return limited.map((row) => {
+	const sourceRows =
+		frame.routeReason === "distinct_list"
+			? ordered
+			: ordered.slice(0, frame.limit ?? 50);
+	const outRows = sourceRows.map((row) => {
 		const out: Record<string, string | number | boolean | null> = {};
 		for (const columnId of projection) {
 			out[labelFor(dataset, columnId)] = formatCell(row.cells[columnId]);
 		}
 		return out;
 	});
+	if (frame.routeReason !== "distinct_list") return outRows;
+	const seen = new Set<string>();
+	const distinctRows: Record<string, string | number | boolean | null>[] = [];
+	for (const row of outRows) {
+		if (Object.values(row).every((value) => value === null || value === "")) {
+			continue;
+		}
+		const key = JSON.stringify(row);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		distinctRows.push(row);
+	}
+	return distinctRows.slice(0, frame.limit ?? 50);
 }
 
 export function querySheet(
