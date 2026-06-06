@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create or update, for example v0.1.0-alpha.4"
+        description: "Release tag to create or update, for example v0.1.0-alpha.5"
         required: true
-        default: "v0.1.0-alpha.4"
+        default: "v0.1.0-alpha.5"
       draft:
         description: "Create the release as a draft when it does not already exist"
         required: true
@@ -371,7 +371,7 @@ jobs:
             fi
             gh release create "${args[@]}"
           fi
-          mapfile -t assets < <(find dist -type f | sort)
+          mapfile -t assets < <(find dist -maxdepth 1 -type f | sort)
           gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
 
   publish-npm:

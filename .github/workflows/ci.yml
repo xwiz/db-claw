@@ -264,7 +264,7 @@ jobs:
       - name: Rehearse alpha npm release packages
         run: >
           python scripts/rehearse_release_packages.py
-          --version 0.1.0-alpha.4
+          --version 0.1.0-alpha.5
           --skip-run-checks
           --pack-destination target/release-rehearsal/npm-alpha
           --out-json target/release-rehearsal/npm-alpha-report.json

@@ -48,7 +48,7 @@ semsql doctor --graph app.semsql
 Resolve a rejected packet from a reviewed typed proposal:
 
 ```bash
-uv run python -m semsql_eval llm-resolution-resolve-packet \
+uv run --package semsql-eval python -m semsql_eval llm-resolution-resolve-packet \
   --packet-json rejected.packet.json \
   --proposal-json reviewed.proposal.json \
   --render-out render.json \
@@ -59,7 +59,7 @@ Optional provider path. Supported providers: `openai`, `groq`, `deepseek`, and
 `openai-compatible`. Missing config makes `0` provider calls and fails closed.
 
 ```bash
-uv run python -m semsql_eval llm-resolution-fallback-query \
+uv run --package semsql-eval python -m semsql_eval llm-resolution-fallback-query \
   --graph app.semsql \
   --question "which segment has the highest average revenue?" \
   --provider openai \
