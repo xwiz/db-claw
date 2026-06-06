@@ -32,11 +32,11 @@ from typing import Literal
 from .exec_acc import exec_eq
 
 __all__ = [
+    "EvalSummary",
     "Example",
     "SpiderSuite",
-    "EvalSummary",
-    "evaluate",
     "SuiteName",
+    "evaluate",
 ]
 
 SuiteName = Literal["spider", "spider2", "bird"]
@@ -81,7 +81,7 @@ class SpiderSuite:
         do *not* resolve those paths here. Manifests that omit an
         inline gold field for an entry surface an explicit error so
         the operator routes the run through a Spider 2.0-lite-aware
-        loader (out of scope for the v0.5 cut).
+        loader outside this Spider/BIRD eval path.
         """
         raw = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(raw, list):
@@ -189,7 +189,7 @@ def evaluate(
         summary.total += 1
         try:
             pred_sql = predict(ex)
-        except BaseException as e:  # noqa: BLE001 — captured intentionally
+        except BaseException as e:
             summary.errored += 1
             if on_error is not None:
                 on_error(ex, e)

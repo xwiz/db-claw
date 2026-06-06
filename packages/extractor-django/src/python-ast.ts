@@ -20,13 +20,16 @@
  * to grammar updates that reorder children.
  */
 
+import { createRequire } from "node:module";
 import type { default as ParserType } from "tree-sitter";
+
+const requireFromModule = createRequire(import.meta.url);
 
 let lazyParser: ParserType | null = null;
 let lazyParserError: unknown = null;
 
 interface Lazy {
-    parser: ParserType;
+	parser: ParserType;
 }
 
 /**
@@ -35,27 +38,23 @@ interface Lazy {
  * current CPU. Callers should record a "skipped" fragment and move on.
  */
 export function getParser(): Lazy | null {
-    if (lazyParser !== null) {
-        return { parser: lazyParser };
-    }
-    if (lazyParserError !== null) {
-        return null;
-    }
-    try {
-        const { createRequire } = require("node:module") as {
-            createRequire: (filename: string) => (id: string) => unknown;
-        };
-        const r = createRequire(__filename);
-        const Parser = r("tree-sitter") as { new (): ParserType };
-        const pyModule = r("tree-sitter-python") as unknown;
-        const parser = new Parser();
-        parser.setLanguage(pyModule as Parameters<ParserType["setLanguage"]>[0]);
-        lazyParser = parser;
-        return { parser };
-    } catch (e) {
-        lazyParserError = e;
-        return null;
-    }
+	if (lazyParser !== null) {
+		return { parser: lazyParser };
+	}
+	if (lazyParserError !== null) {
+		return null;
+	}
+	try {
+		const Parser = requireFromModule("tree-sitter") as { new (): ParserType };
+		const pyModule = requireFromModule("tree-sitter-python") as unknown;
+		const parser = new Parser();
+		parser.setLanguage(pyModule as Parameters<ParserType["setLanguage"]>[0]);
+		lazyParser = parser;
+		return { parser };
+	} catch (e) {
+		lazyParserError = e;
+		return null;
+	}
 }
 
 export type SyntaxNode = ParserType.SyntaxNode;
@@ -67,13 +66,16 @@ export type SyntaxNode = ParserType.SyntaxNode;
  * the caller has already extracted everything it needs from a class
  * body, for example).
  */
-export function walk(node: SyntaxNode, fn: (n: SyntaxNode) => boolean | void): void {
-    const stop = fn(node);
-    if (stop === true) return;
-    for (let i = 0; i < node.namedChildCount; i++) {
-        const c = node.namedChild(i);
-        if (c) walk(c, fn);
-    }
+export function walk(
+	node: SyntaxNode,
+	fn: (n: SyntaxNode) => boolean | void,
+): void {
+	const stop = fn(node);
+	if (stop === true) return;
+	for (let i = 0; i < node.namedChildCount; i++) {
+		const c = node.namedChild(i);
+		if (c) walk(c, fn);
+	}
 }
 
 /**
@@ -87,55 +89,55 @@ export function walk(node: SyntaxNode, fn: (n: SyntaxNode) => boolean | void): v
  * and bail on interpolation.
  */
 export function parsePythonStringLiteral(node: SyntaxNode): string | null {
-    if (node.type !== "string") return null;
-    let out = "";
-    let isFString = false;
-    for (let i = 0; i < node.namedChildCount; i++) {
-        const c = node.namedChild(i);
-        if (!c) continue;
-        if (c.type === "string_start") {
-            // Quote prefix may include `f`, `F`, `rb`, etc. — reject
-            // anything carrying `f` so we don't mis-emit interpolated
-            // labels as static vocabulary.
-            const prefix = c.text.replace(/['"`].*$/s, "");
-            if (/f/i.test(prefix)) isFString = true;
-            continue;
-        }
-        if (c.type === "string_end") continue;
-        if (c.type === "interpolation") return null;
-        if (c.type === "string_content") {
-            out += c.text;
-            continue;
-        }
-        if (c.type === "escape_sequence") {
-            out += decodeEscape(c.text);
-            continue;
-        }
-    }
-    if (isFString) return null;
-    return out;
+	if (node.type !== "string") return null;
+	let out = "";
+	let isFString = false;
+	for (let i = 0; i < node.namedChildCount; i++) {
+		const c = node.namedChild(i);
+		if (!c) continue;
+		if (c.type === "string_start") {
+			// Quote prefix may include `f`, `F`, `rb`, etc. — reject
+			// anything carrying `f` so we don't mis-emit interpolated
+			// labels as static vocabulary.
+			const prefix = c.text.replace(/['"`].*$/s, "");
+			if (/f/i.test(prefix)) isFString = true;
+			continue;
+		}
+		if (c.type === "string_end") continue;
+		if (c.type === "interpolation") return null;
+		if (c.type === "string_content") {
+			out += c.text;
+			continue;
+		}
+		if (c.type === "escape_sequence") {
+			out += decodeEscape(c.text);
+			continue;
+		}
+	}
+	if (isFString) return null;
+	return out;
 }
 
 function decodeEscape(raw: string): string {
-    if (raw.length < 2 || raw[0] !== "\\") return raw;
-    const ch = raw[1];
-    switch (ch) {
-        case "n":
-            return "\n";
-        case "r":
-            return "\r";
-        case "t":
-            return "\t";
-        case "\\":
-            return "\\";
-        case "'":
-            return "'";
-        case '"':
-            return '"';
-        default:
-            // Hex / unicode escape forms are rare in label literals;
-            // surface them verbatim minus the leading backslash so the
-            // sanitiser can reject them downstream.
-            return ch ?? "";
-    }
+	if (raw.length < 2 || raw[0] !== "\\") return raw;
+	const ch = raw[1];
+	switch (ch) {
+		case "n":
+			return "\n";
+		case "r":
+			return "\r";
+		case "t":
+			return "\t";
+		case "\\":
+			return "\\";
+		case "'":
+			return "'";
+		case '"':
+			return '"';
+		default:
+			// Hex / unicode escape forms are rare in label literals;
+			// surface them verbatim minus the leading backslash so the
+			// sanitiser can reject them downstream.
+			return ch ?? "";
+	}
 }

@@ -33,6 +33,10 @@ eval = [
     "sqlglot>=25.0",
     "pandas>=2.2",
 ]
+db = [
+    "pymysql>=1.1",
+    "psycopg[binary]>=3.2",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -55,13 +59,38 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N", "S", "RUF"]
-ignore = ["S101"]
+ignore = [
+    "B007",
+    "E501",
+    "E741",
+    "F402",
+    "N803",
+    "N806",
+    "N812",
+    "N818",
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "RUF005",
+    "S101",
+    "S311",
+    "S324",
+    "S603",
+    "S608",
+    "UP028",
+]
 
 [tool.mypy]
 python_version = "3.10"
 strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+exclude = """(?x)(
+    (^|/)conftest\\.py$
+    | ^python/semsql_train/
+    | ^python/semsql_rewriter/
+    | ^python/.*/tests/
+)"""
 
 [tool.pytest.ini_options]
 testpaths = ["python"]

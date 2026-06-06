@@ -14,7 +14,7 @@ Suites:
   branches, lateral joins, recursive CTEs, comment-based bypass,
   multi-statement smuggling, writable-CTE smuggling).
 
-The bypass suite is the v1.0 gate — any failure ships nothing.
+The bypass suite is a hard safety gate: any failure ships nothing.
 """
 
 __version__ = "0.1.0.dev0"

@@ -59,6 +59,8 @@ pub enum SelectItem {
     Field(Field),
     /// An aggregate over a field.
     Aggregate(Aggregate, Field),
+    /// An aggregate over a field with a SELECT alias.
+    AliasedAggregate(Aggregate, Field, CanonicalName),
     /// A raw SQL expression for arithmetic, CAST, or other complex constructs
     /// that the tiny-model cascade can generate but the typed AST does not
     /// model in detail (e.g. `CAST(t.col AS REAL) / t.total`).

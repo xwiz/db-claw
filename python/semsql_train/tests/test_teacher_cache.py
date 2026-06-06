@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from semsql_train.teacher_cache import (
     ConversionStats,
     build_teacher_cache,
@@ -32,6 +31,25 @@ class TestConvertOne:
         )
         assert rec["natsql_skeleton"] == "SELECT @field1 FROM @entity1"
         assert rec["slot_map"]["@field1"] == "users.email"
+
+    def test_display_columns_are_runtime_canonicalized(self) -> None:
+        rec = convert_one(
+            "charter schools in Alameda",
+            "SELECT `Charter School (Y/N)` FROM frpm "
+            "WHERE `County Name` = 'Alameda'",
+            "demo",
+        )
+
+        assert rec["slot_map"]["@entity1"] == "frpm"
+        assert rec["slot_map"]["@field1"] == "frpm.charter_school_y_n"
+        assert rec["slot_map"]["@field2"] == "frpm.county_name"
+        fields = {
+            item["target"]
+            for item in rec["ranked_schema"]
+            if item.get("kind") == "field"
+        }
+        assert "frpm.charter_school_y_n" in fields
+        assert "frpm.county_name" in fields
 
     def test_select_count(self) -> None:
         rec = convert_one(
@@ -132,7 +150,7 @@ class TestSkipReasons:
         return _run_with_records(manifest)
 
     def test_single_join_converted(self) -> None:
-        # Single INNER JOIN is now kept and transcribed per docs/stage2.md §3.3.
+        # Single INNER JOIN is now kept and transcribed per the Stage 2 training contract §3.3.
         s = self._stats_for(
             "SELECT * FROM users u JOIN posts p ON p.author_id = u.id"
         )
@@ -206,7 +224,7 @@ class TestRetention:
     )
     def test_spider_dev_retention_above_60pct(self, tmp_path: Path) -> None:
         # The paper reports ~94%; our converter now handles single-INNER JOINs
-        # (per docs/stage2.md §3.3), lifting us to ~70%. 60% is a lower bound
+        # (per the Stage 2 training contract §3.3), lifting us to ~70%. 60% is a lower bound
         # that catches real regressions without being brittle to query mix shifts.
         out = tmp_path / "spider_teacher.jsonl"
         stats = build_teacher_cache(

@@ -16,6 +16,8 @@
 
 pub mod sqlite;
 
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
@@ -25,6 +27,8 @@ use serde::{Deserialize, Serialize};
 
 pub use sqlite::SqliteIntrospect;
 
+#[cfg(feature = "mysql")]
+pub use mysql::MySqlIntrospect;
 #[cfg(feature = "postgres")]
 pub use postgres::{PgIntrospect, RlsRow};
 
@@ -86,6 +90,5 @@ pub trait Introspect: Send + Sync {
 
     /// Sample up to `limit` distinct values from a column. Used to seed
     /// `sample_values` in the SemanticGraph for disambiguation.
-    async fn sample_values(&self, table: &str, column: &str, limit: u32)
-        -> Result<Vec<String>>;
+    async fn sample_values(&self, table: &str, column: &str, limit: u32) -> Result<Vec<String>>;
 }

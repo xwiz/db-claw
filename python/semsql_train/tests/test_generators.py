@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from semsql_train.generators import (
     GeneratorConfig,
     generate_e2e_pairs,

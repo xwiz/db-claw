@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import math
 
-import pytest
-
 from semsql_eval.per_stage import (
     RankedItem,
     linker_ndcg_at_k,
@@ -13,7 +11,6 @@ from semsql_eval.per_stage import (
     skeleton_exact_match,
     slot_top1_accuracy,
 )
-
 
 # ---------------------------------------------------------------------------
 # Stage 1 (linker) — recall@k

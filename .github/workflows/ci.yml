@@ -11,6 +11,8 @@ name: CI
 on:
   push:
     branches: [main]
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
 
@@ -19,7 +21,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  source-guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static query-shortcut audit
+        run: python scripts/audit_static_query_shortcuts.py
+      - name: Artifact guard
+        run: python scripts/check_git_artifacts.py --all
+      - name: Docs hygiene
+        run: >
+          python scripts/check_docs_hygiene.py
+          --fail-current-looking
+          --fail-unregistered-current-looking
+          --fail-large-retained
+          --fail-missing-historical-banner
+          --top 12
+
   rust:
+    needs: [source-guards]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -39,9 +60,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test (default features — onnx gated off)
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
 
       - name: Install ONNX Runtime (load-dynamic)
         # The `--features onnx` build uses ort with `load-dynamic`, which
@@ -60,9 +81,10 @@ jobs:
         # compile against the pinned ort/tokenizers versions. Runtime
         # tests that need real ONNX weights are skipped — exec-acc
         # validation lives in the Spider eval harness, not unit tests.
-        run: cargo test -p semsql-runtime --features onnx
+        run: cargo test -p semsql-runtime --features onnx --locked
 
   python:
+    needs: [source-guards]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -76,10 +98,13 @@ jobs:
         run: uv sync --all-extras
       - name: Lint (ruff)
         run: uv run ruff check python
+      - name: Typecheck (mypy)
+        run: uv run mypy python
       - name: Test
         run: uv run pytest python -q
 
   typescript:
+    needs: [source-guards]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -92,6 +117,10 @@ jobs:
           version: 9
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm -r lint
+      - name: Typecheck
+        run: pnpm -r typecheck
       - name: Build
         run: pnpm -r build
       - name: Test
@@ -177,6 +206,77 @@ jobs:
           print(f"spider-mini smoke: total={s['total']} correct={s['correct']} "
                 f"wrong={s['wrong']} bailed={s['bailed']} errored={s['errored']}")
           PY
+
+  product-gate:
+    # Practical product canaries: dynamic schema aliases, BI/ops routes,
+    # and explicit fail-closed rejects. This is the wrong-SQL regression
+    # gate for the SemanticAtlas path.
+    needs: [rust, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-product-gate-${{ hashFiles('**/Cargo.lock') }}
+      - run: pipx install uv
+      - run: uv sync --all-extras
+      - name: Build semsql binary
+        run: cargo build -p semsql-cli --locked
+      - name: Run pathway product gate
+        run: >
+          uv run python -m semsql_eval pathway-benchmark
+          --out target/product-gate/pathway
+          --semsql-bin target/debug/semsql
+          --schema-variant semantic_alias
+          --out-json target/product-gate/pathway.json
+          --out-md target/product-gate/pathway.md
+          --strict
+      - name: Run QueryFrame canary product gate
+        run: >
+          uv run python -m semsql_eval queryframe-canary-suite
+          --out target/product-gate/queryframe
+          --semsql-bin target/debug/semsql
+          --out-json target/product-gate/queryframe.json
+          --out-md target/product-gate/queryframe.md
+          --strict
+
+  release-rehearsal:
+    # Proves the non-dev npm/Rust release prep can produce clean tarballs
+    # without publishing or leaving the worktree on an alpha version.
+    needs: [python, typescript]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Rehearse alpha npm release packages
+        run: >
+          python scripts/rehearse_release_packages.py
+          --version 0.1.0-alpha.1
+          --skip-run-checks
+          --pack-destination target/release-rehearsal/npm-alpha
+          --out-json target/release-rehearsal/npm-alpha-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semsql-release-rehearsal
+          path: target/release-rehearsal/*
+          if-no-files-found: error
 
   cross-language-contract:
     # The two-parser fixture must stay in lockstep with the Python

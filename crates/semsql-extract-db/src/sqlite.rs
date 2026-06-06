@@ -32,8 +32,7 @@ impl SqliteIntrospect {
         let uri = format!("file:{}?mode=ro", path.display());
         let conn = Connection::open_with_flags(
             &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
         .map_err(|e| SemsqlError::Other(format!("sqlite open `{}`: {e}", path.display())))?;
         Ok(Self {
@@ -113,43 +112,45 @@ impl Introspect for SqliteIntrospect {
             let mut out = Vec::new();
             for table in tables {
                 let mut stmt = conn
-                    .prepare(
-                        "SELECT \"from\", \"table\", \"to\" FROM pragma_foreign_key_list(?1)",
-                    )
+                    .prepare("SELECT \"from\", \"table\", \"to\" FROM pragma_foreign_key_list(?1)")
                     .map_err(|e| SemsqlError::Other(format!("fk prepare: {e}")))?;
                 let rows = stmt
                     .query_map(params![table], |row| {
-                        Ok(ForeignKeyIntro {
-                            from_table: table.clone(),
-                            from_column: row.get::<_, String>(0)?,
-                            to_table: row.get::<_, String>(1)?,
-                            to_column: row.get::<_, String>(2)?,
-                        })
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
                     })
                     .map_err(|e| SemsqlError::Other(format!("fk query: {e}")))?;
                 for r in rows {
-                    out.push(r.map_err(|e| SemsqlError::Other(e.to_string()))?);
+                    let (from_column, to_table, to_column) =
+                        r.map_err(|e| SemsqlError::Other(e.to_string()))?;
+                    let to_column = match to_column {
+                        Some(col) if !col.trim().is_empty() => col,
+                        _ => primary_key_column_blocking(conn, &to_table)?
+                            .unwrap_or_else(|| "rowid".to_string()),
+                    };
+                    out.push(ForeignKeyIntro {
+                        from_table: table.clone(),
+                        from_column,
+                        to_table,
+                        to_column,
+                    });
                 }
             }
             Ok(out)
         })
     }
 
-    async fn sample_values(
-        &self,
-        table: &str,
-        column: &str,
-        limit: u32,
-    ) -> Result<Vec<String>> {
-        if !is_safe_ident(table) || !is_safe_ident(column) {
-            return Err(SemsqlError::InvalidIdentifier(format!(
-                "{table}.{column}"
-            )));
-        }
+    async fn sample_values(&self, table: &str, column: &str, limit: u32) -> Result<Vec<String>> {
+        let table_ident = quote_sqlite_ident(table)?;
+        let column_ident = quote_sqlite_ident(column)?;
         self.with_conn(|conn| {
             let q = format!(
-                "SELECT DISTINCT \"{column}\" FROM \"{table}\" \
-                 WHERE \"{column}\" IS NOT NULL LIMIT ?1"
+                "SELECT DISTINCT {column_ident} FROM {table_ident} \
+                 WHERE {column_ident} IS NOT NULL \
+                 ORDER BY {column_ident} COLLATE NOCASE LIMIT ?1"
             );
             let mut stmt = conn
                 .prepare(&q)
@@ -195,6 +196,25 @@ fn list_tables_blocking(conn: &Connection) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn primary_key_column_blocking(conn: &Connection, table: &str) -> Result<Option<String>> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk LIMIT 1")
+        .map_err(|e| SemsqlError::Other(format!("primary_key prepare: {e}")))?;
+    let mut rows = stmt
+        .query(params![table])
+        .map_err(|e| SemsqlError::Other(format!("primary_key query: {e}")))?;
+    match rows
+        .next()
+        .map_err(|e| SemsqlError::Other(format!("primary_key row: {e}")))?
+    {
+        Some(row) => row
+            .get::<_, String>(0)
+            .map(Some)
+            .map_err(|e| SemsqlError::Other(format!("primary_key value: {e}"))),
+        None => Ok(None),
+    }
+}
+
 /// Map SQLite's loose type-affinity strings to the SemanticGraph type
 /// vocabulary. SQLite is permissive (any string in CREATE TABLE works);
 /// we collapse to the closest `FieldType`.
@@ -220,14 +240,11 @@ pub fn normalize_sqlite_type(decl: &str) -> String {
     }
 }
 
-fn is_safe_ident(s: &str) -> bool {
-    if s.is_empty() || s.len() > 64 {
-        return false;
+fn quote_sqlite_ident(s: &str) -> Result<String> {
+    if s.is_empty() || s.len() > 128 || s.chars().any(|ch| ch == '\0' || ch.is_control()) {
+        return Err(SemsqlError::InvalidIdentifier(s.to_string()));
     }
-    let mut bytes = s.bytes();
-    let first = bytes.next().unwrap();
-    (first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    Ok(format!("\"{}\"", s.replace('"', "\"\"")))
 }
 
 #[cfg(test)]
@@ -247,12 +264,13 @@ mod tests {
                  tenant_id INTEGER NOT NULL REFERENCES tenants(id),
                  name TEXT NOT NULL,
                  status_code INTEGER DEFAULT 1,
-                 created_at TEXT
+                 created_at TEXT,
+                 \"Display Status\" TEXT
              );
              INSERT INTO tenants VALUES (1, 'Acme'), (2, 'Globex');
-             INSERT INTO users VALUES (1, 1, 'Ann', 2, '2026-01-01'),
-                                       (2, 1, 'Bob', 1, '2026-02-01'),
-                                       (3, 2, 'Cara', 2, '2026-03-01');",
+             INSERT INTO users VALUES (1, 1, 'Ann', 2, '2026-01-01', 'Directly funded'),
+                                       (2, 1, 'Bob', 1, '2026-02-01', 'Locally funded'),
+                                       (3, 2, 'Cara', 2, '2026-03-01', 'Directly funded');",
         )
         .unwrap();
         drop(conn);
@@ -275,7 +293,10 @@ mod tests {
         let cols = intro.list_columns().await.unwrap();
         let names: Vec<_> = cols.iter().map(|c| (&c.table, &c.column)).collect();
         assert!(names.contains(&(&"users".to_string(), &"tenant_id".to_string())));
-        let id_col = cols.iter().find(|c| c.table == "users" && c.column == "id").unwrap();
+        let id_col = cols
+            .iter()
+            .find(|c| c.table == "users" && c.column == "id")
+            .unwrap();
         assert_eq!(id_col.data_type, "integer");
     }
 
@@ -291,19 +312,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lists_foreign_keys_with_implicit_referenced_pk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("implicit_fk.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE child (
+                 id INTEGER PRIMARY KEY,
+                 parent_id INTEGER REFERENCES parent
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let intro = SqliteIntrospect::open(&path).unwrap();
+        let fks = intro.list_foreign_keys().await.unwrap();
+
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].from_table, "child");
+        assert_eq!(fks[0].from_column, "parent_id");
+        assert_eq!(fks[0].to_table, "parent");
+        assert_eq!(fks[0].to_column, "id");
+    }
+
+    #[tokio::test]
     async fn samples_distinct_values() {
         let (_dir, path) = build_demo_db();
         let intro = SqliteIntrospect::open(&path).unwrap();
-        let mut s = intro.sample_values("users", "status_code", 10).await.unwrap();
+        let mut s = intro
+            .sample_values("users", "status_code", 10)
+            .await
+            .unwrap();
         s.sort();
         assert_eq!(s, vec!["1", "2"]);
     }
 
     #[tokio::test]
-    async fn sample_rejects_unsafe_idents() {
+    async fn samples_quoted_display_name_columns() {
         let (_dir, path) = build_demo_db();
         let intro = SqliteIntrospect::open(&path).unwrap();
-        let r = intro.sample_values("users; DROP", "id", 1).await;
+        let mut s = intro
+            .sample_values("users", "Display Status", 10)
+            .await
+            .unwrap();
+        s.sort();
+        assert_eq!(s, vec!["Directly funded", "Locally funded"]);
+    }
+
+    #[tokio::test]
+    async fn sample_rejects_invalid_identifiers() {
+        let (_dir, path) = build_demo_db();
+        let intro = SqliteIntrospect::open(&path).unwrap();
+        let r = intro.sample_values("users", "bad\0name", 1).await;
         assert!(matches!(r, Err(SemsqlError::InvalidIdentifier(_))));
     }
 

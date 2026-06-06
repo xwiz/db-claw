@@ -1,13 +1,12 @@
 """Mandatory-filter injector — basic invariants.
 
 The bypass corpus (10 documented attack classes) lives in
-``test_injector_bypass.py`` and is the v1.0 deployment gate.
+``test_injector_bypass.py`` and is the deployment safety gate.
 """
 
 from __future__ import annotations
 
 import pytest
-
 from semsql_rewriter.injector import (
     AuditLogWriter,
     InjectionResult,

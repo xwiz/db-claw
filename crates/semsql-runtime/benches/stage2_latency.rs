@@ -1,4 +1,4 @@
-//! Stage 2 latency benchmarks (M7 from `docs/stage2.md` §5.4).
+//! Stage 2 latency benchmarks (M7 from the Stage 2 training contract §5.4).
 //!
 //! Measures the cost of the deterministic pieces of Stage 2 — grammar
 //! generation and grammar compilation through llguidance — at varying
@@ -30,9 +30,7 @@ fn make_schema(n_entities: usize, fields_per_entity: usize) -> GrammarSchema {
     let entities: Vec<String> = (0..n_entities).map(|i| format!("entity_{i}")).collect();
     let fields: Vec<String> = entities
         .iter()
-        .flat_map(|e| {
-            (0..fields_per_entity).map(move |j| format!("{e}.field_{j}"))
-        })
+        .flat_map(|e| (0..fields_per_entity).map(move |j| format!("{e}.field_{j}")))
         .collect();
     GrammarSchema {
         entities,
@@ -77,10 +75,7 @@ fn bench_grammar_compile(c: &mut Criterion) {
         let schema = make_schema(entities, fields_per);
         let total_fields = schema.fields.len();
         group.bench_with_input(
-            BenchmarkId::new(
-                "compile_grammar",
-                format!("e{entities}_f{total_fields}"),
-            ),
+            BenchmarkId::new("compile_grammar", format!("e{entities}_f{total_fields}")),
             &schema,
             |b, schema| {
                 b.iter(|| {
@@ -101,13 +96,13 @@ fn bench_grammar_compile(_c: &mut Criterion) {
     // to time. The pure-grammar bench above still runs.
 }
 
-/// Per-step llguidance mask compute — Phase E acceptance gate. The plan
-/// budget is ≤ 100 µs per `compute_mask()` call for a representative
+/// Per-step llguidance mask compute benchmark. The target budget is
+/// <= 100 us per `compute_mask()` call for a representative
 /// schema slice. Builds a `TokenParser` from the bridge once, then times
 /// repeated `compute_mask` calls on the prompt-empty parser (worst case
 /// for first-token mask construction).
 ///
-/// Skipped if no `tokenizer.json` fixture exists under `target/` — the
+/// Skipped if no `tokenizer.json` fixture exists under `target/` - the
 /// bench requires a real vocab to produce meaningful numbers.
 #[cfg(feature = "onnx")]
 fn bench_per_step_mask(c: &mut Criterion) {
@@ -143,8 +138,7 @@ fn bench_per_step_mask(c: &mut Criterion) {
             return;
         }
     };
-    let mut factory = ParserFactory::new_simple(&env)
-        .expect("ParserFactory::new_simple");
+    let mut factory = ParserFactory::new_simple(&env).expect("ParserFactory::new_simple");
     factory.quiet();
 
     let mut group = c.benchmark_group("stage2_per_step_mask");
@@ -156,9 +150,7 @@ fn bench_per_step_mask(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let g = TopLevelGrammar::from_lark(compiled.lark.clone());
-                let mut p = factory
-                    .create_parser(g)
-                    .expect("create_parser");
+                let mut p = factory.create_parser(g).expect("create_parser");
                 p.start_without_prompt();
                 p
             },

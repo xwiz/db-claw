@@ -87,9 +87,8 @@ impl PreResolverIndex {
     /// Load the index from a `.semsql` file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut plural_labels: AHashMap<String, Vec<String>> = plural_label_index(path)?
-            .into_iter()
-            .collect();
+        let mut plural_labels: AHashMap<String, Vec<String>> =
+            plural_label_index(path)?.into_iter().collect();
 
         // Build enum-label → (entity, field, raw_value) by joining the enum
         // map with the vocabulary table. Enum canonical names follow the
@@ -110,7 +109,7 @@ impl PreResolverIndex {
 
         // Vocabulary table also carries entity / field aliases — fold them in
         // for the plural-label index. Only `entity` and `enum_value` kinds
-        // contribute here; field-level aliases land in v0.5 alongside the
+        // contribute here; field-level aliases belong with the
         // multi-entity templates.
         for v in vocabulary(path)? {
             match v.canonical_kind.as_str() {
@@ -184,6 +183,7 @@ pub fn resolve_with_intents(
 
     let leading: Vec<&str> = tokens[..entity_match.start].to_vec();
     let trailing: Vec<&str> = tokens[entity_match.end..].to_vec();
+    let sensitive_entity = entity_name_looks_sensitive(&entity_match.canonical);
 
     // Helper: strip a leading "of" (so "names of students" leaves
     // ["names"] before the entity).
@@ -214,18 +214,21 @@ pub fn resolve_with_intents(
 
     // Pattern: enum + entity — `"active students"`. The enum label is the
     // span just before the entity; we accept a single optional verb prefix.
-    if let Some(stripped) = strip_optional_verb(&leading) {
-        if let Some(label) = stripped.last() {
-            if let Some((entity, field, raw)) = index.enum_labels.get(label as &str) {
-                if entity == &entity_match.canonical {
-                    let lit = enum_value_literal(raw);
-                    return PreResolveOutcome::Resolved {
-                        natsql: format!(
-                            "SELECT * FROM {} WHERE {}.{} = {}",
-                            entity_match.canonical, entity_match.canonical, field, lit
-                        ),
-                        confidence: 1.0,
-                    };
+    if !sensitive_entity && trailing.is_empty() {
+        if let Some(stripped) = strip_optional_verb(&leading) {
+            if stripped.len() == 1 {
+                let label = stripped[0];
+                if let Some((entity, field, raw)) = index.enum_labels.get(label as &str) {
+                    if entity == &entity_match.canonical {
+                        let lit = enum_value_literal(raw);
+                        return PreResolveOutcome::Resolved {
+                            natsql: format!(
+                                "SELECT * FROM {} WHERE {}.{} = {}",
+                                entity_match.canonical, entity_match.canonical, field, lit
+                            ),
+                            confidence: 1.0,
+                        };
+                    }
                 }
             }
         }
@@ -234,23 +237,25 @@ pub fn resolve_with_intents(
     // Pattern: top-N + (optional explicit field, or intent column hint).
     // Leading span looks like `top|highest|biggest|first <N>?` or
     // `<N> highest|biggest|...`. Trailing optionally carries `by <field>`.
-    if let Some(natsql) = build_top_n(
-        &leading,
-        &trailing,
-        &entity_match.canonical,
-        &index.field_labels,
-        intents,
-    ) {
-        return PreResolveOutcome::Resolved {
-            natsql,
-            confidence: 1.0,
-        };
+    if !sensitive_entity {
+        if let Some(natsql) = build_top_n(
+            &leading,
+            &trailing,
+            &entity_match.canonical,
+            &index.field_labels,
+            intents,
+        ) {
+            return PreResolveOutcome::Resolved {
+                natsql,
+                confidence: 1.0,
+            };
+        }
     }
 
     // Pattern: ordering — `<verb>? <entity> [ordered|sorted|ranked] by
     // <field> [asc|desc|ascending|descending]?`. Leading restricted to
     // fetch verbs.
-    if leading.iter().all(|t| is_fetch_verb(t)) {
+    if !sensitive_entity && leading.iter().all(|t| is_fetch_verb(t)) {
         if let Some(natsql) =
             build_ordering(&trailing, &entity_match.canonical, &index.field_labels)
         {
@@ -264,7 +269,7 @@ pub fn resolve_with_intents(
     // Pattern: numeric comparison — `"<verb>? <entity> [with] <field>
     // <op-phrase> <number>"`. Trailing tokens carry the predicate; the
     // leading span is restricted to optional fetch verbs.
-    if leading.iter().all(|t| is_fetch_verb(t)) {
+    if !sensitive_entity && leading.iter().all(|t| is_fetch_verb(t)) {
         if let Some(natsql) =
             build_numeric_comparison(&trailing, &entity_match.canonical, &index.field_labels)
         {
@@ -280,7 +285,7 @@ pub fn resolve_with_intents(
     // ignores anything that started with "count" / "how many" because that
     // path is handled above with COUNT(*) and we don't currently emit
     // `COUNT(<field>)`.
-    if !match_count_prefix(&leading).is_some() && trailing.is_empty() {
+    if !sensitive_entity && match_count_prefix(&leading).is_none() && trailing.is_empty() {
         if let Some(natsql) = build_field_projection(
             &leading_no_count,
             &entity_match.canonical,
@@ -294,7 +299,7 @@ pub fn resolve_with_intents(
     }
 
     // Pattern: verb + entity — `"show students"`, or bare entity.
-    if leading.iter().all(|t| is_fetch_verb(t)) && trailing.is_empty() {
+    if !sensitive_entity && leading.iter().all(|t| is_fetch_verb(t)) && trailing.is_empty() {
         return PreResolveOutcome::Resolved {
             natsql: format!("SELECT * FROM {}", entity_match.canonical),
             confidence: 1.0,
@@ -346,17 +351,36 @@ fn find_entity(tokens: &[&str], index: &PreResolverIndex) -> Option<EntityMatch>
 fn is_fetch_verb(token: &str) -> bool {
     matches!(
         token,
-        "show"
-            | "list"
-            | "get"
-            | "find"
-            | "display"
-            | "fetch"
-            | "return"
-            | "give"
-            | "pull"
-            | "all"
+        "show" | "list" | "get" | "find" | "display" | "fetch" | "return" | "give" | "pull" | "all"
     )
+}
+
+fn entity_name_looks_sensitive(entity: &str) -> bool {
+    let lower = entity.to_ascii_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    [
+        "password",
+        "token",
+        "secret",
+        "credential",
+        "session",
+        "oauth",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "hash",
+        "salt",
+        "pin",
+        "mfa",
+        "twofactor",
+        "authentication",
+        "login",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle) || compact.contains(needle))
 }
 
 fn strip_optional_verb<'a>(leading: &'a [&'a str]) -> Option<Vec<&'a str>> {
@@ -603,11 +627,7 @@ fn build_ordering(
     let after_by = &trailing[2..];
     // Direction word, if any, is the last token. Take it before label
     // resolution so a 1- to 3-token field label can sit in front.
-    let (label_tokens, direction) = match after_by
-        .last()
-        .copied()
-        .and_then(direction_from_word)
-    {
+    let (label_tokens, direction) = match after_by.last().copied().and_then(direction_from_word) {
         Some(dir) => (&after_by[..after_by.len() - 1], dir),
         None => (after_by, "ASC"),
     };
@@ -697,8 +717,7 @@ fn build_top_n(
     // intent's `default_limit`. Bail if neither has a value — Top-N
     // without a limit is just an ORDER BY, which the ordering pattern
     // already covers.
-    let limit = limit_from_head
-        .or_else(|| intents.iter().find_map(|i| i.default_limit))?;
+    let limit = limit_from_head.or_else(|| intents.iter().find_map(|i| i.default_limit))?;
     Some(format!(
         "SELECT * FROM {entity} ORDER BY {entity}.{field} {ordering} LIMIT {limit}"
     ))
@@ -727,10 +746,11 @@ fn resolve_intent_column(
             let key = candidate.to_lowercase();
             if let Some(refs) = field_labels.get(key.as_str()) {
                 for r in refs {
-                    if r.entity == entity && is_numeric_type(&r.r#type) {
-                        if !matches.iter().any(|f| f == &r.field) {
-                            matches.push(r.field.clone());
-                        }
+                    if r.entity == entity
+                        && is_numeric_type(&r.r#type)
+                        && !matches.iter().any(|f| f == &r.field)
+                    {
+                        matches.push(r.field.clone());
                     }
                 }
             }
@@ -813,19 +833,37 @@ mod tests {
         plural.insert("user".to_string(), vec!["users".to_string()]);
         plural.insert("users".to_string(), vec!["users".to_string()]);
         plural.insert("organizations".to_string(), vec!["tenants".to_string()]);
+        plural.insert(
+            "personal access token".to_string(),
+            vec!["personal_access_tokens".to_string()],
+        );
+        plural.insert(
+            "personal access tokens".to_string(),
+            vec!["personal_access_tokens".to_string()],
+        );
 
         let mut enum_labels = AHashMap::new();
         enum_labels.insert(
             "active".to_string(),
-            ("users".to_string(), "status_code".to_string(), "2".to_string()),
+            (
+                "users".to_string(),
+                "status_code".to_string(),
+                "2".to_string(),
+            ),
         );
         enum_labels.insert(
             "pending".to_string(),
-            ("users".to_string(), "status_code".to_string(), "1".to_string()),
+            (
+                "users".to_string(),
+                "status_code".to_string(),
+                "1".to_string(),
+            ),
         );
 
-        let entity_canonicals: AHashSet<_> =
-            ["users", "tenants"].iter().map(|s| s.to_string()).collect();
+        let entity_canonicals: AHashSet<_> = ["users", "tenants", "personal_access_tokens"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let mut field_labels: AHashMap<String, Vec<FieldRef>> = AHashMap::new();
         let balance = FieldRef {
@@ -902,14 +940,30 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_raw_entities_allow_counts_but_abstain_on_row_projection() {
+        let idx = fixture_index();
+        match resolve("how many personal access tokens", &idx) {
+            PreResolveOutcome::Resolved { natsql, .. } => {
+                assert_eq!(natsql, "SELECT COUNT(*) FROM personal_access_tokens");
+            }
+            other => panic!("expected count resolution, got {other:?}"),
+        }
+        assert_eq!(
+            resolve("list personal access tokens", &idx),
+            PreResolveOutcome::NeedsModel
+        );
+        assert_eq!(
+            resolve("show personal access tokens", &idx),
+            PreResolveOutcome::NeedsModel
+        );
+    }
+
+    #[test]
     fn resolves_enum_subject() {
         let idx = fixture_index();
         match resolve("active students", &idx) {
             PreResolveOutcome::Resolved { natsql, .. } => {
-                assert_eq!(
-                    natsql,
-                    "SELECT * FROM users WHERE users.status_code = 2"
-                );
+                assert_eq!(natsql, "SELECT * FROM users WHERE users.status_code = 2");
             }
             other => panic!("expected resolved, got {other:?}"),
         }
@@ -920,13 +974,19 @@ mod tests {
         let idx = fixture_index();
         match resolve("show active students", &idx) {
             PreResolveOutcome::Resolved { natsql, .. } => {
-                assert_eq!(
-                    natsql,
-                    "SELECT * FROM users WHERE users.status_code = 2"
-                );
+                assert_eq!(natsql, "SELECT * FROM users WHERE users.status_code = 2");
             }
             other => panic!("expected resolved, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enum_entity_abstains_when_leading_span_has_extra_semantics() {
+        let idx = fixture_index();
+        assert_eq!(
+            resolve("orders for active students", &idx),
+            PreResolveOutcome::NeedsModel
+        );
     }
 
     #[test]
@@ -968,10 +1028,7 @@ mod tests {
         let idx = fixture_index();
         match resolve("students with balance over 100", &idx) {
             PreResolveOutcome::Resolved { natsql, .. } => {
-                assert_eq!(
-                    natsql,
-                    "SELECT * FROM users WHERE users.balance > 100"
-                );
+                assert_eq!(natsql, "SELECT * FROM users WHERE users.balance > 100");
             }
             other => panic!("expected resolved, got {other:?}"),
         }
@@ -982,10 +1039,7 @@ mod tests {
         let idx = fixture_index();
         match resolve("show users where balance at least 50", &idx) {
             PreResolveOutcome::Resolved { natsql, .. } => {
-                assert_eq!(
-                    natsql,
-                    "SELECT * FROM users WHERE users.balance >= 50"
-                );
+                assert_eq!(natsql, "SELECT * FROM users WHERE users.balance >= 50");
             }
             other => panic!("expected resolved, got {other:?}"),
         }
@@ -996,10 +1050,7 @@ mod tests {
         let idx = fixture_index();
         match resolve("users with account balance below 200", &idx) {
             PreResolveOutcome::Resolved { natsql, .. } => {
-                assert_eq!(
-                    natsql,
-                    "SELECT * FROM users WHERE users.balance < 200"
-                );
+                assert_eq!(natsql, "SELECT * FROM users WHERE users.balance < 200");
             }
             other => panic!("expected resolved, got {other:?}"),
         }
@@ -1078,10 +1129,9 @@ mod tests {
     fn resolves_order_by_default_asc() {
         let idx = fixture_index();
         match resolve("users sorted by balance", &idx) {
-            PreResolveOutcome::Resolved { natsql, .. } => assert_eq!(
-                natsql,
-                "SELECT * FROM users ORDER BY users.balance ASC"
-            ),
+            PreResolveOutcome::Resolved { natsql, .. } => {
+                assert_eq!(natsql, "SELECT * FROM users ORDER BY users.balance ASC")
+            }
             other => panic!("expected resolved, got {other:?}"),
         }
     }
@@ -1090,10 +1140,9 @@ mod tests {
     fn resolves_order_by_explicit_desc() {
         let idx = fixture_index();
         match resolve("users ordered by balance desc", &idx) {
-            PreResolveOutcome::Resolved { natsql, .. } => assert_eq!(
-                natsql,
-                "SELECT * FROM users ORDER BY users.balance DESC"
-            ),
+            PreResolveOutcome::Resolved { natsql, .. } => {
+                assert_eq!(natsql, "SELECT * FROM users ORDER BY users.balance DESC")
+            }
             other => panic!("expected resolved, got {other:?}"),
         }
     }
@@ -1102,10 +1151,9 @@ mod tests {
     fn resolves_order_by_with_verb_prefix_and_multi_word_label() {
         let idx = fixture_index();
         match resolve("show users ranked by account balance descending", &idx) {
-            PreResolveOutcome::Resolved { natsql, .. } => assert_eq!(
-                natsql,
-                "SELECT * FROM users ORDER BY users.balance DESC"
-            ),
+            PreResolveOutcome::Resolved { natsql, .. } => {
+                assert_eq!(natsql, "SELECT * FROM users ORDER BY users.balance DESC")
+            }
             other => panic!("expected resolved, got {other:?}"),
         }
     }
@@ -1133,7 +1181,8 @@ mod tests {
         // tenants is the entity in this query, but `balance` resolves
         // unambiguously *to that entity* — keep the test on `users`
         // instead, where the ambiguity persists across both.
-        idx.plural_labels.insert("members".into(), vec!["tenants".into()]);
+        idx.plural_labels
+            .insert("members".into(), vec!["tenants".into()]);
         // `users` query: `balance` matches users (1 candidate on this
         // entity), so this still resolves. Using a non-existent field
         // for safety.
@@ -1171,10 +1220,7 @@ mod tests {
     fn top_n_without_field_or_intent_falls_through() {
         let idx = fixture_index();
         // No explicit `by ...` and no intent → can't pick a column.
-        assert_eq!(
-            resolve("top 5 users", &idx),
-            PreResolveOutcome::NeedsModel
-        );
+        assert_eq!(resolve("top 5 users", &idx), PreResolveOutcome::NeedsModel);
     }
 
     #[test]

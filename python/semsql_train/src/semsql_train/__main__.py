@@ -22,16 +22,27 @@ from pathlib import Path
 
 import click
 
+from .corpus_audit import audit_corpora, audit_report_to_json
 from .onnx_export import CascadeExportConfig, export_cascade, read_manifest
 from .spider_linker import (
     SpiderLinkerConfig,
     generate_linker_pairs_from_spider_with_stats,
     write_pairs_jsonl,
 )
-from .trainers.distill import DistillConfig, distill_linker, preflight as distill_preflight
-from .trainers.linker import LinkerTrainConfig, preflight as linker_preflight
-from .trainers.skeleton import SkeletonTrainConfig, preflight as skeleton_preflight, train_skeleton
-from .trainers.slot_filler import SlotFillerTrainConfig, preflight as slot_preflight, train_slot_filler
+from .stage_eval import (
+    eval_linker_checkpoint,
+    eval_skeleton_checkpoint,
+    eval_slot_checkpoint,
+    stage_eval_report_to_json,
+)
+from .trainers.distill import DistillConfig, distill_linker
+from .trainers.distill import preflight as distill_preflight
+from .trainers.linker import LinkerTrainConfig
+from .trainers.linker import preflight as linker_preflight
+from .trainers.skeleton import SkeletonTrainConfig, train_skeleton
+from .trainers.skeleton import preflight as skeleton_preflight
+from .trainers.slot_filler import SlotFillerTrainConfig, train_slot_filler
+from .trainers.slot_filler import preflight as slot_preflight
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -223,7 +234,7 @@ def preflight_cmd(
     "--cascade-version",
     type=str,
     required=True,
-    help='Free-form version string written into the manifest (e.g. "v0.5.0-rc1").',
+    help='Free-form version string written into the manifest (e.g. "benchmark-run").',
 )
 @click.option(
     "--linker-checkpoint",
@@ -275,9 +286,8 @@ def export_cascade_cmd(
 ) -> None:
     """Export every stage's checkpoint to ONNX and write the manifest.
 
-    Stage 2 milestone M4 from `docs/stage2.md`. Reuses pre-existing
-    per-stage artefacts when their checkpoint is omitted, so a single
-    stage can be re-exported without re-running the others.
+    Reuses pre-existing per-stage artifacts when their checkpoint is omitted,
+    so a single stage can be re-exported without re-running the others.
     """
     cfg = CascadeExportConfig(
         output_dir=output_dir,
@@ -365,7 +375,7 @@ def inspect_manifest_cmd(manifest_path: Path) -> None:
     default=False,
     help="Stream OmniSQL (RUCKBReasoning/OmniSQL-synthetic-data) instead of "
     "Spider/BIRD/SQaLe. Phase C in-distribution top-up — see "
-    "docs/completion-plan.md.",
+    "the current architecture/status notes.",
 )
 @click.option(
     "--omnisql-max-rows",
@@ -441,7 +451,7 @@ def build_teacher_cache_cmd(
     (JOINs, HAVING, CTEs, subqueries, set ops) are skipped — the run
     summary surfaces the retention rate so the operator sees the gap.
 
-    Free, deterministic, no GPU, no API. See `docs/training-on-laptop.md`
+    Free, deterministic, no GPU, no API.
     for why this replaces M2 entirely.
     """
     from .teacher_cache import (
@@ -523,7 +533,7 @@ def build_teacher_cache_cmd(
     "target_k",
     type=int,
     required=True,
-    help="Number of rows to select (recommended: 25000 per `docs/training-on-laptop.md`).",
+    help="Number of rows to select (25000 is a practical local default).",
 )
 @click.option(
     "--embedding-model",
@@ -545,7 +555,7 @@ def active_subset_cmd(
     seed: int,
 ) -> None:
     """Pick ``--target`` diverse rows from a synthetic pool — see
-    `docs/training-on-laptop.md` §4 for why this 10× the laptop training
+    the local training rationale §4 for why this 10× the laptop training
     speed without losing accuracy.
     """
     from .active_subset import active_subset
@@ -565,6 +575,72 @@ def active_subset_cmd(
     click.echo(f"  embedding_model={stats.embedding_model}")
 
 
+@cli.command("audit-corpus")
+@click.option(
+    "--skeleton-train",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Stage 2 training JSONL to audit.",
+)
+@click.option(
+    "--skeleton-eval",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Stage 2 eval JSONL to audit.",
+)
+@click.option(
+    "--linker-eval",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Stage 1 eval JSONL to audit for meaningful recall@k groups.",
+)
+@click.option(
+    "--benchmark-questions",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Benchmark dev/test JSON used to reject accidental train overlap.",
+)
+@click.option(
+    "--profile",
+    type=click.Choice(["generic", "bird-stage2"]),
+    default="generic",
+    help="Profile-specific thresholds. Use bird-stage2 before BIRD retraining.",
+)
+@click.option("--recall-k", type=int, default=5, help="Linker recall@k being audited.")
+@click.option(
+    "--out",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional JSON report destination.",
+)
+def audit_corpus_cmd(
+    skeleton_train: Path | None,
+    skeleton_eval: Path | None,
+    linker_eval: Path | None,
+    benchmark_questions: Path | None,
+    profile: str,
+    recall_k: int,
+    out: Path | None,
+) -> None:
+    """Audit training/eval corpora before spending GPU time."""
+
+    report = audit_corpora(
+        skeleton_train=skeleton_train,
+        skeleton_eval=skeleton_eval,
+        linker_eval=linker_eval,
+        benchmark_questions=benchmark_questions,
+        profile=profile,
+        recall_k=recall_k,
+    )
+    rendered = audit_report_to_json(report)
+    click.echo(rendered)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered + "\n", encoding="utf-8")
+    if not report.ok:
+        sys.exit(1)
+
+
 @cli.command("train")
 @click.option(
     "--stage",
@@ -579,7 +655,14 @@ def active_subset_cmd(
               help="HF model id override. Default: t5-small (skeleton), distilbert-base-uncased (linker/slot-filler).")
 @click.option("--epochs", type=int, default=None)
 @click.option("--batch-size", type=int, default=None)
+@click.option(
+    "--learning-rate",
+    type=float,
+    default=None,
+    help="Optimizer learning rate override for the selected stage.",
+)
 @click.option("--grad-accum", type=int, default=None, help="Gradient accumulation steps (skeleton only).")
+@click.option("--max-steps", type=int, default=None, help="Stop after N optimizer steps (skeleton only).")
 @click.option("--bf16", is_flag=True, default=False, help="bf16 mixed precision (skeleton).")
 @click.option("--fp16", is_flag=True, default=False,
               help="fp16 mixed precision (skeleton). Use on Turing/T4 where bf16 unsupported.")
@@ -587,6 +670,12 @@ def active_subset_cmd(
               help="Attention backend: '2' or 'flash_attention_2', 'sdpa'. Skeleton only.")
 @click.option("--compile", "torch_compile", is_flag=True, default=False,
               help="torch.compile the model (skeleton).")
+@click.option(
+    "--gradient-checkpointing",
+    is_flag=True,
+    default=False,
+    help="Trade compute for lower VRAM during skeleton training.",
+)
 @click.option("--liger", is_flag=True, default=False, help="Apply Liger Kernel patch (skeleton).")
 @click.option(
     "--teacher-cache-mode",
@@ -602,17 +691,20 @@ def train_cmd(
     base_model: str | None,
     epochs: int | None,
     batch_size: int | None,
+    learning_rate: float | None,
     grad_accum: int | None,
+    max_steps: int | None,
     bf16: bool,
     fp16: bool,
     flash_attn: str | None,
     torch_compile: bool,
+    gradient_checkpointing: bool,
     liger: bool,
     teacher_cache_mode: str,
 ) -> None:
     """Unified training entry for all cascade stages.
 
-    Maps to the concrete trainer for each stage — see `docs/training-on-laptop.md`
+    Maps to the concrete trainer for each stage — see the local training rationale
     Phase B for the recommended flags per stage.
 
     Stage 1 (linker):     ~30 min on RTX 4060. recall@5 >= 95 % target.
@@ -632,11 +724,14 @@ def train_cmd(
             base_model=base_model or "t5-small",
             epochs=epochs or 5,
             batch_size=batch_size or 16,
+            learning_rate=learning_rate or 3e-4,
+            max_steps=max_steps,
             gradient_accum=grad_accum or 1,
             bf16=bf16,
             fp16=fp16,
             flash_attention=attn_impl,
             torch_compile=torch_compile,
+            gradient_checkpointing=gradient_checkpointing,
             liger_kernel=liger,
         )
         report = skeleton_preflight(cfg)
@@ -660,6 +755,7 @@ def train_cmd(
             base_model=base_model or "distilbert-base-uncased",
             epochs=epochs or 3,
             batch_size=batch_size or 64,
+            learning_rate=learning_rate or 2e-5,
             bf16=bf16,
         )
         report_l = linker_preflight(cfg_l)
@@ -682,6 +778,7 @@ def train_cmd(
             base_model=base_model or "distilbert-base-uncased",
             epochs=epochs or 4,
             batch_size=batch_size or 64,
+            learning_rate=learning_rate or 2e-5,
             bf16=bf16,
         )
         report_s = slot_preflight(cfg_s)
@@ -695,6 +792,79 @@ def train_cmd(
         )
         out_s = train_slot_filler(cfg_s)
         click.echo(f"slot-filler trainer done: output={out_s}")
+
+
+@cli.command("eval-stage")
+@click.option(
+    "--stage",
+    type=click.Choice(["linker", "skeleton", "slot-filler"]),
+    required=True,
+    help="Which checkpoint type to evaluate.",
+)
+@click.option(
+    "--checkpoint",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+    help="HF checkpoint directory.",
+)
+@click.option(
+    "--eval",
+    "eval_jsonl",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Stage eval JSONL.",
+)
+@click.option("--out", type=click.Path(path_type=Path), default=None)
+@click.option("--limit", type=int, default=None, help="Limit examples/groups for smoke runs.")
+@click.option("--batch-size", type=int, default=32)
+@click.option("--k", type=int, default=5, help="Stage 1 recall@k.")
+@click.option("--device", type=str, default=None, help="Torch device override, e.g. cuda or cpu.")
+@click.option("--max-new-tokens", type=int, default=96, help="Stage 2 generation cap.")
+def eval_stage_cmd(
+    stage: str,
+    checkpoint: Path,
+    eval_jsonl: Path,
+    out: Path | None,
+    limit: int | None,
+    batch_size: int,
+    k: int,
+    device: str | None,
+    max_new_tokens: int,
+) -> None:
+    """Evaluate a trained checkpoint against a per-stage corpus."""
+
+    if stage == "skeleton":
+        report = eval_skeleton_checkpoint(
+            checkpoint=checkpoint,
+            eval_jsonl=eval_jsonl,
+            limit=limit,
+            batch_size=batch_size,
+            device=device,
+            max_new_tokens=max_new_tokens,
+        )
+    elif stage == "linker":
+        report = eval_linker_checkpoint(
+            checkpoint=checkpoint,
+            eval_jsonl=eval_jsonl,
+            limit=limit,
+            batch_size=batch_size,
+            device=device,
+            k=k,
+        )
+    else:
+        report = eval_slot_checkpoint(
+            checkpoint=checkpoint,
+            eval_jsonl=eval_jsonl,
+            limit=limit,
+            batch_size=batch_size,
+            device=device,
+        )
+
+    rendered = stage_eval_report_to_json(report)
+    click.echo(rendered)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered + "\n", encoding="utf-8")
 
 
 @cli.command("derive-linker-pairs")
@@ -779,7 +949,7 @@ def derive_slot_pairs_cmd(
     Each row's ``slot_map`` becomes one or more Stage 3 training records
     with synthesised candidate sets including hard-negative NL stop-words
     so the cross-encoder learns to score capitalised / numeric tokens
-    above grammatical fillers — Phase A's dominant failure mode.
+    above grammatical fillers, which are a recurring BIRD diagnostic failure.
     """
     from .generators_slot_v3 import DeriveSlotConfig, derive_slot_pairs
 
@@ -794,6 +964,73 @@ def derive_slot_pairs_cmd(
             fh.write("\n")
             n += 1
     click.echo(f"wrote {n} Stage 3 pairs to {out_jsonl}")
+
+
+@cli.command("derive-runtime-slot-pairs")
+@click.option(
+    "--report-json",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Eval report JSON containing per-example stage3_slots traces.",
+)
+@click.option(
+    "--oracle-cache",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Teacher-cache JSONL carrying canonical slot_map gold labels.",
+)
+@click.option(
+    "--out",
+    "out_jsonl",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output runtime-shaped Stage 3 JSONL.",
+)
+@click.option(
+    "--max-candidates",
+    type=int,
+    default=None,
+    help="Optional candidate cap per slot. Gold is retained if clipping.",
+)
+@click.option(
+    "--no-append-missing-gold",
+    "append_missing_gold",
+    flag_value=False,
+    default=True,
+    help="Drop traced slots whose runtime candidate list lacks the gold value.",
+)
+@click.option(
+    "--context-mode",
+    type=click.Choice(["actual", "teacher-forced", "both"]),
+    default="actual",
+    show_default=True,
+    help="Skeleton context to write: runtime actual, oracle teacher-forced, or both.",
+)
+def derive_runtime_slot_pairs_cmd(
+    report_json: Path,
+    oracle_cache: Path,
+    out_jsonl: Path,
+    max_candidates: int | None,
+    append_missing_gold: bool,
+    context_mode: str,
+) -> None:
+    """Derive Stage 3 hard negatives from actual runtime slot traces."""
+    from .runtime_slot_pairs import write_runtime_slot_pairs
+
+    stats = write_runtime_slot_pairs(
+        report_json=report_json,
+        oracle_cache=oracle_cache,
+        out_jsonl=out_jsonl,
+        append_missing_gold=append_missing_gold,
+        max_candidates=max_candidates,
+        context_mode=context_mode,
+    )
+    click.echo(
+        f"wrote {stats.pairs_written} runtime Stage 3 pairs to {out_jsonl} "
+        f"(examples={stats.examples} examples_with_oracle={stats.examples_with_oracle} "
+        f"slots_seen={stats.slots_seen} gold_appended={stats.gold_appended} "
+        f"missing_oracle={stats.missing_oracle} missing_trace={stats.missing_trace})"
+    )
 
 
 @cli.command("generate-targeted-v3")
@@ -853,9 +1090,8 @@ def generate_targeted_v3_cmd(
 
     Produces JOIN-chain (1-3 INNER JOINs over real FK edges), HAVING,
     and CAST/ratio templates that exercise the v0.3 forms which the
-    Phase A BIRD smoke surfaced as primary failure buckets. See
-    `docs/results/v2-bird-smoke-failures.md` for the failure histogram
-    these templates target.
+    earlier v0.2 BIRD diagnostics surfaced as primary failure buckets.
+    The current status summary lives in `docs/results/v02-current-status.md`.
     """
     from .generators_targeted_v3 import (
         TargetedGeneratorConfig,
@@ -927,7 +1163,13 @@ def generate_pairs_cmd(
             --stage skeleton --paraphrase-variants 2 \\
             --out data/synthetic_skeleton.jsonl
     """
-    from .generators import GeneratorConfig, generate_e2e_pairs, generate_linker_pairs, generate_skeleton_pairs, generate_slot_pairs
+    from .generators import (
+        GeneratorConfig,
+        generate_e2e_pairs,
+        generate_linker_pairs,
+        generate_skeleton_pairs,
+        generate_slot_pairs,
+    )
 
     cfg = GeneratorConfig(paraphrase_variants=paraphrase_variants, seed=seed)
     fn_map = {

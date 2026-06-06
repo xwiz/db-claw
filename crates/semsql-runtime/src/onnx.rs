@@ -57,26 +57,17 @@ impl OnnxCrossEncoder {
         // gates the file-loading path. We pre-read the file ourselves
         // so the error message points at the path the user supplied
         // rather than at an opaque ort error.
-        let onnx_bytes = std::fs::read(onnx_path).map_err(|e| {
-            SemsqlError::Other(format!("read ONNX `{}`: {e}", onnx_path.display()))
-        })?;
+        let onnx_bytes = std::fs::read(onnx_path)
+            .map_err(|e| SemsqlError::Other(format!("read ONNX `{}`: {e}", onnx_path.display())))?;
         let session = Session::builder()
             .map_err(|e| SemsqlError::Other(format!("ort session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| SemsqlError::Other(format!("ort optimisation level: {e}")))?
             .commit_from_memory(&onnx_bytes)
-            .map_err(|e| {
-                SemsqlError::Other(format!(
-                    "ort load `{}`: {e}",
-                    onnx_path.display()
-                ))
-            })?;
+            .map_err(|e| SemsqlError::Other(format!("ort load `{}`: {e}", onnx_path.display())))?;
         // ort 2.0.0-rc.10 exposes `inputs` as a public field on
         // `Session`, not a method. Each entry has a `name: String` field.
-        let needs_token_type_ids = session
-            .inputs
-            .iter()
-            .any(|i| i.name == "token_type_ids");
+        let needs_token_type_ids = session.inputs.iter().any(|i| i.name == "token_type_ids");
 
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
             SemsqlError::Other(format!(
@@ -149,8 +140,7 @@ impl OnnxCrossEncoder {
         let input_ids_v = Value::from_array((shape.clone(), input_ids)).map_err(map_ort)?;
         let attention_mask_v =
             Value::from_array((shape.clone(), attention_mask)).map_err(map_ort)?;
-        let token_type_ids_v =
-            Value::from_array((shape, token_type_ids)).map_err(map_ort)?;
+        let token_type_ids_v = Value::from_array((shape, token_type_ids)).map_err(map_ort)?;
 
         let mut session = self
             .session
@@ -194,9 +184,7 @@ impl OnnxCrossEncoder {
                     }
                 }
             }
-            found.ok_or_else(|| {
-                SemsqlError::Other("no 2D float logits in model output".into())
-            })?
+            found.ok_or_else(|| SemsqlError::Other("no 2D float logits in model output".into()))?
         };
 
         let num_classes = logit_shape[1];
@@ -285,13 +273,16 @@ impl OnnxEncoder {
             .first()
             .and_then(|o| match &o.output_type {
                 ort::value::ValueType::Tensor { shape, .. } => {
-                    shape.iter().nth(2).copied().map(|d| d.max(1) as usize)
+                    shape.get(2).copied().map(|d| d.max(1) as usize)
                 }
                 _ => None,
             })
             .unwrap_or(384);
 
-        Ok(Self { session: Mutex::new(session), hidden_size })
+        Ok(Self {
+            session: Mutex::new(session),
+            hidden_size,
+        })
     }
 
     /// Forward pass. Returns `last_hidden_state` as a flat Vec of
@@ -306,9 +297,10 @@ impl OnnxEncoder {
         let ids_v = Value::from_array((shape.clone(), input_ids.to_vec())).map_err(map_ort)?;
         let mask_v = Value::from_array((shape, attention_mask.to_vec())).map_err(map_ort)?;
 
-        let mut sess = self.session.lock().map_err(|_| {
-            SemsqlError::Other("encoder mutex poisoned".into())
-        })?;
+        let mut sess = self
+            .session
+            .lock()
+            .map_err(|_| SemsqlError::Other("encoder mutex poisoned".into()))?;
         let outputs = sess
             .run(inputs!["input_ids" => ids_v, "attention_mask" => mask_v])
             .map_err(map_ort)?;
@@ -318,7 +310,9 @@ impl OnnxEncoder {
                 return Ok(data.to_vec());
             }
         }
-        Err(SemsqlError::Other("encoder produced no float output".into()))
+        Err(SemsqlError::Other(
+            "encoder produced no float output".into(),
+        ))
     }
 }
 
@@ -341,16 +335,17 @@ impl OnnxDecoder {
             .iter()
             .find(|o| o.name.contains("logit") || o.name.contains("score"))
             .and_then(|o| match &o.output_type {
-                ort::value::ValueType::Tensor { shape, .. } => shape
-                    .iter()
-                    .last()
-                    .copied()
-                    .map(|d| d.max(1) as usize),
+                ort::value::ValueType::Tensor { shape, .. } => {
+                    shape.iter().last().copied().map(|d| d.max(1) as usize)
+                }
                 _ => None,
             })
             .unwrap_or(32_000);
 
-        Ok(Self { session: Mutex::new(session), vocab_size })
+        Ok(Self {
+            session: Mutex::new(session),
+            vocab_size,
+        })
     }
 
     /// One decoder step. Returns `logits` for the last position as
@@ -378,17 +373,21 @@ impl OnnxDecoder {
             return Err(SemsqlError::Other("decoder_ids must not be empty".into()));
         }
         // Decoder input: [1, dec_len] — full prefix generated so far.
-        let ids_v = Value::from_array((vec![1i64, dec_len as i64], decoder_ids.to_vec())).map_err(map_ort)?;
+        let ids_v = Value::from_array((vec![1i64, dec_len as i64], decoder_ids.to_vec()))
+            .map_err(map_ort)?;
         // Encoder states: [1, src_len, hidden_size]
         let enc_shape = vec![1i64, src_len as i64, hidden_size as i64];
-        let enc_v = Value::from_array((enc_shape, encoder_hidden_states.to_vec())).map_err(map_ort)?;
+        let enc_v =
+            Value::from_array((enc_shape, encoder_hidden_states.to_vec())).map_err(map_ort)?;
         // Encoder mask: [1, src_len]
         let mask_shape = vec![1i64, src_len as i64];
-        let mask_v = Value::from_array((mask_shape, encoder_attention_mask.to_vec())).map_err(map_ort)?;
+        let mask_v =
+            Value::from_array((mask_shape, encoder_attention_mask.to_vec())).map_err(map_ort)?;
 
-        let mut sess = self.session.lock().map_err(|_| {
-            SemsqlError::Other("decoder mutex poisoned".into())
-        })?;
+        let mut sess = self
+            .session
+            .lock()
+            .map_err(|_| SemsqlError::Other("decoder mutex poisoned".into()))?;
         let outputs = sess
             .run(inputs![
                 "input_ids"             => ids_v,
@@ -408,7 +407,9 @@ impl OnnxDecoder {
                 }
             }
         }
-        Err(SemsqlError::Other("decoder produced no logits output".into()))
+        Err(SemsqlError::Other(
+            "decoder produced no logits output".into(),
+        ))
     }
 }
 

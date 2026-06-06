@@ -15,8 +15,7 @@ fn main() {
         .unwrap()
         .join("schemas");
 
-    let protos = ["semantic_graph.proto", "training_pair.proto"]
-        .map(|name| schemas_dir.join(name));
+    let protos = ["semantic_graph.proto", "training_pair.proto"].map(|name| schemas_dir.join(name));
 
     for p in &protos {
         println!("cargo:rerun-if-changed={}", p.display());

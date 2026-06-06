@@ -2,7 +2,7 @@
 //!
 //! NatSQL v0.3 supports single-entity queries AND up to 3 INNER JOIN chains,
 //! HAVING clauses, and arithmetic expressions in SELECT. Subqueries, OUTER
-//! JOIN, set operations, and CTEs remain out of scope (v1.0).
+//! JOIN, set operations, and CTE support is intentionally explicit and tested.
 //!
 //! ## Two surfaces
 //!
@@ -27,7 +27,49 @@ use sqlparser::parser::Parser;
 pub mod ast;
 pub mod transpile;
 
-pub use ast::{Aggregate, Comparator, Condition, Field, JoinClause, NatSql, OrderDir, SelectItem, Value};
+pub use ast::{
+    Aggregate, Comparator, Condition, Field, JoinClause, NatSql, OrderDir, SelectItem, Value,
+};
+
+/// Validate that `text` is a single standard SQL `SELECT` surface.
+///
+/// This is intentionally broader than [`parse`]: it checks that sqlparser
+/// accepts the generated text as one plain SELECT statement, without forcing
+/// the query through the tiny NatSQL typed AST. The runtime uses it as a
+/// fail-closed Stage 4 escape hatch for valid SQL shapes that the current
+/// NatSQL IR cannot yet represent, such as `OR`, `IS NOT NULL`, aggregate
+/// `ORDER BY` keys, and longer join chains.
+pub fn validate_select_sql_surface(text: &str) -> Result<()> {
+    let dialect = GenericDialect {};
+    let stmts = Parser::parse_sql(&dialect, text)
+        .map_err(|e| SemsqlError::validation(format!("sql surface parse: {e}")))?;
+    if stmts.len() != 1 {
+        return Err(SemsqlError::validation(format!(
+            "expected exactly one statement, got {}",
+            stmts.len()
+        )));
+    }
+    let query = match &stmts[0] {
+        sql_ast::Statement::Query(q) => q.as_ref(),
+        other => {
+            return Err(SemsqlError::validation(format!(
+                "expected a SELECT statement, got {}",
+                other
+            )))
+        }
+    };
+    if query.with.is_some() {
+        return Err(SemsqlError::validation(
+            "SQL surface validation does not allow CTEs",
+        ));
+    }
+    match query.body.as_ref() {
+        sql_ast::SetExpr::Select(_) => Ok(()),
+        _ => Err(SemsqlError::validation(
+            "SQL surface validation allows only a plain SELECT body",
+        )),
+    }
+}
 
 /// Parse a concrete NatSQL string into the typed AST.
 ///
@@ -172,10 +214,7 @@ mod convert {
                 ));
             }
             // Only INNER JOINs are supported.
-            let is_inner = matches!(
-                join.join_operator,
-                sql_ast::JoinOperator::Inner(_)
-            );
+            let is_inner = matches!(join.join_operator, sql_ast::JoinOperator::Inner(_));
             if !is_inner {
                 return Err(SemsqlError::validation(
                     "natsql v0.3 only supports INNER JOIN (not LEFT, RIGHT, FULL, CROSS)",
@@ -239,8 +278,7 @@ mod convert {
     fn select_item_from(item: &sql_ast::SelectItem) -> Result<SelectItem> {
         match item {
             sql_ast::SelectItem::Wildcard(_) => Ok(SelectItem::Star),
-            sql_ast::SelectItem::UnnamedExpr(e)
-            | sql_ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+            sql_ast::SelectItem::UnnamedExpr(e) => {
                 if let Some((agg, inner)) = aggregate_from(e) {
                     let f = field_from_expr(&inner)?;
                     return Ok(SelectItem::Aggregate(agg, f));
@@ -251,6 +289,19 @@ mod convert {
                     return Ok(SelectItem::Field(f));
                 }
                 Ok(SelectItem::Expr(e.to_string()))
+            }
+            sql_ast::SelectItem::ExprWithAlias { expr: e, alias } => {
+                if let Some((agg, inner)) = aggregate_from(e) {
+                    let f = field_from_expr(&inner)?;
+                    let alias = CanonicalName::new(strip_quotes(alias.value.as_str()))?;
+                    return Ok(SelectItem::AliasedAggregate(agg, f, alias));
+                }
+                // Try plain field first; fall back to raw expression for
+                // arithmetic, CAST, and other complex constructs.
+                if let Ok(f) = field_from_expr(e) {
+                    return Ok(SelectItem::Field(f));
+                }
+                Ok(SelectItem::Expr(format!("{} AS {}", e, alias)))
             }
             sql_ast::SelectItem::QualifiedWildcard(_, _) => Err(SemsqlError::validation(
                 "natsql v0.3 does not support qualified wildcards",
@@ -281,7 +332,10 @@ mod convert {
             sql_ast::FunctionArg::Unnamed(sql_ast::FunctionArgExpr::Wildcard) => {
                 // COUNT(*) is `Aggregate(Count, Field::Bare("*"))` in our IR.
                 let name = CanonicalName::new("__star__").ok()?;
-                return Some((agg, sql_ast::Expr::Identifier(sql_ast::Ident::new(name.as_str()))));
+                return Some((
+                    agg,
+                    sql_ast::Expr::Identifier(sql_ast::Ident::new(name.as_str())),
+                ));
             }
             _ => return None,
         };
@@ -312,7 +366,12 @@ mod convert {
     }
 
     fn flatten_and(e: &sql_ast::Expr) -> Result<Vec<Condition>> {
-        if let sql_ast::Expr::BinaryOp { left, op: sql_ast::BinaryOperator::And, right } = e {
+        if let sql_ast::Expr::BinaryOp {
+            left,
+            op: sql_ast::BinaryOperator::And,
+            right,
+        } = e
+        {
             let mut out = flatten_and(left)?;
             out.extend(flatten_and(right)?);
             return Ok(out);
@@ -325,15 +384,28 @@ mod convert {
         match e {
             sql_ast::Expr::IsNull(inner) => Ok(Condition::IsNull(field_from_expr(inner)?)),
             sql_ast::Expr::IsNotNull(inner) => Ok(Condition::IsNotNull(field_from_expr(inner)?)),
-            sql_ast::Expr::Like { negated: false, expr, pattern, .. } => {
+            sql_ast::Expr::Like {
+                negated: false,
+                expr,
+                pattern,
+                ..
+            } => {
                 let f = field_from_expr(expr)?;
                 let pat = match pattern.as_ref() {
                     sql_ast::Expr::Value(sql_ast::Value::SingleQuotedString(s)) => s.clone(),
-                    other => return Err(SemsqlError::validation(format!("LIKE pattern must be a string literal, got {other}"))),
+                    other => {
+                        return Err(SemsqlError::validation(format!(
+                            "LIKE pattern must be a string literal, got {other}"
+                        )))
+                    }
                 };
                 Ok(Condition::Like(f, pat))
             }
-            sql_ast::Expr::InList { expr, list, negated: false } => {
+            sql_ast::Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
                 let f = field_from_expr(expr)?;
                 let vals = list.iter().map(value_from).collect::<Result<Vec<_>>>()?;
                 Ok(Condition::In(f, vals))
@@ -387,12 +459,13 @@ mod convert {
                         )))
                     }
                 }
-                sql_ast::Value::SingleQuotedString(s)
-                | sql_ast::Value::DoubleQuotedString(s) => Ok(Value::Str(s.clone())),
+                sql_ast::Value::SingleQuotedString(s) | sql_ast::Value::DoubleQuotedString(s) => {
+                    Ok(Value::Str(s.clone()))
+                }
                 sql_ast::Value::Boolean(b) => Ok(Value::Bool(*b)),
                 sql_ast::Value::Null => Ok(Value::Null),
                 sql_ast::Value::Placeholder(p) => {
-                    let name = p.trim_start_matches(|c: char| c == ':' || c == '@' || c == '$' || c == '?');
+                    let name = p.trim_start_matches([':', '@', '$', '?']);
                     Ok(Value::Param(name.to_string()))
                 }
                 other => Err(SemsqlError::validation(format!(
@@ -444,14 +517,13 @@ mod convert {
             None => return Ok(None),
         };
         match lim {
-            sql_ast::Expr::Value(sql_ast::Value::Number(n, _)) => n
-                .parse::<u32>()
-                .map(Some)
-                .map_err(|_| {
+            sql_ast::Expr::Value(sql_ast::Value::Number(n, _)) => {
+                n.parse::<u32>().map(Some).map_err(|_| {
                     SemsqlError::validation(format!(
                         "LIMIT must be a non-negative integer, got `{n}`"
                     ))
-                }),
+                })
+            }
             other => Err(SemsqlError::validation(format!(
                 "LIMIT must be a literal, got {other}"
             ))),
@@ -464,14 +536,13 @@ mod convert {
             None => return Ok(None),
         };
         match &off.value {
-            sql_ast::Expr::Value(sql_ast::Value::Number(n, _)) => n
-                .parse::<u32>()
-                .map(Some)
-                .map_err(|_| {
+            sql_ast::Expr::Value(sql_ast::Value::Number(n, _)) => {
+                n.parse::<u32>().map(Some).map_err(|_| {
                     SemsqlError::validation(format!(
                         "OFFSET must be a non-negative integer, got `{n}`"
                     ))
-                }),
+                })
+            }
             other => Err(SemsqlError::validation(format!(
                 "OFFSET must be a literal, got {other}"
             ))),
@@ -530,7 +601,20 @@ mod tests {
     #[test]
     fn parses_aggregate() {
         let q = parse("SELECT COUNT(*) FROM users").unwrap();
-        assert!(matches!(q.select[0], SelectItem::Aggregate(Aggregate::Count, _)));
+        assert!(matches!(
+            q.select[0],
+            SelectItem::Aggregate(Aggregate::Count, _)
+        ));
+    }
+
+    #[test]
+    fn parses_aggregate_alias() {
+        let q = parse("SELECT SUM(users.balance) AS total_amount FROM users").unwrap();
+        assert!(matches!(
+            &q.select[0],
+            SelectItem::AliasedAggregate(Aggregate::Sum, _, alias)
+                if alias.as_str() == "total_amount"
+        ));
     }
 
     #[test]
@@ -556,19 +640,15 @@ mod tests {
 
     #[test]
     fn accepts_inner_join() {
-        let q = parse(
-            "SELECT * FROM users INNER JOIN posts ON posts.author_id = users.id",
-        )
-        .expect("inner join should parse");
+        let q = parse("SELECT * FROM users INNER JOIN posts ON posts.author_id = users.id")
+            .expect("inner join should parse");
         assert_eq!(q.joins.len(), 1);
         assert_eq!(q.joins[0].entity.as_str(), "posts");
     }
 
     #[test]
     fn rejects_left_join() {
-        let r = parse(
-            "SELECT * FROM users LEFT JOIN posts ON posts.author_id = users.id",
-        );
+        let r = parse("SELECT * FROM users LEFT JOIN posts ON posts.author_id = users.id");
         assert!(r.is_err(), "LEFT JOIN must be rejected");
     }
 

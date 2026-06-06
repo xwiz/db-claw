@@ -1,104 +1,120 @@
-# SemanticSQL
+# SemanticSQL (DB-CLAW)
 
-> Open-source NL→SQL with a tiny multi-stage cascade. The SemanticGraph is the product. Vocabulary is canonical. Security is non-negotiable.
+> Ask your app's database questions in English. Get scoped SQL, not a guess.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
-[![Status](https://img.shields.io/badge/status-pre--alpha%20(v0.1)-orange.svg)](#roadmap)
+[![Status](https://img.shields.io/badge/status-v0.2%20working%20runtime-orange.svg)](#status)
 
-SemanticSQL converts natural-language questions into safe, scoped SQL by:
+SemanticSQL adds natural-language database questions to an existing app. It
+reads app labels, translations, API resources, ORM models, and database schema
+into a `.semsql` graph. SQL is emitted only when a question is
+grounded in that graph, scoped, rendered locally, and validated.
 
-1. Auto-extracting an auditable **SemanticGraph** from your codebase (frontend labels, i18n, API resources, ORM, DB) — frontend vocabulary is canonical.
-2. Running queries through a **~35 M-parameter cascade** of specialised tiny models, not a single large LLM.
-3. Validating + injecting mandatory tenant/RLS scoping through **sqlglot**, with an independent Rust second-pass parser.
-4. Rendering for any of 7 SQL dialects via sqlglot's emitter.
+If a question is vague, unsafe, or outside the graph, SemanticSQL rejects it or
+writes a typed handoff packet for reviewed/LLM-assisted plan proposals. The
+model does not get to execute its own SQL.
 
-The full design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+## Questions You Can Ask
 
-## Why a cascade
+```bash
+semsql query --graph app.semsql "how many active accounts signed up in February 2024?"
+semsql query --graph app.semsql "list active enterprise accounts in EMEA"
+semsql query --graph app.semsql "top 2 products by order amount"
+semsql query --graph app.semsql "find account ACME-001"
+```
 
-| Property                         | Single LLM (e.g. Qwen-0.5B) | SemanticSQL cascade   |
-| -------------------------------- | --------------------------- | --------------------- |
-| Total parameters                 | ~500 M                      | ~35 M                 |
-| Ship size (int8 ONNX)            | ~400 MB                     | ~40 MB                |
-| Median CPU latency               | 80–150 ms                   | 20–25 ms              |
-| Browser-deployable               | yes (heavy)                 | yes (under 50 MB)     |
-| Hallucinated tables / columns    | possible                    | structurally rejected |
-| Per-stage debuggability          | one black box               | five measurable steps |
-| Idiomatic NL ("bleeding money")  | hit-or-miss                 | deterministic         |
+And when the question is too loose or unsafe:
 
-Cascade research: [RESDSQL (AAAI 2023)](https://arxiv.org/pdf/2302.05965), [NatSQL (Findings EMNLP 2021)](https://aclanthology.org/2021.findings-emnlp.174/).
+```bash
+semsql query --graph app.semsql "show open things"                  # narrow it down
+semsql query --graph app.semsql "which customer is healthiest?"     # define the metric first
+semsql query --graph app.semsql "email all accounts with invoices"  # not a SQL query
+semsql query --graph app.semsql "list every ticket with all columns" # row dump
+```
 
-## Stack
+## Try It
 
-| Layer                              | Language    | Crate / package                                   |
-| ---------------------------------- | ----------- | ------------------------------------------------- |
-| SemanticGraph + intent + cascade   | Rust        | `semsql-graph`, `semsql-intent`, `semsql-runtime` |
-| NatSQL grammar + transpiler        | Rust        | `semsql-natsql`                                   |
-| SQL validator + filter injector    | Python      | `semsql_rewriter` (sqlglot)                       |
-| Independent second-pass validator  | Rust        | `semsql-second-pass` (sqlparser-rs)               |
-| SQL dialect renderer               | Rust        | `semsql-renderer`                                 |
-| Per-stage trainers + ONNX export   | Python      | `semsql_train`                                    |
-| Spider/BIRD + adversarial eval     | Python      | `semsql_eval`                                     |
-| Framework extractors               | TypeScript  | `packages/extractor-*`                            |
-| Intent pattern library             | YAML        | `intent-library/patterns.yaml`                    |
-| Canonical contract                 | Protobuf    | `schemas/semantic_graph.proto`                    |
+```bash
+semsql extract . --framework none --db-url postgres://localhost/myapp -o app.semsql
+semsql extract . --framework laravel --db-url "$DATABASE_URL" -o app.semsql
+semsql query --graph app.semsql "active students who joined last month"
+semsql query --graph app.semsql --query-frame-json frame.json "active students"
+semsql query --graph app.semsql \
+  --rejection-packet-json rejected.packet.json \
+  "which customer is healthiest?"
+semsql doctor --graph app.semsql
+```
+
+Resolve a rejected packet from a reviewed typed proposal:
+
+```bash
+uv run python -m semsql_eval llm-resolution-resolve-packet \
+  --packet-json rejected.packet.json \
+  --proposal-json reviewed.proposal.json \
+  --render-out render.json \
+  --strict
+```
+
+Optional provider path. Supported providers: `openai`, `groq`, `deepseek`, and
+`openai-compatible`. Missing config makes `0` provider calls and fails closed.
+
+```bash
+uv run python -m semsql_eval llm-resolution-fallback-query \
+  --graph app.semsql \
+  --question "which segment has the highest average revenue?" \
+  --provider openai \
+  --out target/fallback-smoke
+```
+
+## Laravel Alpha Shape
+
+```bash
+pnpm dlx --package @semsql/cli --package @semsql/extractor-cli \
+  semsql extract . \
+  --framework laravel \
+  --db-url "$DATABASE_URL" \
+  --no-sample-values \
+  -o storage/semsql/app.semsql
+pnpm dlx @semsql/cli doctor --graph storage/semsql/app.semsql
+pnpm dlx @semsql/cli query --graph storage/semsql/app.semsql "count active users"
+```
+
+## How It Works
+
+1. Extract app and database vocabulary into a `.semsql` graph.
+2. Build a `SemanticAtlas`: entities, fields, aliases, relationships, values,
+   roles, sensitivity, and metric hints.
+3. Turn a question into a typed `IntentFrame`.
+4. Bind it into a `BoundQueryPlan`.
+5. Render SQL only when the plan is grounded.
+6. Validate and optionally execute read-only with bounded previews.
+
+LLMs can help unresolved cases by proposing a typed plan over a bounded packet.
+Direct LLM SQL is rejected.
 
 ## Status
 
-Pre-alpha. v0.1 (rewriter foundation, no model) is in active development. See the [roadmap](docs/ARCHITECTURE.md#roadmap) for milestones.
+v0.2 is a working runtime line, not a broad benchmark-complete release.
 
-## Quick start (planned API for v0.2)
+Current proof points:
 
-```bash
-# Extract a SemanticGraph from a Laravel/Filament app
-semsql extract --framework laravel ./my-app -o my-app.semsql
+- promoted governed routes have `0` wrong accepted SQL;
+- MariaDB and Postgres probes pass read-only;
+- framework/source aliases flow through native `extract` when `semsql-extract`
+  is available;
+- direct LLM SQL, static example routers, and ambiguous sharded routes fail
+  closed;
+- broad BIRD remains poor after shortcut removal and is a research signal.
 
-# Or DB-only fallback
-semsql extract --framework none --db-url postgres://localhost/myapp -o my-app.semsql
+Detailed status lives in [docs/results/v02-current-status.md](docs/results/v02-current-status.md).
 
-# Query in natural language
-semsql query --graph my-app.semsql "active students who joined last month"
+## Docs
 
-# Inspect provenance + flag conflicts
-semsql doctor --graph my-app.semsql
-```
+- [Contributor docs](docs/README.md)
+- [Comparisons](docs/COMPARISONS.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Contributing](docs/CONTRIBUTING.md)
+- [Go-live packaging](docs/GO_LIVE.md)
+- [Results index](docs/results/README.md)
 
-## Browser spreadsheet demo
-
-A browser-only CSV and public Google Sheets demo lives in `packages/sheets-demo`. It imports `@semsql/sheets` and supports packaged use cases, public CSV/Google Sheets URLs, and local CSV uploads.
-
-```bash
-pnpm --filter @semsql/sheets-demo build
-python -m http.server 4173 --bind 127.0.0.1
-# http://127.0.0.1:4173/packages/sheets-demo/index.html
-```
-
-For GitHub Pages:
-
-```bash
-pnpm --filter @semsql/sheets-demo build:pages
-pnpm --filter @semsql/sheets-demo smoke:pages
-python -m http.server 4173 --bind 127.0.0.1 -d target/sheets-demo-pages
-# http://127.0.0.1:4173/
-```
-
-The `Sheets demo Pages` workflow deploys the artifact to `https://xwiz.github.io/db-claw/`.
-
-## Security
-
-SemanticSQL is designed with multi-tenant isolation as a hard requirement. Every generated query is:
-
-1. **Validated** by sqlglot (the same parser Apache Superset adopted to fix [CVE-2025-48912](https://www.miggo.io/vulnerability-database/cve/CVE-2025-48912)) against an allow-list of statement types.
-2. **Scoped** by the mandatory-filter injector, recursively across CTEs / UNION / lateral joins.
-3. **Re-validated** by an independent Rust parser (sqlparser-rs) — two parsers must agree.
-4. **Required to run alongside Postgres RLS** (or vendor equivalent) in production. `semsql doctor` blocks deployment if RLS is missing on tenanted tables.
-
-Every vocabulary fragment entering the SemanticGraph is sanitised at extraction time so untrusted lang-file or label content can never reach SQL.
-
-## License
-
-Dual-licensed under **Apache-2.0** and **MIT**, at your option.
-
-## Contributing
-
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md). Each layer has its own README — pick the language you know.
+License: dual **Apache-2.0** and **MIT**, at your option.

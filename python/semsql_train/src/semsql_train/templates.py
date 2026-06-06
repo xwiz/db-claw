@@ -28,12 +28,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional
 
 __all__ = [
-    "TemplateContext",
-    "Template",
     "TEMPLATES",
+    "Template",
+    "TemplateContext",
     "expand",
 ]
 
@@ -45,15 +44,15 @@ class TemplateContext:
     verb: str
     entity: str          # plural label, e.g. "students"
     entity_canonical: str  # canonical name, e.g. "users"
-    field: Optional[str] = None       # display label, e.g. "joined date"
-    field_canonical: Optional[str] = None  # canonical, e.g. "users.created_at"
-    operator: Optional[str] = None    # one of '=' '<' '>' '<=' '>=' '!='
-    value: Optional[str] = None       # rendered literal or :param
-    aggregate: Optional[str] = None   # COUNT/SUM/AVG/MIN/MAX
-    enum_label: Optional[str] = None  # for filter_enum
-    enum_raw_value: Optional[str] = None
-    limit: Optional[int] = None
-    order_dir: Optional[str] = None   # 'ASC' / 'DESC'
+    field: str | None = None       # display label, e.g. "joined date"
+    field_canonical: str | None = None  # canonical, e.g. "users.created_at"
+    operator: str | None = None    # one of '=' '<' '>' '<=' '>=' '!='
+    value: str | None = None       # rendered literal or :param
+    aggregate: str | None = None   # COUNT/SUM/AVG/MIN/MAX
+    enum_label: str | None = None  # for filter_enum
+    enum_raw_value: str | None = None
+    limit: int | None = None
+    order_dir: str | None = None   # 'ASC' / 'DESC'
 
 
 @dataclass(frozen=True)

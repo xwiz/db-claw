@@ -1,0 +1,18 @@
+{
+	"$schema": "https://biomejs.dev/schemas/1.9.3/schema.json",
+	"linter": {
+		"rules": {
+			"correctness": {
+				"noUnnecessaryContinue": "off"
+			},
+			"style": {
+				"noNonNullAssertion": "off",
+				"noUnusedTemplateLiteral": "off"
+			},
+			"suspicious": {
+				"noConfusingVoidType": "off",
+				"noImplicitAnyLet": "off"
+			}
+		}
+	}
+}

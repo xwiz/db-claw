@@ -4,18 +4,17 @@
 //! distilled T5-mini-class encoder-decoder exported to ONNX by
 //! `python/semsql_train/onnx_export.py`.
 //!
-//! Architecture (from `docs/stage2.md §2.2`):
+//! Architecture (from the Stage 2 training contract §2.2`):
 //!
 //!  - Encoder: 4 layers, d_model=384, 6 heads — processes the NL + schema
 //!    sentinel string (format defined in §2.3).
 //!  - Decoder: 4 layers, same dimensions — generates NatSQL tokens one by
 //!    one under a per-query Lark grammar enforced by llguidance. The grammar
-//!    is built from Stage 1's top-k schema items; only those identifiers are
-//!    valid productions, making hallucinated tables/columns structurally
-//!    impossible.
+//!    constrains placeholder NatSQL syntax and slot cardinality. Semantic
+//!    table/field/value binding happens downstream.
 //!
 //! Token decoding strategy: **greedy** (argmax after llguidance mask).
-//! Beam-search (size 4) is wired in `docs/stage2.md §2.4` but disabled by
+//! Beam-search (size 4) is wired in the Stage 2 training contract §2.4` but disabled by
 //! default; the latency trade-off (2× cost, ~2% skeleton-match lift) is not
 //! worth the default budget.
 //!
@@ -28,18 +27,18 @@
 //!  Grammar-compile cost (entity×field enumeration) is paid at
 //!  `compile_grammar()` call time, not per decoded token.
 
-use crate::grammar::GrammarSchema;
 #[cfg(feature = "onnx")]
 use crate::grammar::build_natsql_grammar;
+use crate::grammar::GrammarSchema;
 #[cfg(feature = "onnx")]
 use crate::onnx::{OnnxDecoder, OnnxEncoder};
 #[cfg(feature = "onnx")]
 use crate::tokenizer_bridge::OnnxTokEnv;
+#[cfg(feature = "onnx")]
+use llguidance::{Constraint, ParserFactory};
 use semsql_core::{Result, SemsqlError};
 #[cfg(feature = "onnx")]
 use std::path::Path;
-#[cfg(feature = "onnx")]
-use llguidance::{ParserFactory, TokenParser};
 #[cfg(feature = "onnx")]
 use tokenizers::Tokenizer;
 
@@ -52,11 +51,15 @@ const T5_PAD_ID: i64 = 0;
 #[cfg(feature = "onnx")]
 const T5_EOS_ID: i64 = 1;
 
-/// Hard cap on generated skeleton length. 96 tokens covers every NatSQL
-/// v0.2 skeleton observed in the Spider+BIRD training corpus; the grammar
-/// also enforces structural completeness so we rarely hit this limit.
+/// Hard cap on generated skeleton length.
+///
+/// BIRD dev contains long arithmetic/ranking skeletons with several joins and
+/// predicates. The old 96-token cap truncated otherwise-valid constrained
+/// decodes mid-placeholder or mid-keyword (`@`, `ORDER B`), which then looked
+/// like a semantic Stage 2 failure. Keep the cap bounded for latency, but high
+/// enough for those state-machine shapes to finish.
 #[cfg(feature = "onnx")]
-const MAX_DECODE_STEPS: usize = 96;
+const MAX_DECODE_STEPS: usize = 160;
 
 /// Result of one Stage 2 run.
 #[derive(Clone, Debug, Default)]
@@ -164,7 +167,12 @@ impl SkeletonGenerator {
         // SkeletonOutput.repair_attempts and parser_stats.
         parser_factory.quiet();
 
-        Ok(Self { encoder, decoder, tokenizer, parser_factory })
+        Ok(Self {
+            encoder,
+            decoder,
+            tokenizer,
+            parser_factory,
+        })
     }
 
     /// Generate a NatSQL skeleton for `source` (the formatted encoder input:
@@ -216,20 +224,15 @@ impl SkeletonGenerator {
         }
 
         // 2. Encoder forward pass.
-        let enc_hidden = self
-            .encoder
-            .encode(&src_ids, &src_mask, src_len)?;
+        let enc_hidden = self.encoder.encode(&src_ids, &src_mask, src_len)?;
         let hidden_size = self.encoder.hidden_size;
 
         // 3. Set up llguidance constraint for this query.
         //    The constraint is constructed per-query from the compiled grammar
         //    and the model vocabulary. It drives the token-level mask.
         let vocab_size = self.decoder.vocab_size;
-        let mut constraint = build_llguidance_constraint(
-            &compiled_grammar.lark,
-            &self.parser_factory,
-            vocab_size,
-        )?;
+        let mut constraint =
+            build_llguidance_constraint(&compiled_grammar.lark, &self.parser_factory, vocab_size)?;
 
         // 4. Greedy decode loop.
         let mut decode_ids: Vec<i64> = vec![T5_PAD_ID]; // T5 decoder starts with pad
@@ -242,7 +245,10 @@ impl SkeletonGenerator {
 
             // 4a. Compute llguidance token mask for this position.
             //     Returns a bit-vector of length vocab_size; 1 = allowed.
-            let mut mask = query_llguidance_mask(&mut constraint, vocab_size);
+            let mut mask = match query_llguidance_mask(&mut constraint, vocab_size)? {
+                LlgStep::Stop => break,
+                LlgStep::Sample(mask) => mask,
+            };
             // Apply repair-mode bans: tokens that triggered a previous
             // validation failure are forbidden regardless of grammar.
             for &banned in banned_token_ids {
@@ -254,13 +260,9 @@ impl SkeletonGenerator {
 
             // 4b. Decoder one step — pass full prefix so the non-KV-cache
             //     decoder ONNX can attend over all tokens generated so far.
-            let logits = self.decoder.step(
-                &decode_ids,
-                &enc_hidden,
-                &src_mask,
-                src_len,
-                hidden_size,
-            )?;
+            let logits =
+                self.decoder
+                    .step(&decode_ids, &enc_hidden, &src_mask, src_len, hidden_size)?;
 
             // 4c. Apply mask: set forbidden logits to −∞.
             let masked_logits = apply_token_mask(&logits, &mask);
@@ -269,21 +271,33 @@ impl SkeletonGenerator {
             let (next_id, logprob) = greedy_argmax_logprob(&masked_logits)?;
             log_probs.push(logprob);
 
-            // 4e. Check for EOS.
-            if next_id == T5_EOS_ID as usize {
+            // 4e. Commit the sampled token through llguidance. The high-level
+            // constraint owns forced-token and backtrack bookkeeping, which
+            // keeps the parser state aligned with the decoder prefix.
+            let commit = commit_llguidance_token(&mut constraint, next_id as u32)?;
+            if commit.backtrack > 0 {
+                let remove = commit.backtrack as usize;
+                if remove > decode_ids.len().saturating_sub(1) {
+                    return Err(SemsqlError::Other(
+                        "stage2_constraint_error: llguidance requested invalid backtrack".into(),
+                    ));
+                }
+                let keep = decode_ids.len() - remove;
+                decode_ids.truncate(keep);
+                for _ in 0..remove.min(log_probs.len()) {
+                    let _ = log_probs.pop();
+                }
+            }
+            for token in commit.tokens {
+                decode_ids.push(token as i64);
+            }
+            if commit.stop || next_id == T5_EOS_ID as usize {
                 break;
             }
-
-            // 4f. Commit the token to the constraint and accumulate.
-            commit_llguidance_token(&mut constraint, next_id as u32);
-            decode_ids.push(next_id as i64);
         }
 
         // 5. Decode the generated token ids back to text (strip the BOS pad).
-        let generated_ids: Vec<u32> = decode_ids[1..]
-            .iter()
-            .map(|&id| id as u32)
-            .collect();
+        let generated_ids: Vec<u32> = decode_ids[1..].iter().map(|&id| id as u32).collect();
         let skeleton = self
             .tokenizer
             .decode(&generated_ids, true)
@@ -371,25 +385,20 @@ pub struct CompiledGrammar {
 // llguidance per-step helpers — feature-gated
 // ---------------------------------------------------------------------------
 
-/// Per-query llguidance state — wraps a `TokenParser` driven via
-/// `compute_mask()` / `consume_token()`.
+/// Per-query llguidance state.
 #[cfg(feature = "onnx")]
 pub(crate) struct LlgConstraint {
-    /// llguidance parser. Holds the compiled automaton + the running
-    /// position; cloned cheaply from `ParserFactory` per query.
-    parser: TokenParser,
-    /// `true` once the parser has been moved past the prompt phase. The
-    /// llguidance API requires `process_prompt` (or `start_without_prompt`)
-    /// before `compute_mask`; we lazy-init on the first mask call.
-    started: bool,
+    /// High-level sampling constraint. It wraps the parser and handles
+    /// forced tokens/backtracking between `compute_mask()` and `commit_token()`.
+    constraint: Constraint,
 }
 
 /// Construct a fresh llguidance constraint for one generation run.
 ///
 /// Compiles the Lark grammar against the bound tokenizer (one-shot at
 /// `ParserFactory` creation; the per-call cost here is automaton
-/// instantiation only) and returns a `TokenParser` ready for
-/// `compute_mask()` / `consume_token()` driving from the decode loop.
+/// instantiation only) and returns a high-level constraint ready for
+/// `compute_mask()` / `commit_token()` driving from the decode loop.
 #[cfg(feature = "onnx")]
 fn build_llguidance_constraint(
     lark: &str,
@@ -401,27 +410,40 @@ fn build_llguidance_constraint(
     let parser = factory
         .create_parser(grammar)
         .map_err(|e| SemsqlError::Other(format!("llguidance parser create: {e}")))?;
-    let _ = vocab_size;  // sized at the call site for symmetry with the mask path
-    Ok(LlgConstraint { parser, started: false })
+    let _ = vocab_size; // sized at the call site for symmetry with the mask path
+    Ok(LlgConstraint {
+        constraint: Constraint::new(parser),
+    })
 }
 
-/// Returns a bitmask of allowed tokens at the current decode position.
-///
-/// Calls `TokenParser::compute_mask()` and converts the resulting
-/// `SimpleVob` into a `Vec<bool>` sized to the model vocabulary. On
-/// llguidance error (e.g. grammar accepts the current state but the
-/// automaton has no extension at all — usually because the schema slice
-/// has degenerated) we fall back to the permissive mask so the decoder
-/// can finish; the validator + repair-mode loop catches semantic faults
-/// downstream.
+/// One llguidance sampling step.
 #[cfg(feature = "onnx")]
-fn query_llguidance_mask(constraint: &mut LlgConstraint, vocab_size: usize) -> Vec<bool> {
-    if !constraint.started {
-        constraint.parser.start_without_prompt();
-        constraint.started = true;
-    }
-    match constraint.parser.compute_mask() {
-        Ok(vob) => {
+enum LlgStep {
+    Stop,
+    Sample(Vec<bool>),
+}
+
+/// Result of committing one sampled token.
+#[cfg(feature = "onnx")]
+struct LlgCommit {
+    stop: bool,
+    backtrack: u32,
+    tokens: Vec<u32>,
+}
+
+/// Returns a bitmask of allowed tokens at the current decode position, or
+/// `Stop` when the grammar is complete. llguidance errors fail closed so
+/// gated benchmark runs bucket them as `stage2_constraint_error`.
+#[cfg(feature = "onnx")]
+fn query_llguidance_mask(constraint: &mut LlgConstraint, vocab_size: usize) -> Result<LlgStep> {
+    match constraint.constraint.compute_mask() {
+        Ok(step) if step.is_stop() => Ok(LlgStep::Stop),
+        Ok(step) => {
+            let vob = step.sample_mask.as_ref().ok_or_else(|| {
+                SemsqlError::Other(
+                    "stage2_constraint_error: llguidance returned no sample mask".into(),
+                )
+            })?;
             let mut out = vec![false; vocab_size];
             for tok in vob.iter() {
                 let idx = tok as usize;
@@ -429,24 +451,27 @@ fn query_llguidance_mask(constraint: &mut LlgConstraint, vocab_size: usize) -> V
                     out[idx] = true;
                 }
             }
-            out
+            Ok(LlgStep::Sample(out))
         }
-        Err(_) => {
-            // Permissive fallback — the validator / repair loop
-            // catches structural drift after generation.
-            vec![true; vocab_size]
-        }
+        Err(e) => Err(SemsqlError::Other(format!(
+            "stage2_constraint_error: llguidance mask failed: {e}"
+        ))),
     }
 }
 
 /// Commit a generated token to the constraint state.
 #[cfg(feature = "onnx")]
-fn commit_llguidance_token(constraint: &mut LlgConstraint, token_id: u32) {
-    // Errors here mean the token violated the grammar — extremely rare
-    // because we only commit the argmax of an already-masked logits
-    // vector. Swallow and let the validator decide what to do; logging
-    // would belong to the cascade orchestrator's repair-mode bookkeeping.
-    let _ = constraint.parser.consume_token(token_id);
+fn commit_llguidance_token(constraint: &mut LlgConstraint, token_id: u32) -> Result<LlgCommit> {
+    match constraint.constraint.commit_token(Some(token_id)) {
+        Ok(commit) => Ok(LlgCommit {
+            stop: commit.stop,
+            backtrack: commit.backtrack,
+            tokens: commit.ff_tokens,
+        }),
+        Err(e) => Err(SemsqlError::Other(format!(
+            "stage2_constraint_error: llguidance commit failed for token {token_id}: {e}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,25 +554,28 @@ mod tests {
             value_slots: vec![],
         };
         let compiled = compile_grammar(&schema).expect("grammar must compile");
-        assert!(compiled.lark.contains("\"users\""));
-        assert!(compiled.lark.contains("\"orders\""));
+        assert!(compiled.lark.contains("\"@entity1\""));
+        assert!(compiled.lark.contains("\"@entity2\""));
+        assert!(compiled.lark.contains("\"@field1\""));
     }
 
     #[test]
     fn empty_schema_emits_an_unsatisfiable_grammar_but_still_compiles() {
-        let compiled = compile_grammar(&GrammarSchema::default())
-            .expect("sentinel grammar must still parse");
+        let compiled =
+            compile_grammar(&GrammarSchema::default()).expect("sentinel grammar must still parse");
         assert!(compiled.lark.contains("__no_entities__"));
     }
 
     #[test]
-    fn weird_canonical_names_compile_after_lark_escaping() {
+    fn weird_canonical_names_do_not_enter_placeholder_grammar() {
         let schema = GrammarSchema {
             entities: vec!["weird\"name".into()],
             fields: vec!["weird\"name.col".into()],
             value_slots: vec![],
         };
-        compile_grammar(&schema).expect("escaped quotes must compile");
+        let compiled = compile_grammar(&schema).expect("placeholder grammar must compile");
+        assert!(compiled.lark.contains("\"@entity1\""));
+        assert!(!compiled.lark.contains("weird"));
     }
 
     #[test]

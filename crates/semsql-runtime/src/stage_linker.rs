@@ -63,11 +63,7 @@ pub struct Linker {
 impl Linker {
     /// Load a linker model from the manifest's stage artifact and
     /// snapshot the SemanticGraph's vocabulary into entity/field lists.
-    pub fn load(
-        onnx_path: &Path,
-        tokenizer_path: &Path,
-        graph_path: &Path,
-    ) -> Result<Self> {
+    pub fn load(onnx_path: &Path, tokenizer_path: &Path, graph_path: &Path) -> Result<Self> {
         let model = OnnxCrossEncoder::load(onnx_path, tokenizer_path)?;
         let vocab = vocabulary(graph_path)?;
         let (entities, fields) = collect_schema_items(&vocab);
@@ -75,11 +71,12 @@ impl Linker {
             model,
             entities,
             fields,
-            // Spider training distribution: 1-2 entities, 1-3 fields.
-            // Sending more schema context degrades the skeleton decoder
-            // (out-of-distribution). Revise after Phase D retraining.
-            top_k_entities: 2,
-            top_k_fields: 4,
+            // Match the Stage 2 training/eval schema-slice distribution:
+            // BIRD p95 is 3 entities / 7 fields. Wider slices improve raw
+            // linker recall but pollute the T5 encoder prompt and produce
+            // extra tables/columns end-to-end.
+            top_k_entities: 3,
+            top_k_fields: 7,
             intent_bias: 0.3,
         })
     }
@@ -107,8 +104,12 @@ impl Linker {
 
         let entity_scores = self.model.score_batch(&entity_pairs)?;
         let field_scores_raw = self.model.score_batch(&field_pairs)?;
-        let field_scores =
-            apply_intent_bias(&self.fields, &field_scores_raw, intent_column_hints, self.intent_bias);
+        let field_scores = apply_intent_bias(
+            &self.fields,
+            &field_scores_raw,
+            intent_column_hints,
+            self.intent_bias,
+        );
 
         let top_entities = top_k(&self.entities, &entity_scores, self.top_k_entities);
         let top_fields = top_k(&self.fields, &field_scores, self.top_k_fields);
@@ -177,10 +178,8 @@ fn collect_schema_items(vocab: &[VocabularyEntry]) -> (Vec<String>, Vec<String>)
             "entity" => {
                 entities.insert(v.canonical_value.clone());
             }
-            "field" => {
-                if v.canonical_value.contains('.') {
-                    fields.insert(v.canonical_value.clone());
-                }
+            "field" if v.canonical_value.contains('.') => {
+                fields.insert(v.canonical_value.clone());
             }
             _ => {}
         }
@@ -229,12 +228,7 @@ mod tests {
     #[test]
     fn intent_bias_returns_input_on_length_mismatch() {
         // Defensive: caller bug shouldn't corrupt scores.
-        let biased = apply_intent_bias(
-            &["a.b".to_string()],
-            &[0.1, 0.2],
-            &["x".to_string()],
-            0.3,
-        );
+        let biased = apply_intent_bias(&["a.b".to_string()], &[0.1, 0.2], &["x".to_string()], 0.3);
         assert_eq!(biased, vec![0.1, 0.2]);
     }
 

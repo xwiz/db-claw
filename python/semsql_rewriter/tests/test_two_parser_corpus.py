@@ -23,7 +23,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from semsql_rewriter.injector import ScopeRule, inject
 
 _FIXTURE = (

@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
-use serde_json;
 
 use semsql_core::SemsqlError;
 use semsql_second_pass::{verify_with_dialect, Invariants, SqlDialect};

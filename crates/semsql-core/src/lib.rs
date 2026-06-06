@@ -18,7 +18,10 @@ pub mod proto {
     //! in that case this module is intentionally empty as well.
 
     #[cfg(feature = "build-protos")]
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proto_gen/semsql.v1.rs"));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/proto_gen/semsql.v1.rs"
+    ));
 }
 
 pub use error::{Result, SemsqlError};

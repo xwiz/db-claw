@@ -1,8 +1,13 @@
 {
   "name": "@semsql/extractor-laravel",
   "version": "0.1.0-dev",
-  "description": "Laravel + Filament extractor — i18n + Eloquent + Filament Resources/Forms/Tables. v0.1 priority.",
+  "description": "Laravel + Filament extractor — i18n, Eloquent, and Filament Resources/Forms/Tables.",
   "license": "Apache-2.0 OR MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xwiz/db-claw.git",
+    "directory": "packages/extractor-laravel"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,8 +18,13 @@
     }
   },
   "files": ["dist"],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"const fs=require('fs'); for (const p of ['dist','tsconfig.tsbuildinfo','tsconfig.build.tsbuildinfo']) fs.rmSync(p,{recursive:true,force:true})\"",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "prepack": "pnpm run build",
     "test": "vitest run",
     "lint": "biome check src",
     "typecheck": "tsc -p tsconfig.json --noEmit"

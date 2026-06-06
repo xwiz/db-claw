@@ -40,8 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 __all__ = [
-    "SlotFillerTrainConfig",
     "PreflightReport",
+    "SlotFillerTrainConfig",
     "build_dataset",
     "preflight",
     "train_slot_filler",
@@ -201,10 +201,10 @@ def train_slot_filler(cfg: SlotFillerTrainConfig) -> Path:
         # See note in trainers/skeleton.py — pandas/datasets MUST be
         # imported before torch/transformers on Python 3.13 + Windows or
         # Trainer.__init__ blows the OS stack via pandas._libs.tslibs.
-        import pandas  # noqa: F401
         import datasets  # noqa: F401
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
+        import pandas  # noqa: F401
+        import torch
+        import transformers
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "Stage 3 training requires `pip install semsql-train[ml]`."
@@ -283,8 +283,12 @@ def train_slot_filler(cfg: SlotFillerTrainConfig) -> Path:
         logging_steps=20,
         save_strategy="steps",
         save_steps=500,
-        save_total_limit=2,
-        eval_strategy="no",
+        save_total_limit=3,
+        eval_strategy="steps",
+        eval_steps=500,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         report_to=[],
         bf16=bf16,
         dataloader_pin_memory=torch.cuda.is_available(),
@@ -307,7 +311,8 @@ def train_slot_filler(cfg: SlotFillerTrainConfig) -> Path:
         trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = transformers.Trainer(**trainer_kwargs)
-    import glob, os
+    import glob
+    import os
     ckpts = sorted(
         glob.glob(os.path.join(str(cfg.output_dir), "checkpoint-*")),
         key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else 0,

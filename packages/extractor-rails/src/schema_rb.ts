@@ -27,14 +27,14 @@
  *    label is just the snake_case → space-separated form
  *    (`tenant_id` → "tenant id" → trailing-Id strip → "tenant").
  *
- * Skipped at v0.1:
+ * Deliberately skipped by this schema.rb reader:
  *
- *  - `t.references "user", foreign_key: true` — emits a relation,
- *    not just a column. Defer until the SemanticGraph relationship
- *    fragment shape lands.
- *  - `t.index ["a", "b"]` — index declarations don't add vocabulary.
- *  - `add_foreign_key`, `create_join_table` — relationship surface.
- *  - Migration files in `db/migrate/*.rb` — schema.rb is the
+ *  - `t.references "user", foreign_key: true` emits a relation,
+ *    not just a column; relationship extraction is handled by DB-backed
+ *    extractors until Rails has a dedicated relation reader.
+ *  - `t.index ["a", "b"]` does not add vocabulary.
+ *  - `add_foreign_key`, `create_join_table` relationship surface.
+ *  - Migration files in `db/migrate/*.rb`; schema.rb is the
  *    point-in-time truth. Migrations may declare columns that were
  *    later removed; relying on schema.rb gives one consistent view.
  *  - `enable_extension "pgcrypto"`, `add_check_constraint`, etc.
@@ -50,47 +50,47 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
-    sanitiseCanonical,
-    sanitiseLabel,
-    SanitiserError,
-    SourceLayer,
-    type VocabFragment,
+	SanitiserError,
+	SourceLayer,
+	type VocabFragment,
+	sanitiseCanonical,
+	sanitiseLabel,
 } from "@semsql/extractor-sdk";
 
 /** Result of scanning one project. */
 export interface SchemaRbScanResult {
-    fragments: VocabFragment[];
-    /** Files we recognised but couldn't fully parse. */
-    skipped: Array<{ file: string; reason: string }>;
+	fragments: VocabFragment[];
+	/** Files we recognised but couldn't fully parse. */
+	skipped: Array<{ file: string; reason: string }>;
 }
 
 const SCHEMA_PATH_CANDIDATES = ["db/schema.rb", "db/structure.sql"];
 
 /**
- * Find and parse `db/schema.rb` under `root`. We only support
- * `schema.rb` at v0.1; `structure.sql` (used when the schema_format
- * is `:sql`) lands in v0.5 alongside the migration walker.
+ * Find and parse `db/schema.rb` under `root`. `structure.sql` is
+ * intentionally deferred until the Rails extractor has a SQL/migration
+ * parser instead of a schema.rb-only reader.
  */
 export async function scanSchemaRb(root: string): Promise<SchemaRbScanResult> {
-    const result: SchemaRbScanResult = { fragments: [], skipped: [] };
-    for (const sub of SCHEMA_PATH_CANDIDATES) {
-        if (!sub.endsWith("schema.rb")) {
-            continue; // structure.sql deferred
-        }
-        const full = path.join(root, sub);
-        try {
-            const text = await fs.readFile(full, "utf8");
-            mergeInto(result, parseSchemaRb(full, text));
-        } catch {
-            // file missing
-        }
-    }
-    return result;
+	const result: SchemaRbScanResult = { fragments: [], skipped: [] };
+	for (const sub of SCHEMA_PATH_CANDIDATES) {
+		if (!sub.endsWith("schema.rb")) {
+			continue; // structure.sql deferred
+		}
+		const full = path.join(root, sub);
+		try {
+			const text = await fs.readFile(full, "utf8");
+			mergeInto(result, parseSchemaRb(full, text));
+		} catch {
+			// file missing
+		}
+	}
+	return result;
 }
 
 function mergeInto(into: SchemaRbScanResult, from: SchemaRbScanResult): void {
-    into.fragments.push(...from.fragments);
-    into.skipped.push(...from.skipped);
+	into.fragments.push(...from.fragments);
+	into.skipped.push(...from.skipped);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,40 +99,40 @@ function mergeInto(into: SchemaRbScanResult, from: SchemaRbScanResult): void {
 
 /** Parse the text of a `schema.rb` file. Exposed for unit tests. */
 export function parseSchemaRb(file: string, text: string): SchemaRbScanResult {
-    const result: SchemaRbScanResult = { fragments: [], skipped: [] };
-    for (const block of extractCreateTableBlocks(text)) {
-        emitTable(file, text, block, result);
-    }
-    return result;
+	const result: SchemaRbScanResult = { fragments: [], skipped: [] };
+	for (const block of extractCreateTableBlocks(text)) {
+		emitTable(file, text, block, result);
+	}
+	return result;
 }
 
 interface CreateTableBlock {
-    /** First arg to `create_table` — the DB table name. */
-    tableName: string;
-    /** Block body between `do |t|` and the matching `end`. */
-    body: string;
-    /** Byte offset of the `create_table` keyword in the source. */
-    indexInText: number;
+	/** First arg to `create_table` — the DB table name. */
+	tableName: string;
+	/** Block body between `do |t|` and the matching `end`. */
+	body: string;
+	/** Byte offset of the `create_table` keyword in the source. */
+	indexInText: number;
 }
 
 const CREATE_TABLE_RX =
-    /\bcreate_table\s+(['"])((?:\\.|(?!\1).)*)\1[^\n]*\bdo\s*\|\s*([A-Za-z_]\w*)\s*\|/g;
+	/\bcreate_table\s+(['"])((?:\\.|(?!\1).)*)\1[^\n]*\bdo\s*\|\s*([A-Za-z_]\w*)\s*\|/g;
 
 export function extractCreateTableBlocks(text: string): CreateTableBlock[] {
-    const stripped = stripRubyComments(text);
-    const out: CreateTableBlock[] = [];
-    for (const match of stripped.matchAll(CREATE_TABLE_RX)) {
-        const tableName = match[2]!;
-        const blockStart = (match.index ?? 0) + match[0].length;
-        const closeIdx = findMatchingBlockEnd(stripped, blockStart);
-        if (closeIdx < 0) continue;
-        out.push({
-            tableName,
-            body: text.slice(blockStart, closeIdx),
-            indexInText: match.index ?? 0,
-        });
-    }
-    return out;
+	const stripped = stripRubyComments(text);
+	const out: CreateTableBlock[] = [];
+	for (const match of stripped.matchAll(CREATE_TABLE_RX)) {
+		const tableName = match[2]!;
+		const blockStart = (match.index ?? 0) + match[0].length;
+		const closeIdx = findMatchingBlockEnd(stripped, blockStart);
+		if (closeIdx < 0) continue;
+		out.push({
+			tableName,
+			body: text.slice(blockStart, closeIdx),
+			indexInText: match.index ?? 0,
+		});
+	}
+	return out;
 }
 
 /**
@@ -143,94 +143,97 @@ export function extractCreateTableBlocks(text: string): CreateTableBlock[] {
  * confuse the matcher.
  */
 function findMatchingBlockEnd(text: string, startIdx: number): number {
-    // schema.rb block bodies use a small set of keywords that open a
-    // block requiring `end`. We tolerate any of them for safety, even
-    // if the autogenerated form only ever uses `do`.
-    const OPENERS = new Set([
-        "do",
-        "if",
-        "unless",
-        "begin",
-        "case",
-        "while",
-        "until",
-        "module",
-        "class",
-        "def",
-    ]);
-    let depth = 1;
-    let i = startIdx;
-    while (i < text.length) {
-        // Skip strings and comments — the stripping pass already
-        // removed comments, but strings are intact.
-        if (text[i] === "'" || text[i] === '"') {
-            i = skipString(text, i);
-            continue;
-        }
-        // Match a keyword token at a word boundary.
-        const ch = text[i]!;
-        if (/[A-Za-z_]/.test(ch) && !/\w/.test(text[i - 1] ?? " ")) {
-            const word = readWord(text, i);
-            if (word === "end") {
-                depth--;
-                i += 3;
-                if (depth === 0) return i - 3;
-                continue;
-            }
-            if (OPENERS.has(word)) {
-                // Modifier-`if`/`unless` (postfix) doesn't open a
-                // block. Detect by checking whether the next
-                // non-space char on the same line, AFTER the keyword,
-                // begins a block — heuristic: a modifier sits at the
-                // tail of a statement, so the keyword has non-space
-                // text BEFORE it on the same line.
-                if (
-                    (word === "if" || word === "unless" || word === "while" || word === "until") &&
-                    hasNonSpaceBeforeOnLine(text, i)
-                ) {
-                    i += word.length;
-                    continue;
-                }
-                depth++;
-                i += word.length;
-                continue;
-            }
-            i += word.length;
-            continue;
-        }
-        i++;
-    }
-    return -1;
+	// schema.rb block bodies use a small set of keywords that open a
+	// block requiring `end`. We tolerate any of them for safety, even
+	// if the autogenerated form only ever uses `do`.
+	const OPENERS = new Set([
+		"do",
+		"if",
+		"unless",
+		"begin",
+		"case",
+		"while",
+		"until",
+		"module",
+		"class",
+		"def",
+	]);
+	let depth = 1;
+	let i = startIdx;
+	while (i < text.length) {
+		// Skip strings and comments — the stripping pass already
+		// removed comments, but strings are intact.
+		if (text[i] === "'" || text[i] === '"') {
+			i = skipString(text, i);
+			continue;
+		}
+		// Match a keyword token at a word boundary.
+		const ch = text[i]!;
+		if (/[A-Za-z_]/.test(ch) && !/\w/.test(text[i - 1] ?? " ")) {
+			const word = readWord(text, i);
+			if (word === "end") {
+				depth--;
+				i += 3;
+				if (depth === 0) return i - 3;
+				continue;
+			}
+			if (OPENERS.has(word)) {
+				// Modifier-`if`/`unless` (postfix) doesn't open a
+				// block. Detect by checking whether the next
+				// non-space char on the same line, AFTER the keyword,
+				// begins a block — heuristic: a modifier sits at the
+				// tail of a statement, so the keyword has non-space
+				// text BEFORE it on the same line.
+				if (
+					(word === "if" ||
+						word === "unless" ||
+						word === "while" ||
+						word === "until") &&
+					hasNonSpaceBeforeOnLine(text, i)
+				) {
+					i += word.length;
+					continue;
+				}
+				depth++;
+				i += word.length;
+				continue;
+			}
+			i += word.length;
+			continue;
+		}
+		i++;
+	}
+	return -1;
 }
 
 function readWord(text: string, idx: number): string {
-    let j = idx;
-    while (j < text.length && /\w/.test(text[j]!)) j++;
-    return text.slice(idx, j);
+	let j = idx;
+	while (j < text.length && /\w/.test(text[j]!)) j++;
+	return text.slice(idx, j);
 }
 
 function hasNonSpaceBeforeOnLine(text: string, idx: number): boolean {
-    let i = idx - 1;
-    while (i >= 0 && text[i] !== "\n") {
-        if (!/\s/.test(text[i]!)) return true;
-        i--;
-    }
-    return false;
+	let i = idx - 1;
+	while (i >= 0 && text[i] !== "\n") {
+		if (!/\s/.test(text[i]!)) return true;
+		i--;
+	}
+	return false;
 }
 
 function skipString(text: string, idx: number): number {
-    const quote = text[idx]!;
-    let i = idx + 1;
-    while (i < text.length) {
-        const ch = text[i]!;
-        if (ch === "\\") {
-            i += 2;
-            continue;
-        }
-        if (ch === quote) return i + 1;
-        i++;
-    }
-    return text.length;
+	const quote = text[idx]!;
+	let i = idx + 1;
+	while (i < text.length) {
+		const ch = text[i]!;
+		if (ch === "\\") {
+			i += 2;
+			continue;
+		}
+		if (ch === quote) return i + 1;
+		i++;
+	}
+	return text.length;
 }
 
 /**
@@ -240,67 +243,71 @@ function skipString(text: string, idx: number): number {
  * are also handled defensively.
  */
 function stripRubyComments(text: string): string {
-    const buf = text.split("");
-    let i = 0;
-    let inStr: '"' | "'" | null = null;
-    let inBlock = false;
-    let lineStart = true;
-    while (i < buf.length) {
-        const ch = buf[i]!;
-        if (inBlock) {
-            // `=end` at start of line ends a block comment.
-            if (
-                lineStart &&
-                buf.slice(i, i + 4).join("") === "=end" &&
-                (buf[i + 4] === undefined || buf[i + 4] === "\n" || /\s/.test(buf[i + 4]!))
-            ) {
-                for (let k = 0; k < 4; k++) buf[i + k] = " ";
-                inBlock = false;
-                i += 4;
-                continue;
-            }
-            if (ch !== "\n") buf[i] = " ";
-            lineStart = ch === "\n";
-            i++;
-            continue;
-        }
-        if (inStr) {
-            if (ch === "\\") {
-                i += 2;
-                continue;
-            }
-            if (ch === inStr) inStr = null;
-            i++;
-            continue;
-        }
-        if (
-            lineStart &&
-            buf.slice(i, i + 6).join("") === "=begin" &&
-            (buf[i + 6] === undefined || buf[i + 6] === "\n" || /\s/.test(buf[i + 6]!))
-        ) {
-            for (let k = 0; k < 6; k++) buf[i + k] = " ";
-            inBlock = true;
-            i += 6;
-            continue;
-        }
-        if (ch === "#") {
-            while (i < buf.length && buf[i] !== "\n") {
-                buf[i] = " ";
-                i++;
-            }
-            lineStart = true;
-            continue;
-        }
-        if (ch === "'" || ch === '"') {
-            inStr = ch as '"' | "'";
-            i++;
-            lineStart = false;
-            continue;
-        }
-        lineStart = ch === "\n" || (lineStart && /\s/.test(ch));
-        i++;
-    }
-    return buf.join("");
+	const buf = text.split("");
+	let i = 0;
+	let inStr: '"' | "'" | null = null;
+	let inBlock = false;
+	let lineStart = true;
+	while (i < buf.length) {
+		const ch = buf[i]!;
+		if (inBlock) {
+			// `=end` at start of line ends a block comment.
+			if (
+				lineStart &&
+				buf.slice(i, i + 4).join("") === "=end" &&
+				(buf[i + 4] === undefined ||
+					buf[i + 4] === "\n" ||
+					/\s/.test(buf[i + 4]!))
+			) {
+				for (let k = 0; k < 4; k++) buf[i + k] = " ";
+				inBlock = false;
+				i += 4;
+				continue;
+			}
+			if (ch !== "\n") buf[i] = " ";
+			lineStart = ch === "\n";
+			i++;
+			continue;
+		}
+		if (inStr) {
+			if (ch === "\\") {
+				i += 2;
+				continue;
+			}
+			if (ch === inStr) inStr = null;
+			i++;
+			continue;
+		}
+		if (
+			lineStart &&
+			buf.slice(i, i + 6).join("") === "=begin" &&
+			(buf[i + 6] === undefined ||
+				buf[i + 6] === "\n" ||
+				/\s/.test(buf[i + 6]!))
+		) {
+			for (let k = 0; k < 6; k++) buf[i + k] = " ";
+			inBlock = true;
+			i += 6;
+			continue;
+		}
+		if (ch === "#") {
+			while (i < buf.length && buf[i] !== "\n") {
+				buf[i] = " ";
+				i++;
+			}
+			lineStart = true;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			inStr = ch as '"' | "'";
+			i++;
+			lineStart = false;
+			continue;
+		}
+		lineStart = ch === "\n" || (lineStart && /\s/.test(ch));
+		i++;
+	}
+	return buf.join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -308,63 +315,62 @@ function stripRubyComments(text: string): string {
 // ---------------------------------------------------------------------------
 
 interface RailsColumn {
-    /** DB-side column name. */
-    dbName: string;
-    /** AR type helper (`string`, `integer`, ...). */
-    typeHelper: string;
-    /** Byte offset within the block body — for line numbering. */
-    indexInBody: number;
-    /** True if this is a `t.references` declaration — emits a FK
-     *  column (`<name>_id`) plus implies a relation. We only emit the
-     *  column at v0.1; the relation surface is deferred. */
-    isReference: boolean;
+	/** DB-side column name. */
+	dbName: string;
+	/** AR type helper (`string`, `integer`, ...). */
+	typeHelper: string;
+	/** Byte offset within the block body — for line numbering. */
+	indexInBody: number;
+	/** True if this is a `t.references` declaration. We emit the FK
+	 *  column (`<name>_id`); relationship extraction is handled by
+	 *  DB-backed extractors until Rails has a dedicated relation reader. */
+	isReference: boolean;
 }
 
-const COLUMN_LINE_RX =
-    /\bt\.([A-Za-z_]\w*)\s+(['"])((?:\\.|(?!\2).)*)\2/g;
+const COLUMN_LINE_RX = /\bt\.([A-Za-z_]\w*)\s+(['"])((?:\\.|(?!\2).)*)\2/g;
 
 const SKIP_HELPERS = new Set([
-    "index",
-    "primary_key",
-    "check_constraint",
-    "foreign_key",
-    "timestamps", // `t.timestamps` declares created_at/updated_at — emitted separately
+	"index",
+	"primary_key",
+	"check_constraint",
+	"foreign_key",
+	"timestamps", // `t.timestamps` declares created_at/updated_at — emitted separately
 ]);
 
 const REFERENCE_HELPERS = new Set(["references", "belongs_to"]);
 
 export function extractColumns(body: string): RailsColumn[] {
-    const out: RailsColumn[] = [];
-    for (const match of body.matchAll(COLUMN_LINE_RX)) {
-        const typeHelper = match[1]!;
-        const dbName = match[3]!;
-        const idx = match.index ?? 0;
-        if (SKIP_HELPERS.has(typeHelper)) continue;
-        const isReference = REFERENCE_HELPERS.has(typeHelper);
-        out.push({
-            dbName: isReference ? `${dbName}_id` : dbName,
-            typeHelper,
-            indexInBody: idx,
-            isReference,
-        });
-    }
-    // Inject created_at / updated_at if `t.timestamps` is present.
-    if (/\bt\.timestamps\b/.test(body)) {
-        const idx = body.search(/\bt\.timestamps\b/);
-        out.push({
-            dbName: "created_at",
-            typeHelper: "datetime",
-            indexInBody: idx,
-            isReference: false,
-        });
-        out.push({
-            dbName: "updated_at",
-            typeHelper: "datetime",
-            indexInBody: idx,
-            isReference: false,
-        });
-    }
-    return out;
+	const out: RailsColumn[] = [];
+	for (const match of body.matchAll(COLUMN_LINE_RX)) {
+		const typeHelper = match[1]!;
+		const dbName = match[3]!;
+		const idx = match.index ?? 0;
+		if (SKIP_HELPERS.has(typeHelper)) continue;
+		const isReference = REFERENCE_HELPERS.has(typeHelper);
+		out.push({
+			dbName: isReference ? `${dbName}_id` : dbName,
+			typeHelper,
+			indexInBody: idx,
+			isReference,
+		});
+	}
+	// Inject created_at / updated_at if `t.timestamps` is present.
+	if (/\bt\.timestamps\b/.test(body)) {
+		const idx = body.search(/\bt\.timestamps\b/);
+		out.push({
+			dbName: "created_at",
+			typeHelper: "datetime",
+			indexInBody: idx,
+			isReference: false,
+		});
+		out.push({
+			dbName: "updated_at",
+			typeHelper: "datetime",
+			indexInBody: idx,
+			isReference: false,
+		});
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,65 +378,68 @@ export function extractColumns(body: string): RailsColumn[] {
 // ---------------------------------------------------------------------------
 
 function emitTable(
-    file: string,
-    text: string,
-    block: CreateTableBlock,
-    result: SchemaRbScanResult,
+	file: string,
+	text: string,
+	block: CreateTableBlock,
+	result: SchemaRbScanResult,
 ): void {
-    let canonicalEntity: string;
-    try {
-        canonicalEntity = sanitiseCanonical(block.tableName);
-    } catch (e) {
-        if (e instanceof SanitiserError) {
-            result.skipped.push({ file, reason: e.message });
-            return;
-        }
-        throw e;
-    }
-    const tableLine = lineOf(text, block.indexInText);
-    for (const col of extractColumns(block.body)) {
-        let canonicalField: string;
-        let label: string;
-        try {
-            canonicalField = sanitiseCanonical(col.dbName);
-            label = sanitiseLabel(prettyName(col.dbName));
-        } catch {
-            continue;
-        }
-        result.fragments.push({
-            term: label.toLowerCase(),
-            canonical: { kind: "field", field: `${canonicalEntity}.${canonicalField}` },
-            confidence: 0.8,
-            locator: {
-                file,
-                line: tableLine + countNewlines(block.body, col.indexInBody),
-                layer: SourceLayer.Orm,
-                extractor: "extractor-rails:schema.rb",
-            },
-        });
-    }
+	let canonicalEntity: string;
+	try {
+		canonicalEntity = sanitiseCanonical(block.tableName);
+	} catch (e) {
+		if (e instanceof SanitiserError) {
+			result.skipped.push({ file, reason: e.message });
+			return;
+		}
+		throw e;
+	}
+	const tableLine = lineOf(text, block.indexInText);
+	for (const col of extractColumns(block.body)) {
+		let canonicalField: string;
+		let label: string;
+		try {
+			canonicalField = sanitiseCanonical(col.dbName);
+			label = sanitiseLabel(prettyName(col.dbName));
+		} catch {
+			continue;
+		}
+		result.fragments.push({
+			term: label.toLowerCase(),
+			canonical: {
+				kind: "field",
+				field: `${canonicalEntity}.${canonicalField}`,
+			},
+			confidence: 0.8,
+			locator: {
+				file,
+				line: tableLine + countNewlines(block.body, col.indexInBody),
+				layer: SourceLayer.Orm,
+				extractor: "extractor-rails:schema.rb",
+			},
+		});
+	}
 }
 
 function prettyName(name: string): string {
-    // Rails columns are snake_case by convention; convert to space-
-    // separated, then strip a trailing `_id` so foreign-key columns
-    // get a human-friendly label (`tenant_id` → "tenant").
-    const stripped = name.replace(/_id$/i, "");
-    return stripped.replace(/_/g, " ").toLowerCase().trim() || name;
+	// Rails columns are snake_case by convention; convert to space-
+	// separated, then strip a trailing `_id` so foreign-key columns
+	// get a human-friendly label (`tenant_id` → "tenant").
+	const stripped = name.replace(/_id$/i, "");
+	return stripped.replace(/_/g, " ").toLowerCase().trim() || name;
 }
 
 function lineOf(text: string, idx: number): number {
-    let line = 1;
-    for (let i = 0; i < idx; i++) {
-        if (text[i] === "\n") line++;
-    }
-    return line;
+	let line = 1;
+	for (let i = 0; i < idx; i++) {
+		if (text[i] === "\n") line++;
+	}
+	return line;
 }
 
 function countNewlines(text: string, upTo: number): number {
-    let n = 0;
-    for (let i = 0; i < upTo; i++) {
-        if (text[i] === "\n") n++;
-    }
-    return n;
+	let n = 0;
+	for (let i = 0; i < upTo; i++) {
+		if (text[i] === "\n") n++;
+	}
+	return n;
 }

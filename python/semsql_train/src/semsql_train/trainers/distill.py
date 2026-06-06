@@ -46,8 +46,8 @@ from typing import Any
 __all__ = [
     "DistillConfig",
     "DistillReport",
-    "preflight",
     "distill_linker",
+    "preflight",
 ]
 
 
@@ -177,8 +177,8 @@ def distill_linker(cfg: DistillConfig) -> DistillReport:
         raise RuntimeError("distill preflight failed:\n" + "\n".join(f"  - {x}" for x in issues))
 
     try:
-        import torch  # noqa: F401
-        import torch.nn.functional as F  # noqa: N812
+        import torch
+        import torch.nn.functional as F
         from torch.optim import AdamW
         from torch.utils.data import DataLoader, Dataset
         from transformers import (

@@ -4,8 +4,8 @@
 //! `semsql_natsql::transpile::to_sql_text`. After validation +
 //! mandatory-filter injection, the dialect renderer here translates
 //! the NatSQL AST into a dialect-correct SQL string per target
-//! engine. v0.5 ships PostgreSQL + MySQL + SQLite. v1.0 adds MSSQL,
-//! BigQuery, Snowflake, DuckDB.
+//! engine. The enum includes the dialects covered by the renderer tests and
+//! integrations.
 //!
 //! Per-dialect concerns we handle:
 //!
@@ -28,33 +28,34 @@
 #![warn(missing_docs)]
 
 use semsql_core::{Result, SemsqlError};
-use semsql_natsql::ast::{Aggregate, Comparator, Condition, Field, NatSql, OrderDir, SelectItem, Value};
+use semsql_natsql::ast::{
+    Aggregate, Comparator, Condition, Field, NatSql, OrderDir, SelectItem, Value,
+};
 use std::fmt::Write;
 
 /// Target SQL dialects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
-    /// PostgreSQL — v0.1 default.
+    /// PostgreSQL.
     Postgres,
-    /// MySQL / MariaDB — v0.5.
+    /// MySQL / MariaDB.
     MySql,
-    /// SQLite — v0.5.
+    /// SQLite.
     Sqlite,
-    /// Microsoft SQL Server — v1.0.
+    /// Microsoft SQL Server.
     MsSql,
-    /// Google BigQuery — v1.0.
+    /// Google BigQuery.
     BigQuery,
-    /// Snowflake — v1.0.
+    /// Snowflake.
     Snowflake,
     /// DuckDB — used by the differential-render test.
     DuckDb,
 }
 
 impl Dialect {
-    /// Whether this dialect is supported in the current build. v1.0
-    /// covers every entry in the enum; the flag remains because future
-    /// dialect additions land disabled until validated against
-    /// integration suites.
+    /// Whether this dialect is supported in the current build. The flag remains
+    /// because future dialect additions may land disabled until validated
+    /// against integration suites.
     pub fn is_supported(self) -> bool {
         true
     }
@@ -72,10 +73,9 @@ impl Dialect {
         Ok(match self {
             // Standard SQL double-quote (case-preserving on PG, case-folding
             // to upper on Snowflake — both widely interoperable).
-            Dialect::Postgres
-            | Dialect::Sqlite
-            | Dialect::DuckDb
-            | Dialect::Snowflake => format!("\"{name}\""),
+            Dialect::Postgres | Dialect::Sqlite | Dialect::DuckDb | Dialect::Snowflake => {
+                format!("\"{name}\"")
+            }
             // BigQuery uses backticks for fully-qualified
             // `project.dataset.table` paths and accepts them on bare
             // identifiers too. Double quotes are *string literals* in
@@ -129,12 +129,6 @@ pub fn render(q: &NatSql, dialect: Dialect) -> Result<String> {
             "natsql AST has no entities — cannot render FROM clause",
         ));
     }
-    if q.entities.len() > 1 {
-        return Err(SemsqlError::validation(
-            "renderer v0.5 supports a single FROM entity",
-        ));
-    }
-
     let mut out = String::new();
     out.push_str("SELECT ");
     // MSSQL pivot:
@@ -144,9 +138,7 @@ pub fn render(q: &NatSql, dialect: Dialect) -> Result<String> {
     //     and `OFFSET` requires `ORDER BY` per the MSSQL spec — we
     //     surface that as a validation error rather than silently
     //     emitting non-deterministic SQL.
-    let mssql_use_top = !dialect.limit_clause_at_tail()
-        && q.offset.is_none()
-        && q.limit.is_some();
+    let mssql_use_top = !dialect.limit_clause_at_tail() && q.offset.is_none() && q.limit.is_some();
     if mssql_use_top {
         if let Some(n) = q.limit {
             write!(out, "TOP {n} ").expect("write");
@@ -164,6 +156,14 @@ pub fn render(q: &NatSql, dialect: Dialect) -> Result<String> {
     }
     out.push_str(" FROM ");
     out.push_str(&dialect.quote_ident(q.entities[0].as_str())?);
+    for join in &q.joins {
+        out.push_str(" INNER JOIN ");
+        out.push_str(&dialect.quote_ident(join.entity.as_str())?);
+        out.push_str(" ON ");
+        render_field(&mut out, &join.on_left, dialect)?;
+        out.push_str(" = ");
+        render_field(&mut out, &join.on_right, dialect)?;
+    }
 
     if !q.conditions.is_empty() {
         out.push_str(" WHERE ");
@@ -238,26 +238,86 @@ fn render_select_item(out: &mut String, item: &SelectItem, dialect: Dialect) -> 
         SelectItem::Star => out.push('*'),
         SelectItem::Field(f) => render_field(out, f, dialect)?,
         SelectItem::Aggregate(agg, f) => {
-            out.push_str(match agg {
-                Aggregate::Count => "COUNT",
-                Aggregate::Sum => "SUM",
-                Aggregate::Avg => "AVG",
-                Aggregate::Min => "MIN",
-                Aggregate::Max => "MAX",
-            });
-            out.push('(');
-            // Special case: COUNT over the synthetic `__star__` placeholder
-            // we emit at parse time becomes `COUNT(*)` on the way back out.
-            match f {
-                Field::Bare(name) if name.as_str() == "__star__" => out.push('*'),
-                _ => render_field(out, f, dialect)?,
-            }
-            out.push(')');
+            render_aggregate(out, *agg, f, dialect)?;
         }
-        // Raw arithmetic/CAST expressions from Stage 2 — emit verbatim.
-        // The second-pass parser validates them before injection.
-        SelectItem::Expr(raw) => out.push_str(raw),
+        SelectItem::AliasedAggregate(agg, f, alias) => {
+            render_aggregate(out, *agg, f, dialect)?;
+            out.push_str(" AS ");
+            out.push_str(&dialect.quote_ident(alias.as_str())?);
+        }
+        // Raw arithmetic/CAST expressions from Stage 2 and graph QueryFrame
+        // routes keep their expression text, but standard double-quoted
+        // identifiers still need the target dialect's identifier quoting.
+        SelectItem::Expr(raw) => render_raw_expr(out, raw, dialect)?,
     }
+    Ok(())
+}
+
+fn render_raw_expr(out: &mut String, raw: &str, dialect: Dialect) -> Result<()> {
+    let mut chars = raw.chars().peekable();
+    let mut in_single = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_backtick && !in_bracket => {
+                in_single = !in_single;
+                out.push(ch);
+            }
+            '`' if !in_single && !in_bracket => {
+                in_backtick = !in_backtick;
+                out.push(ch);
+            }
+            '[' if !in_single && !in_backtick => {
+                in_bracket = true;
+                out.push(ch);
+            }
+            ']' if !in_single && !in_backtick => {
+                in_bracket = false;
+                out.push(ch);
+            }
+            '"' if !in_single && !in_backtick && !in_bracket => {
+                let mut ident = String::new();
+                let mut closed = false;
+                for next in chars.by_ref() {
+                    if next == '"' {
+                        closed = true;
+                        break;
+                    }
+                    ident.push(next);
+                }
+                if closed && is_safe_identifier(&ident) {
+                    out.push_str(&dialect.quote_ident(&ident)?);
+                } else {
+                    out.push('"');
+                    out.push_str(&ident);
+                    if closed {
+                        out.push('"');
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    Ok(())
+}
+
+fn render_aggregate(out: &mut String, agg: Aggregate, f: &Field, dialect: Dialect) -> Result<()> {
+    out.push_str(match agg {
+        Aggregate::Count => "COUNT",
+        Aggregate::Sum => "SUM",
+        Aggregate::Avg => "AVG",
+        Aggregate::Min => "MIN",
+        Aggregate::Max => "MAX",
+    });
+    out.push('(');
+    // Special case: COUNT over the synthetic `__star__` placeholder
+    // we emit at parse time becomes `COUNT(*)` on the way back out.
+    match f {
+        Field::Bare(name) if name.as_str() == "__star__" => out.push('*'),
+        _ => render_field(out, f, dialect)?,
+    }
+    out.push(')');
     Ok(())
 }
 
@@ -405,7 +465,10 @@ mod tests {
 
     #[test]
     fn quotes_per_dialect() {
-        assert_eq!(Dialect::Postgres.quote_ident("users").unwrap(), r#""users""#);
+        assert_eq!(
+            Dialect::Postgres.quote_ident("users").unwrap(),
+            r#""users""#
+        );
         assert_eq!(Dialect::MySql.quote_ident("users").unwrap(), "`users`");
         assert_eq!(Dialect::MsSql.quote_ident("users").unwrap(), "[users]");
     }
@@ -457,6 +520,43 @@ mod tests {
     }
 
     #[test]
+    fn mysql_preserves_aggregate_alias_for_order_by() {
+        let sql = render_or_panic(
+            "SELECT products.name, SUM(orders.amount) AS total_amount \
+             FROM products INNER JOIN orders ON products.id = orders.product_id \
+             GROUP BY products.name ORDER BY total_amount DESC LIMIT 2",
+            Dialect::MySql,
+        );
+        assert_eq!(
+            sql,
+            "SELECT `products`.`name`, SUM(`orders`.`amount`) AS `total_amount` \
+             FROM `products` INNER JOIN `orders` ON `products`.`id` = `orders`.`product_id` \
+             GROUP BY `products`.`name` ORDER BY `total_amount` DESC LIMIT 2"
+        );
+    }
+
+    #[test]
+    fn mysql_requotes_raw_conditional_rate_expression_identifiers() {
+        let sql = render_or_panic(
+            "SELECT SUM(CASE WHEN \"domains\".\"is_spf_verified\" = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(\"domains\".\"id\"), 0) AS spf_verified_rate FROM domains",
+            Dialect::MySql,
+        );
+
+        assert!(
+            sql.contains("`domains`.`is_spf_verified` = 1"),
+            "mysql raw expression identifiers should use backticks: {sql}"
+        );
+        assert!(
+            sql.contains("NULLIF(COUNT(`domains`.`id`), 0)"),
+            "mysql raw expression denominator should use backticks: {sql}"
+        );
+        assert!(
+            !sql.contains("\"domains\""),
+            "mysql raw expression should not retain double-quoted identifiers: {sql}"
+        );
+    }
+
+    #[test]
     fn sqlite_emits_boolean_as_integer() {
         let sql = render_or_panic(
             "SELECT * FROM users WHERE users.is_active = TRUE",
@@ -500,12 +600,21 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_renders_inner_joins_with_quoted_identifiers() {
+        let sql = render_or_panic(
+            "SELECT COUNT(*) FROM account INNER JOIN order ON order.account_id = account.account_id",
+            Dialect::Sqlite,
+        );
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"account\" INNER JOIN \"order\" ON \"order\".\"account_id\" = \"account\".\"account_id\""
+        );
+    }
+
+    #[test]
     fn string_literal_escape_is_universal() {
         for d in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
-            let sql = render_or_panic(
-                "SELECT * FROM users WHERE users.name = 'O''Neil'",
-                d,
-            );
+            let sql = render_or_panic("SELECT * FROM users WHERE users.name = 'O''Neil'", d);
             assert!(sql.contains("'O''Neil'"), "dialect {d:?}: {sql}");
         }
     }
@@ -580,9 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn every_dialect_renders_the_v05_baseline_query() {
+    fn every_dialect_renders_the_baseline_query() {
         // Sanity guard: every dialect in the enum must round-trip
-        // the v0.5 fixture without erroring. Dialect-specific
+        // the baseline fixture without erroring. Dialect-specific
         // assertions live in the per-dialect tests above.
         for d in [
             Dialect::Postgres,
@@ -633,10 +742,7 @@ mod tests {
         // MySQL rejects bare `OFFSET m`; canonical workaround is
         // `LIMIT 18446744073709551615 OFFSET m`. Emit it implicitly
         // so authors don't have to special-case MySQL in NatSQL.
-        let sql = render_or_panic(
-            "SELECT * FROM users OFFSET 5",
-            Dialect::MySql,
-        );
+        let sql = render_or_panic("SELECT * FROM users OFFSET 5", Dialect::MySql);
         assert!(sql.contains("LIMIT 18446744073709551615"), "{sql}");
         assert!(sql.ends_with(" OFFSET 5"), "{sql}");
     }
@@ -644,10 +750,7 @@ mod tests {
     #[test]
     fn bigquery_synthesises_max_limit_when_offset_set_without_limit() {
         // BigQuery, like MySQL, requires LIMIT before OFFSET.
-        let sql = render_or_panic(
-            "SELECT * FROM users OFFSET 5",
-            Dialect::BigQuery,
-        );
+        let sql = render_or_panic("SELECT * FROM users OFFSET 5", Dialect::BigQuery);
         assert!(sql.contains("LIMIT 18446744073709551615"), "{sql}");
         assert!(sql.ends_with(" OFFSET 5"), "{sql}");
     }
@@ -738,11 +841,7 @@ mod tests {
                 );
                 // SELECT-list content survives. We strip the quoting
                 // chars so the comparison is dialect-blind.
-                let stripped = sql
-                    .replace('"', "")
-                    .replace('`', "")
-                    .replace('[', "")
-                    .replace(']', "");
+                let stripped = sql.replace(['"', '`', '[', ']'], "");
                 assert!(
                     stripped.starts_with("SELECT "),
                     "dialect {d:?} on `{input}` lost SELECT prefix: {sql}"
@@ -775,10 +874,7 @@ mod tests {
     #[test]
     fn null_renders_as_keyword_across_dialects() {
         for d in [Dialect::Postgres, Dialect::MySql, Dialect::Sqlite] {
-            let sql = render_or_panic(
-                "SELECT * FROM users WHERE users.deleted_at IS NULL",
-                d,
-            );
+            let sql = render_or_panic("SELECT * FROM users WHERE users.deleted_at IS NULL", d);
             assert!(sql.ends_with(" IS NULL"));
         }
     }

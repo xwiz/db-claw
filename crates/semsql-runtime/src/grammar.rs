@@ -1,12 +1,11 @@
 //! NatSQL → llguidance Lark grammar generator.
 //!
 //! Stage 2 (skeleton generator) decodes under a constrained grammar so
-//! the model cannot emit identifiers that don't exist in the live
-//! schema. The grammar is built **per-query** from Stage 1's top-k
-//! schema items — typically <20 entities and <100 fields — so the CFG
-//! stays tiny regardless of the underlying database size. This is the
-//! structural advantage of the cascade over a single-shot LLM: the
-//! grammar bounds the search space *exactly* to what's relevant.
+//! the model can emit only valid NatSQL shapes and placeholder slots
+//! such as `@entity1`, `@field1`, and `@val1`. The grammar is built
+//! per-query from Stage 1's top-k schema cardinalities so the slot
+//! vocabulary stays bounded, but it intentionally does not embed real
+//! table or column names. Semantic binding happens in Stage 3.
 //!
 //! Grammar surface (Lark dialect, llguidance-compatible):
 //!
@@ -21,18 +20,16 @@
 //! condition:    field CMP value
 //! CMP:          "=" | "!=" | "<" | ">" | "<=" | ">="
 //! ...
-//! entity:       "users" | "orders" | "tenants" | ...      (per-query)
-//! field:        "users.id" | "users.email" | ...           (per-query)
+//! entity:       "@entity1" | "@entity2" | ...              (per-query count)
+//! field:        "@field1" | "@field2" | ...                (per-query count)
 //! value:        "@val1" | "@val2" | ... | NUMBER | STRING
 //! ```
 //!
-//! `entity` and `field` are the only productions that vary per query —
-//! everything else is static and round-trips cleanly through the
-//! NatSQL parser in `semsql-natsql`.
+//! `entity`, `field`, and `value` placeholders are the only productions
+//! whose cardinality varies per query. Everything else is static and
+//! round-trips cleanly through the NatSQL parser in `semsql-natsql`.
+//! Placeholder literals are escaped defensively before they enter Lark.
 //!
-//! The generator escapes identifiers that contain Lark metacharacters
-//! (rare — canonical names are `[A-Za-z_][A-Za-z0-9_]*` so this is a
-//! defensive guard, not a hot path).
 
 use semsql_core::{Result, SemsqlError};
 use semsql_natsql::ast::{Condition, Field, NatSql, SelectItem};
@@ -42,15 +39,14 @@ use std::collections::BTreeSet;
 /// emits as its ranked top-k.
 #[derive(Clone, Debug, Default)]
 pub struct GrammarSchema {
-    /// Entity canonical names — drive the `entity` non-terminal.
+    /// Entity candidates. Only the count drives the `entity` non-terminal.
     pub entities: Vec<String>,
-    /// Field canonical names as `entity.field`. Drive the `field`
-    /// non-terminal. Each field MUST be qualified — the grammar emits
-    /// fully qualified references so the slot filler doesn't have to
-    /// re-disambiguate.
+    /// Field candidates as `entity.field`. Only the count drives the `field`
+    /// non-terminal. Concrete field names are validated after Stage 3 fills
+    /// the placeholders.
     pub fields: Vec<String>,
     /// Distinct value placeholders Stage 2 may emit. Defaults to
-    /// `@val1..@val4` if not supplied.
+    /// `@val1..@val16` if not supplied.
     pub value_slots: Vec<String>,
 }
 
@@ -66,34 +62,43 @@ pub fn build_natsql_grammar(schema: &GrammarSchema) -> String {
 
     out.push_str("start: select_stmt\n\n");
 
-    // v0.3: join_clause* allows up to 3 INNER JOINs after the FROM entity.
     out.push_str("select_stmt: \"SELECT\" select_list \"FROM\" entity ");
     out.push_str("join_clause* where_clause? group_clause? having_clause? ");
     out.push_str("order_clause? limit_clause? offset_clause?\n\n");
 
-    // select_list: v0.3 adds arithmetic expression (arith_expr).
-    out.push_str("select_list: \"*\" | arith_expr | aggregate | field_list\n");
-    out.push_str("field_list: field (\",\" field)*\n");
+    out.push_str("select_list: select_item (\",\" select_item)*\n");
+    out.push_str("select_item: \"*\" | arith_expr | aggregate | field\n");
     out.push_str("aggregate: AGG \"(\" (field | \"*\") \")\"\n");
     out.push_str("AGG: \"COUNT\" | \"SUM\" | \"AVG\" | \"MIN\" | \"MAX\"\n");
-    // Arithmetic: field / field or aggregate / field etc.
-    out.push_str("arith_expr: (field | aggregate) ARITH_OP (field | aggregate | NUMBER)\n");
+    out.push_str("arith_expr: arith_term ARITH_OP arith_term\n");
+    out.push_str("arith_term: field | aggregate | cast_expr | NUMBER\n");
+    out.push_str("cast_expr: \"CAST\" \"(\" field \"AS\" CAST_TYPE \")\"\n");
+    out.push_str("CAST_TYPE: \"REAL\" | \"FLOAT\" | \"NUMERIC\" | \"INTEGER\" | \"INT\"\n");
     out.push_str("ARITH_OP: \"/\" | \"*\" | \"+\" | \"-\"\n\n");
 
-    // JOIN clause: only INNER JOIN with ON field = field.
     out.push_str("join_clause: \"INNER\" \"JOIN\" entity \"ON\" field \"=\" field\n\n");
 
-    out.push_str("where_clause: \"WHERE\" condition (\"AND\" condition)*\n");
-    out.push_str("condition: field CMP value\n");
+    out.push_str("where_clause: \"WHERE\" condition\n");
+    out.push_str("condition: predicate ((\"AND\" | \"OR\") predicate)*\n");
+    out.push_str("predicate: comparable CMP value\n");
+    out.push_str("         | field \"BETWEEN\" value \"AND\" value\n");
+    out.push_str("         | field \"IN\" \"(\" value_list \")\"\n");
+    out.push_str("         | field \"LIKE\" value\n");
+    out.push_str("         | field \"IS\" \"NULL\"\n");
+    out.push_str("         | field \"IS\" \"NOT\" \"NULL\"\n");
+    out.push_str("         | \"NOT\" field \"IS\" \"NULL\"\n");
+    out.push_str("comparable: field | aggregate\n");
+    out.push_str("value_list: value (\",\" value)*\n");
     out.push_str("CMP: \"=\" | \"!=\" | \"<\" | \">\" | \"<=\" | \">=\"\n\n");
 
-    // HAVING: same structure as WHERE.
-    out.push_str("having_clause: \"HAVING\" condition (\"AND\" condition)*\n\n");
+    out.push_str("having_clause: \"HAVING\" having_condition\n");
+    out.push_str("having_condition: having_predicate ((\"AND\" | \"OR\") having_predicate)*\n");
+    out.push_str("having_predicate: comparable CMP value\n\n");
 
     out.push_str("group_clause: \"GROUP\" \"BY\" field (\",\" field)*\n");
-    out.push_str("order_clause: \"ORDER\" \"BY\" field (\"DESC\" | \"ASC\")?\n");
-    out.push_str("limit_clause: \"LIMIT\" INT\n");
-    out.push_str("offset_clause: \"OFFSET\" INT\n\n");
+    out.push_str("order_clause: \"ORDER\" \"BY\" comparable (\"DESC\" | \"ASC\")?\n");
+    out.push_str("limit_clause: \"LIMIT\" (INT | value)\n");
+    out.push_str("offset_clause: \"OFFSET\" (INT | value)\n\n");
 
     out.push_str(&entity_production(&schema.entities));
     out.push('\n');
@@ -117,10 +122,7 @@ fn entity_production(entities: &[String]) -> String {
         // correct: an empty schema can answer no queries.
         return "entity: \"__no_entities__\"\n".into();
     }
-    let alts: Vec<String> = sorted_unique(entities)
-        .into_iter()
-        .map(|e| format!("\"{}\"", lark_escape(&e)))
-        .collect();
+    let alts = numbered_slots("@entity", entities.len());
     format!("entity: {}\n", alts.join(" | "))
 }
 
@@ -128,16 +130,19 @@ fn field_production(fields: &[String]) -> String {
     if fields.is_empty() {
         return "field: \"__no_fields__\"\n".into();
     }
-    let alts: Vec<String> = sorted_unique(fields)
-        .into_iter()
-        .map(|f| format!("\"{}\"", lark_escape(&f)))
-        .collect();
+    let alts = numbered_slots("@field", fields.len());
     format!("field: {}\n", alts.join(" | "))
+}
+
+fn numbered_slots(prefix: &str, count: usize) -> Vec<String> {
+    (1..=count)
+        .map(|i| format!("\"{}{}\"", lark_escape(prefix), i))
+        .collect()
 }
 
 fn value_production(schema: &GrammarSchema) -> String {
     let slots: Vec<String> = if schema.value_slots.is_empty() {
-        vec!["@val1".into(), "@val2".into(), "@val3".into(), "@val4".into()]
+        (1..=16).map(|i| format!("@val{i}")).collect()
     } else {
         schema.value_slots.clone()
     };
@@ -149,11 +154,6 @@ fn value_production(schema: &GrammarSchema) -> String {
         "value: {} | NUMBER | STRING | \"true\" | \"false\" | \"NULL\"\n",
         slot_alts.join(" | ")
     )
-}
-
-fn sorted_unique(xs: &[String]) -> Vec<String> {
-    let set: BTreeSet<&str> = xs.iter().map(String::as_str).collect();
-    set.into_iter().map(str::to_string).collect()
 }
 
 /// Parse `skeleton` as NatSQL and check every entity/field
@@ -172,15 +172,10 @@ fn sorted_unique(xs: &[String]) -> Vec<String> {
 ///  - `SemsqlError::Validation` if NatSQL parsing fails.
 ///  - `SemsqlError::Validation` with a precise out-of-scope message
 ///    if any reference is absent from the schema slice.
-pub fn validate_skeleton_against_schema(
-    skeleton: &str,
-    schema: &GrammarSchema,
-) -> Result<NatSql> {
+pub fn validate_skeleton_against_schema(skeleton: &str, schema: &GrammarSchema) -> Result<NatSql> {
     let parsed = semsql_natsql::parse(skeleton)?;
-    let entity_set: BTreeSet<&str> =
-        schema.entities.iter().map(String::as_str).collect();
-    let field_set: BTreeSet<&str> =
-        schema.fields.iter().map(String::as_str).collect();
+    let entity_set: BTreeSet<&str> = schema.entities.iter().map(String::as_str).collect();
+    let field_set: BTreeSet<&str> = schema.fields.iter().map(String::as_str).collect();
     for entity in &parsed.entities {
         if !entity_set.contains(entity.as_str()) {
             return Err(SemsqlError::validation(format!(
@@ -225,7 +220,9 @@ fn check_field_iter(
     for item in items {
         match item {
             SelectItem::Star => {}
-            SelectItem::Field(f) | SelectItem::Aggregate(_, f) => {
+            SelectItem::Field(f)
+            | SelectItem::Aggregate(_, f)
+            | SelectItem::AliasedAggregate(_, f, _) => {
                 // `COUNT(*)` lowers to an `Aggregate(Count, Bare("__star__"))`
                 // placeholder during parsing; the transpiler renders it
                 // back as `*`. Skip schema validation for this synthetic.
@@ -333,22 +330,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn produces_alphabetised_deduplicated_alternatives() {
+    fn produces_placeholder_slots_from_schema_cardinality() {
         let schema = GrammarSchema {
             entities: vec!["users".into(), "orders".into(), "users".into()],
             fields: vec!["users.email".into(), "orders.id".into()],
             value_slots: vec![],
         };
         let g = build_natsql_grammar(&schema);
-        // Entities alphabetised + deduplicated.
         let entity_line = g.lines().find(|l| l.starts_with("entity:")).unwrap();
-        assert!(entity_line.contains("\"orders\""));
-        assert!(entity_line.contains("\"users\""));
-        assert_eq!(entity_line.matches("\"users\"").count(), 1, "deduplicated");
-        // `orders` precedes `users` lexicographically.
-        let o = entity_line.find("\"orders\"").unwrap();
-        let u = entity_line.find("\"users\"").unwrap();
-        assert!(o < u, "alphabetised");
+        assert!(entity_line.contains("\"@entity1\""));
+        assert!(entity_line.contains("\"@entity2\""));
+        assert!(entity_line.contains("\"@entity3\""));
+        assert!(!entity_line.contains("\"users\""));
+        assert!(!entity_line.contains("\"orders\""));
+
+        let field_line = g.lines().find(|l| l.starts_with("field:")).unwrap();
+        assert!(field_line.contains("\"@field1\""));
+        assert!(field_line.contains("\"@field2\""));
+        assert!(!field_line.contains("\"users.email\""));
+        assert!(!field_line.contains("\"orders.id\""));
     }
 
     #[test]
@@ -365,7 +365,7 @@ mod tests {
             fields: vec!["x.y".into()],
             value_slots: vec![],
         });
-        for slot in ["@val1", "@val2", "@val3", "@val4"] {
+        for slot in ["@val1", "@val2", "@val3", "@val4", "@val16"] {
             assert!(g.contains(slot), "expected {slot} in grammar");
         }
     }
@@ -379,11 +379,14 @@ mod tests {
         });
         assert!(g.contains("@param"));
         assert!(g.contains("@nl1"));
-        assert!(!g.contains("@val1"), "default slots replaced when caller supplies");
+        assert!(
+            !g.contains("@val1"),
+            "default slots replaced when caller supplies"
+        );
     }
 
     #[test]
-    fn escapes_lark_metacharacters_in_identifiers() {
+    fn placeholder_grammar_does_not_embed_hostile_identifiers() {
         // `is_safe_canonical` makes this defensive — but we still want
         // the escaper to work on hostile input that bypassed the gate.
         let schema = GrammarSchema {
@@ -392,8 +395,29 @@ mod tests {
             value_slots: vec![],
         };
         let g = build_natsql_grammar(&schema);
-        assert!(g.contains("\"weird\\\"name\""));
-        assert!(g.contains("\"weird\\\\name.col\""));
+        assert!(g.contains("\"@entity1\""));
+        assert!(g.contains("\"@field1\""));
+        assert!(!g.contains("weird"));
+    }
+
+    #[test]
+    fn grammar_covers_skeleton_eval_surface() {
+        let g = build_natsql_grammar(&GrammarSchema {
+            entities: vec!["a".into(), "b".into()],
+            fields: (1..=6).map(|i| format!("a.f{i}")).collect(),
+            value_slots: vec!["@val1".into(), "@val2".into()],
+        });
+        for needle in [
+            "select_item: \"*\" | arith_expr | aggregate | field",
+            "field \"BETWEEN\" value \"AND\" value",
+            "field \"LIKE\" value",
+            "(\"AND\" | \"OR\")",
+            "cast_expr",
+            "limit_clause: \"LIMIT\" (INT | value)",
+            "aggregate: AGG \"(\" (field | \"*\") \")\"",
+        ] {
+            assert!(g.contains(needle), "missing grammar surface: {needle}");
+        }
     }
 
     #[test]
@@ -417,12 +441,9 @@ mod tests {
             fields: vec!["users.id".into()],
             value_slots: vec![],
         };
-        let err = validate_skeleton_against_schema(
-            "SELECT orders.id FROM orders",
-            &schema,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = validate_skeleton_against_schema("SELECT orders.id FROM orders", &schema)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("orders"), "{err}");
         assert!(err.contains("schema slice"), "{err}");
     }
@@ -434,12 +455,9 @@ mod tests {
             fields: vec!["users.id".into()],
             value_slots: vec![],
         };
-        let err = validate_skeleton_against_schema(
-            "SELECT users.secret FROM users",
-            &schema,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = validate_skeleton_against_schema("SELECT users.secret FROM users", &schema)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("users.secret"), "{err}");
     }
 
@@ -450,10 +468,7 @@ mod tests {
             fields: vec!["users.email".into(), "users.id".into()],
             value_slots: vec![],
         };
-        let parsed = validate_skeleton_against_schema(
-            "SELECT email FROM users",
-            &schema,
-        );
+        let parsed = validate_skeleton_against_schema("SELECT email FROM users", &schema);
         assert!(parsed.is_ok(), "{:?}", parsed.err());
     }
 
@@ -464,12 +479,9 @@ mod tests {
             fields: vec!["users.id".into()],
             value_slots: vec![],
         };
-        let err = validate_skeleton_against_schema(
-            "SELECT phone FROM users",
-            &schema,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = validate_skeleton_against_schema("SELECT phone FROM users", &schema)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("phone"), "{err}");
     }
 

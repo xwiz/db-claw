@@ -174,10 +174,10 @@ def train_linker(cfg: LinkerTrainConfig) -> Path:
         # See note in trainers/skeleton.py — pandas/datasets MUST be
         # imported before torch/transformers on Python 3.13 + Windows or
         # Trainer.__init__ blows the OS stack via pandas._libs.tslibs.
-        import pandas  # noqa: F401
         import datasets  # noqa: F401
-        import torch  # noqa: F401
-        import transformers  # noqa: F401
+        import pandas  # noqa: F401
+        import torch
+        import transformers
     except ImportError as e:  # pragma: no cover — exercised only without ML extras
         raise RuntimeError(
             "Stage 1 training requires `pip install semsql-train[ml]`."
@@ -266,7 +266,8 @@ def train_linker(cfg: LinkerTrainConfig) -> Path:
         trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = transformers.Trainer(**trainer_kwargs)
-    import glob, os
+    import glob
+    import os
     ckpts = sorted(
         glob.glob(os.path.join(str(cfg.output_dir), "checkpoint-*")),
         key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else 0,

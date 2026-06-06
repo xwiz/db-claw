@@ -18,17 +18,16 @@ Rejected at the AST level:
   ``dblink``, etc. — engine-specific deny-list).
 - Multi-statement input.
 
-This v0.1 cut establishes the public surface and the allowlist core. Full
-schema cross-checks (every column exists on its table, every JOIN matches a
-known relationship edge) land alongside the SemanticGraph reader.
+Schema cross-checks and relationship-aware validation are layered around this
+allowlist in the rewriter/graph reader path.
 
 Reference: Apache Superset CVE-2025-48912.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import sqlglot
 from sqlglot import exp

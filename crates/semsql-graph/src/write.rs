@@ -9,7 +9,7 @@
 //! and the writer enforces it again as a defence-in-depth check.
 
 use crate::open;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use semsql_core::{Result, SemsqlError};
 use std::path::Path;
 
@@ -44,6 +44,22 @@ pub struct FieldInsert<'a> {
     pub enum_canonical: Option<&'a str>,
     /// Unit canonical name.
     pub unit_canonical: Option<&'a str>,
+}
+
+/// Insert a relationship edge between two entities.
+pub struct RelationshipInsert<'a> {
+    /// Source entity canonical name.
+    pub from_entity: &'a str,
+    /// Source field canonical name.
+    pub from_field: &'a str,
+    /// Target entity canonical name.
+    pub to_entity: &'a str,
+    /// Target field canonical name.
+    pub to_field: &'a str,
+    /// Relationship kind (`many_to_one`, `one_to_many`, ...).
+    pub kind: &'a str,
+    /// Optional human-readable relation name.
+    pub relation_name: Option<&'a str>,
 }
 
 /// Insert a vocabulary entry.
@@ -82,6 +98,52 @@ pub struct ScopeInsert<'a> {
     pub required_params_json: &'a str,
     /// Human-readable rule name.
     pub source_rule: Option<&'a str>,
+}
+
+/// Insert sampled values for a field.
+pub struct SampleValuesInsert<'a> {
+    /// Canonical field key, e.g. `users.status_code`.
+    pub field_canonical: &'a str,
+    /// JSON array of example values.
+    pub examples_json: &'a str,
+    /// Whether values were redacted because they may contain PII.
+    pub pii_redacted: bool,
+}
+
+/// Insert a governed metric definition.
+pub struct MetricDefinitionInsert<'a> {
+    /// Stable metric name, e.g. `lead_to_customer_conversion_rate`.
+    pub name: &'a str,
+    /// User-facing display label.
+    pub display_label: Option<&'a str>,
+    /// Metric kind (`conditional_rate` or `aggregate`).
+    pub metric_kind: &'a str,
+    /// Subject entity for the metric denominator.
+    pub subject_entity: &'a str,
+    /// Canonical numerator field, e.g. `leads.status`.
+    pub numerator_field: &'a str,
+    /// Numerator operator, e.g. `=`.
+    pub numerator_operator: &'a str,
+    /// Numerator value encoded as display/storage text.
+    pub numerator_value: &'a str,
+    /// Value evidence kind, e.g. `value_dictionary` or `metric_definition`.
+    pub numerator_value_kind: &'a str,
+    /// Canonical denominator field, e.g. `leads.id`.
+    pub denominator_field: &'a str,
+    /// Scale applied to the rate, usually `100.0`.
+    pub scale: f64,
+    /// Canonical measure field for aggregate metrics.
+    pub measure_field: Option<&'a str>,
+    /// Aggregate function for aggregate metrics (`AVG`, `SUM`, ...).
+    pub aggregate: Option<&'a str>,
+    /// Whether aggregate metrics should use DISTINCT over the measure field.
+    pub distinct_measure: bool,
+    /// JSON array of required entity canonical names.
+    pub required_entities_json: &'a str,
+    /// JSON array of user-facing aliases.
+    pub aliases_json: &'a str,
+    /// Optional JSON locator (file/line/extractor).
+    pub source_locator: Option<&'a str>,
 }
 
 /// Open a writer connection. Shorthand for [`open`] with a more
@@ -128,6 +190,29 @@ pub fn insert_field(conn: &Connection, f: FieldInsert<'_>) -> Result<()> {
         ],
     )
     .map_err(|err| SemsqlError::Other(format!("insert_field: {err}")))?;
+    Ok(())
+}
+
+/// Insert a relationship edge. Idempotent on all join-defining columns.
+pub fn insert_relationship(conn: &Connection, r: RelationshipInsert<'_>) -> Result<()> {
+    check_canonical(r.from_entity)?;
+    check_canonical(r.from_field)?;
+    check_canonical(r.to_entity)?;
+    check_canonical(r.to_field)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO relationships \
+         (from_entity, from_field, to_entity, to_field, kind, relation_name, proto_blob) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, X'')",
+        params![
+            r.from_entity,
+            r.from_field,
+            r.to_entity,
+            r.to_field,
+            r.kind,
+            r.relation_name,
+        ],
+    )
+    .map_err(|err| SemsqlError::Other(format!("insert_relationship: {err}")))?;
     Ok(())
 }
 
@@ -179,9 +264,7 @@ pub fn insert_enum(conn: &Connection, e: EnumInsert<'_>) -> Result<()> {
 
 fn ensure_enum_values_column(conn: &Connection) -> Result<()> {
     let exists: bool = conn
-        .prepare(
-            "SELECT 1 FROM pragma_table_info('enums') WHERE name = '_enum_values_json'",
-        )
+        .prepare("SELECT 1 FROM pragma_table_info('enums') WHERE name = '_enum_values_json'")
         .map_err(|e| SemsqlError::Other(format!("pragma probe prepare: {e}")))?
         .exists([])
         .map_err(|e| SemsqlError::Other(format!("pragma probe: {e}")))?;
@@ -221,13 +304,70 @@ pub fn insert_scope(conn: &Connection, s: ScopeInsert<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Insert sampled field values. Idempotent on the field canonical key.
+pub fn insert_sample_values(conn: &Connection, s: SampleValuesInsert<'_>) -> Result<()> {
+    let Some((entity, field)) = s.field_canonical.split_once('.') else {
+        return Err(SemsqlError::InvalidIdentifier(
+            s.field_canonical.to_string(),
+        ));
+    };
+    check_canonical(entity)?;
+    check_canonical(field)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sample_values \
+         (field_canonical, examples, pii_redacted) VALUES (?1, ?2, ?3)",
+        params![
+            s.field_canonical,
+            s.examples_json,
+            i32::from(s.pii_redacted)
+        ],
+    )
+    .map_err(|err| SemsqlError::Other(format!("insert_sample_values: {err}")))?;
+    Ok(())
+}
+
+/// Insert a metric definition. Idempotent on the metric name.
+pub fn insert_metric_definition(conn: &Connection, m: MetricDefinitionInsert<'_>) -> Result<()> {
+    check_canonical(m.name)?;
+    check_canonical(m.subject_entity)?;
+    check_field_canonical(m.numerator_field)?;
+    check_field_canonical(m.denominator_field)?;
+    if let Some(measure_field) = m.measure_field {
+        check_field_canonical(measure_field)?;
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO metric_definitions \
+         (name, display_label, metric_kind, subject_entity, numerator_field, \
+         numerator_operator, numerator_value, numerator_value_kind, \
+          denominator_field, scale, required_entities_json, aliases_json, source_locator, \
+          measure_field, aggregate, distinct_measure) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            m.name,
+            m.display_label,
+            m.metric_kind,
+            m.subject_entity,
+            m.numerator_field,
+            m.numerator_operator,
+            m.numerator_value,
+            m.numerator_value_kind,
+            m.denominator_field,
+            m.scale,
+            m.required_entities_json,
+            m.aliases_json,
+            m.source_locator,
+            m.measure_field,
+            m.aggregate,
+            i32::from(m.distinct_measure),
+        ],
+    )
+    .map_err(|err| SemsqlError::Other(format!("insert_metric_definition: {err}")))?;
+    Ok(())
+}
+
 /// Stamp the application metadata. Run once after the writer has finished
 /// inserting so downstream readers see a stable `schema_hash`.
-pub fn stamp_metadata(
-    conn: &Connection,
-    application_name: &str,
-    schema_hash: &str,
-) -> Result<()> {
+pub fn stamp_metadata(conn: &Connection, application_name: &str, schema_hash: &str) -> Result<()> {
     for (k, v) in [
         ("application_name", application_name),
         ("schema_hash", schema_hash),
@@ -253,6 +393,15 @@ fn check_canonical(name: &str) -> Result<()> {
     if bytes.any(|b| !(b.is_ascii_alphanumeric() || b == b'_')) {
         return Err(SemsqlError::InvalidIdentifier(name.to_string()));
     }
+    Ok(())
+}
+
+fn check_field_canonical(field: &str) -> Result<()> {
+    let Some((entity, name)) = field.split_once('.') else {
+        return Err(SemsqlError::InvalidIdentifier(field.to_string()));
+    };
+    check_canonical(entity)?;
+    check_canonical(name)?;
     Ok(())
 }
 

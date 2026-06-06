@@ -21,12 +21,12 @@ from pathlib import Path
 from .injector import ScopeRule
 
 __all__ = [
+    "SUPPORTED_SCHEMA_VERSION",
     "Entity",
-    "Field",
     "EnumDef",
+    "Field",
     "GraphReadError",
     "GraphSnapshot",
-    "SUPPORTED_SCHEMA_VERSION",
     "load_graph",
     "load_scope_rules",
     "schema_version",
@@ -166,7 +166,7 @@ class Relationship:
 
     Represents a FK-style edge between two entities. Surfaced so the
     Stage 2 trainer can render JOIN structure into encoder input
-    (Phase C — see `docs/completion-plan.md` Decision 4).
+    (Phase C — see the current architecture/status notes Decision 4).
     """
 
     from_entity: str

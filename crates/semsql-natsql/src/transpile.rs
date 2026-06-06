@@ -104,25 +104,33 @@ fn render_select_item(out: &mut String, item: &SelectItem) -> Result<()> {
         SelectItem::Star => out.push('*'),
         SelectItem::Field(f) => render_field(out, f),
         SelectItem::Aggregate(agg, f) => {
-            out.push_str(match agg {
-                Aggregate::Count => "COUNT",
-                Aggregate::Sum => "SUM",
-                Aggregate::Avg => "AVG",
-                Aggregate::Min => "MIN",
-                Aggregate::Max => "MAX",
-            });
-            out.push('(');
-            // Special case: COUNT over the synthetic `__star__` placeholder
-            // we emit at parse time becomes `COUNT(*)` on the way back out.
-            match f {
-                Field::Bare(name) if name.as_str() == "__star__" => out.push('*'),
-                _ => render_field(out, f),
-            }
-            out.push(')');
+            render_aggregate(out, *agg, f);
+        }
+        SelectItem::AliasedAggregate(agg, f, alias) => {
+            render_aggregate(out, *agg, f);
+            write!(out, " AS {}", alias.as_str()).expect("write");
         }
         SelectItem::Expr(raw) => out.push_str(raw),
     }
     Ok(())
+}
+
+fn render_aggregate(out: &mut String, agg: Aggregate, f: &Field) {
+    out.push_str(match agg {
+        Aggregate::Count => "COUNT",
+        Aggregate::Sum => "SUM",
+        Aggregate::Avg => "AVG",
+        Aggregate::Min => "MIN",
+        Aggregate::Max => "MAX",
+    });
+    out.push('(');
+    // Special case: COUNT over the synthetic `__star__` placeholder
+    // we emit at parse time becomes `COUNT(*)` on the way back out.
+    match f {
+        Field::Bare(name) if name.as_str() == "__star__" => out.push('*'),
+        _ => render_field(out, f),
+    }
+    out.push(')');
 }
 
 fn render_field(out: &mut String, f: &Field) {
@@ -353,6 +361,32 @@ mod tests {
         round_trip(
             "SELECT CAST(frpm.free_meals AS REAL) / frpm.enrollment FROM frpm",
             "SELECT CAST(frpm.free_meals AS REAL) / frpm.enrollment FROM frpm",
+        );
+    }
+
+    #[test]
+    fn broader_sql_surface_accepts_valid_selects_outside_typed_ir() {
+        crate::validate_select_sql_surface(
+            "SELECT schools.city FROM schools GROUP BY schools.city ORDER BY COUNT(*) DESC LIMIT 1",
+        )
+        .expect("aggregate ORDER BY should be a valid SQL surface");
+        crate::validate_select_sql_surface(
+            "SELECT schools.website FROM schools WHERE NOT schools.website IS NULL",
+        )
+        .expect("NOT x IS NULL should be a valid SQL surface");
+        crate::validate_select_sql_surface(
+            "SELECT schools.county FROM schools WHERE schools.county = 'A' OR schools.county = 'B'",
+        )
+        .expect("OR should be a valid SQL surface");
+    }
+
+    #[test]
+    fn broader_sql_surface_rejects_non_selects_and_malformed_sql() {
+        assert!(crate::validate_select_sql_surface("DELETE FROM users").is_err());
+        assert!(crate::validate_select_sql_surface("SELECT * FROM").is_err());
+        assert!(
+            crate::validate_select_sql_surface("SELECT * FROM users; SELECT * FROM orders")
+                .is_err()
         );
     }
 

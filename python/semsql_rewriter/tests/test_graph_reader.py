@@ -7,10 +7,9 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from semsql_rewriter.graph_reader import (
-    GraphReadError,
     SUPPORTED_SCHEMA_VERSION,
+    GraphReadError,
     load_scope_rules,
     schema_version,
 )

@@ -41,17 +41,18 @@ descended into; lateral subqueries are treated like any other Select.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping
 
 import sqlglot
 from sqlglot import exp
 
 __all__ = [
+    "AuditLogWriter",
+    "InjectionResult",
     "InjectorError",
     "ScopeRule",
-    "InjectionResult",
-    "AuditLogWriter",
     "inject",
 ]
 
@@ -344,15 +345,15 @@ class AuditLogWriter:
     flushed per call so partial writes don't leave the log torn.
     """
 
-    def __init__(self, path: str | bytes | "os.PathLike[str]") -> None:
+    def __init__(self, path: str | bytes | os.PathLike[str]) -> None:
         self.path = str(path)
 
     def record(self, query_id: str, result: InjectionResult) -> int:
         """Append one entry per injection in ``result``. Returns the
         number of entries written."""
         import datetime
-        import os
         import json as _json
+        import os
 
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         # `os` import inlined here so the type-import in the signature

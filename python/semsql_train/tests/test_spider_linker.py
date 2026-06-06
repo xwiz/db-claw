@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from semsql_train.spider_linker import (
     SpiderLinkerConfig,
     extract_referenced_items,

@@ -26,8 +26,8 @@ from __future__ import annotations
 import hashlib
 import random
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 __all__ = [
     "ParaphraseConfig",

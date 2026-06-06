@@ -85,9 +85,15 @@ macro_rules! canonical_newtype {
     };
 }
 
-canonical_newtype!(EntityName, "Entity-canonical name (matches DB table unless overridden).");
+canonical_newtype!(
+    EntityName,
+    "Entity-canonical name (matches DB table unless overridden)."
+);
 canonical_newtype!(EnumName, "Enum-canonical name, e.g. `users.status_code`.");
-canonical_newtype!(IntentType, "Intent type key, matches an entry in `intent-library/patterns.yaml`.");
+canonical_newtype!(
+    IntentType,
+    "Intent type key, matches an entry in `intent-library/patterns.yaml`."
+);
 
 /// A field reference: `entity.field`. Stored as two `CanonicalName`s rather
 /// than a dotted string to keep validation airtight.

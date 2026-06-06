@@ -1,0 +1,460 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, for example v0.1.0-alpha.1"
+        required: true
+        default: "v0.1.0-alpha.1"
+      draft:
+        description: "Create the release as a draft when it does not already exist"
+        required: true
+        type: boolean
+        default: true
+      publish_npm:
+        description: "Publish npm packages and run the public package smoke. Requires draft=false and NPM_TOKEN."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-binaries-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-preflight:
+    name: Release source guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      DRAFT_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
+      PUBLISH_NPM: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release inputs
+        run: |
+          set -euo pipefail
+          python scripts/check_release_versions.py --tag "$RELEASE_TAG" --validate-release-tag-only
+          if [ "$PUBLISH_NPM" = "true" ] && [ "$DRAFT_RELEASE" = "true" ]; then
+            echo "::error::publish_npm=true requires draft=false so public package smoke can run against released assets."
+            exit 1
+          fi
+
+      - name: Static query-shortcut audit
+        run: python scripts/audit_static_query_shortcuts.py
+
+      - name: Artifact guard
+        run: python scripts/check_git_artifacts.py --all
+
+      - name: Docs hygiene
+        run: >
+          python scripts/check_docs_hygiene.py
+          --fail-current-looking
+          --fail-unregistered-current-looking
+          --fail-large-retained
+          --fail-missing-historical-banner
+          --top 12
+
+  release-rust-quality:
+    name: Release Rust quality gate
+    needs: [release-preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-quality-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-quality-
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test default features
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Install ONNX Runtime
+        run: |
+          set -euo pipefail
+          ORT_VERSION=1.18.1
+          curl -sSL -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          mkdir -p /tmp/ort && tar -xzf /tmp/ort.tgz -C /tmp/ort --strip-components=1
+          echo "ORT_DYLIB_PATH=/tmp/ort/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+
+      - name: Test ONNX feature path
+        run: cargo test -p semsql-runtime --features onnx --locked
+
+  release-python-quality:
+    name: Release Python quality gate
+    needs: [release-preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: pipx install uv
+
+      - name: Sync workspace
+        run: uv sync --all-extras
+
+      - name: Lint
+        run: uv run ruff check python
+
+      - name: Typecheck
+        run: uv run mypy python
+
+      - name: Test
+        run: uv run pytest python -q
+
+  release-product-quality:
+    name: Release product gate
+    needs: [release-rust-quality, release-python-quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-product-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-product-
+
+      - name: Install uv
+        run: pipx install uv
+
+      - name: Sync workspace
+        run: uv sync --all-extras
+
+      - name: Build product-gate binary
+        run: cargo build -p semsql-cli --locked
+
+      - name: Pathway product gate
+        run: >
+          uv run python -m semsql_eval pathway-benchmark
+          --out target/release-product-gates/pathway
+          --semsql-bin target/debug/semsql
+          --schema-variant semantic_alias
+          --out-json target/release-product-gates/pathway.json
+          --out-md target/release-product-gates/pathway.md
+          --strict
+
+      - name: QueryFrame canary product gate
+        run: >
+          uv run python -m semsql_eval queryframe-canary-suite
+          --out target/release-product-gates/queryframe
+          --semsql-bin target/debug/semsql
+          --out-json target/release-product-gates/queryframe.json
+          --out-md target/release-product-gates/queryframe.md
+          --strict
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semsql-release-product-gates
+          path: target/release-product-gates/*
+          if-no-files-found: error
+
+  build-native:
+    name: Build ${{ matrix.target }}
+    needs: [release-product-quality]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+            asset_name: semsql-linux-x64
+            binary_path: target/release/semsql
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            asset_name: semsql-linux-arm64
+            binary_path: target/release/semsql
+          - target: win32-x64
+            runner: windows-2022
+            asset_name: semsql-win32-x64.exe
+            binary_path: target/release/semsql.exe
+          - target: darwin-x64
+            runner: macos-15-intel
+            asset_name: semsql-darwin-x64
+            binary_path: target/release/semsql
+          - target: darwin-arm64
+            runner: macos-15
+            asset_name: semsql-darwin-arm64
+            binary_path: target/release/semsql
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Rust version matches release tag
+        run: python scripts/check_release_versions.py --tag "$env:RELEASE_TAG" --surface rust
+        shell: pwsh
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-release-
+
+      - name: Build native binary
+        run: cargo build -p semsql-cli --release --locked
+
+      - name: Prepare release asset
+        shell: pwsh
+        run: |
+          $source = "${{ matrix.binary_path }}"
+          $asset = Join-Path "dist" "${{ matrix.asset_name }}"
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item -LiteralPath $source -Destination $asset
+          if ($env:RUNNER_OS -ne "Windows") {
+            chmod +x $asset
+          }
+
+      - name: Smoke binary
+        shell: pwsh
+        run: |
+          $asset = Join-Path "dist" "${{ matrix.asset_name }}"
+          & $asset --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semsql-native-${{ matrix.target }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  npm-pack:
+    name: Pack npm packages
+    needs: [release-product-quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify npm package versions match release tag
+        run: python scripts/check_release_versions.py --tag "$RELEASE_TAG" --surface npm
+
+      - name: Test and pack npm packages
+        run: >
+          python scripts/check_npm_release_packages.py
+          --tag "$RELEASE_TAG"
+          --run-checks
+          --pack-destination dist/npm
+          --clean-pack-destination
+          --out-json dist/npm/npm-release-package-check.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semsql-npm-packages
+          path: dist/npm/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release assets
+    needs: [build-native, npm-pack]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      DRAFT_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: semsql-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate download manifest
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          python scripts/generate_semsql_downloads_manifest.py \
+            --version "$version" \
+            --base-url "$base_url" \
+            --asset linux-x64=dist/semsql-linux-x64 \
+            --asset linux-arm64=dist/semsql-linux-arm64 \
+            --asset win32-x64=dist/semsql-win32-x64.exe \
+            --asset darwin-x64=dist/semsql-darwin-x64 \
+            --asset darwin-arm64=dist/semsql-darwin-arm64 \
+            --out dist/semsql-downloads.json
+
+      - name: Validate release asset set
+        run: |
+          set -euo pipefail
+          test -s dist/semsql-downloads.json
+          test -s dist/semsql-linux-x64
+          test -s dist/semsql-linux-arm64
+          test -s dist/semsql-win32-x64.exe
+          test -s dist/semsql-darwin-x64
+          test -s dist/semsql-darwin-arm64
+          python -m json.tool dist/semsql-downloads.json >/dev/null
+          ls -la dist
+
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/**
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            args=("$RELEASE_TAG" "--title" "$RELEASE_TAG" "--notes" "SemanticSQL $RELEASE_TAG native binaries and npm package smoke tarballs.")
+            if [ "$DRAFT_RELEASE" = "true" ]; then
+              args+=("--draft")
+            fi
+            gh release create "${args[@]}"
+          fi
+          mapfile -t assets < <(find dist -type f | sort)
+          gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+
+  publish-npm:
+    name: Publish npm packages
+    needs: [release]
+    if: ${{ github.event_name == 'push' || (inputs.publish_npm && !inputs.draft) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org/"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: semsql-npm-packages
+          path: dist/npm
+
+      - name: Publish packed npm packages
+        run: |
+          set -euo pipefail
+          test -n "${NODE_AUTH_TOKEN:-}" || { echo "NPM_TOKEN secret is required"; exit 1; }
+          python scripts/publish_npm_release_packages.py \
+            --tag "$RELEASE_TAG" \
+            --package-dir dist/npm \
+            --skip-existing \
+            --provenance \
+            --out-json dist/npm/npm-publish-report.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semsql-npm-publish-report
+          path: dist/npm/npm-publish-report.json
+          if-no-files-found: error
+
+  package-public-smoke:
+    name: Public package smoke
+    needs: [release, publish-npm]
+    if: ${{ github.event_name == 'push' || (inputs.publish_npm && !inputs.draft) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install eval harness
+        run: python -m pip install -e python/semsql_eval
+
+      - name: Run public package smoke
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          python -m semsql_eval package-public-smoke \
+            --version "$version" \
+            --package-check-retries 12 \
+            --package-check-delay-seconds 10 \
+            --out target/package-public-smoke \
+            --out-json target/package-public-smoke/report.json \
+            --out-md target/package-public-smoke/report.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: semsql-package-public-smoke
+          path: target/package-public-smoke/*
+          if-no-files-found: error

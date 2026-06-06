@@ -12,10 +12,12 @@ name = "semsql"
 path = "src/main.rs"
 
 [features]
-default = ["postgres"]
+default = ["postgres", "mysql"]
 # Re-export the underlying extract-db backend toggle so users can opt out
 # of Postgres at the CLI level (smaller binary, fewer transitive deps).
 postgres = ["semsql-extract-db/postgres"]
+# Re-export the MySQL / MariaDB DB-only extractor toggle.
+mysql = ["semsql-extract-db/mysql"]
 # Pass-through to enable Stage 1/3 ONNX inference in the cascade. With
 # this feature off, `--cascade-manifest` is silently ignored at query
 # time and `semsql doctor` warns when the manifest is supplied. Pulls
@@ -28,6 +30,7 @@ semsql-graph      = { path = "../semsql-graph" }
 semsql-intent     = { path = "../semsql-intent" }
 semsql-extract-db = { path = "../semsql-extract-db", default-features = false }
 semsql-runtime    = { path = "../semsql-runtime" }
+semsql-natsql     = { path = "../semsql-natsql" }
 semsql-renderer   = { path = "../semsql-renderer" }
 clap.workspace    = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -36,7 +39,8 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+csv.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
-rusqlite.workspace = true
 tempfile = "3"

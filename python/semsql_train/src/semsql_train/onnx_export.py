@@ -33,15 +33,15 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
-    "StageArtifact",
-    "Manifest",
     "MANIFEST_SCHEMA_VERSION",
-    "ExportConfig",
     "CascadeExportConfig",
-    "export_stage",
+    "ExportConfig",
+    "Manifest",
+    "StageArtifact",
     "export_cascade",
-    "write_manifest",
+    "export_stage",
     "read_manifest",
+    "write_manifest",
 ]
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -120,6 +120,7 @@ def export_stage(cfg: ExportConfig) -> StageArtifact:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        import torch
         from optimum.onnxruntime import (
             ORTModelForSeq2SeqLM,
             ORTModelForSequenceClassification,
@@ -132,6 +133,13 @@ def export_stage(cfg: ExportConfig) -> StageArtifact:
             "ONNX export requires `pip install semsql-train[ml]` "
             "(transformers + optimum + onnxruntime)."
         ) from e
+    # Optimum/ONNXRuntime releases after int4 support reference
+    # ``torch.int4`` while Torch 2.5.x does not expose that dtype yet.
+    # The export path here only needs the attribute for type mapping
+    # during ORT session inspection; aliasing to int8 keeps older Torch
+    # environments usable without changing emitted model weights.
+    if not hasattr(torch, "int4"):
+        torch.int4 = torch.int8  # type: ignore[attr-defined]
 
     onnx_filename = f"{cfg.stage}.onnx"
     tokenizer_filename = f"{cfg.stage}.tok.json"
@@ -214,6 +222,12 @@ def export_stage(cfg: ExportConfig) -> StageArtifact:
             break
 
     params = _count_onnx_parameters(onnx_path)
+    if cfg.stage == "skeleton":
+        return StageArtifact(
+            path=stage_dir.name,
+            tokenizer=f"{stage_dir.name}/tokenizer.json",
+            params=params,
+        )
     return StageArtifact(
         path=onnx_filename,
         tokenizer=tokenizer_filename if tokenizer_path.exists() else "tokenizer.json",
@@ -229,7 +243,7 @@ def _count_onnx_parameters(onnx_path: Path) -> int:
     after export.
     """
     try:
-        import onnx  # type: ignore[import-not-found]
+        import onnx
     except ImportError:
         return 0
     if not onnx_path.exists():
@@ -290,6 +304,7 @@ def export_cascade(cfg: CascadeExportConfig) -> Manifest:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     artefacts: dict[str, StageArtifact] = {}
+    existing_manifest = _read_existing_manifest(cfg.output_dir / "manifest.json")
 
     def _resolve(stage: str, ckpt: Path | None) -> StageArtifact:
         if ckpt is not None:
@@ -301,6 +316,10 @@ def export_cascade(cfg: CascadeExportConfig) -> Manifest:
                 opset=cfg.opset,
             )
             return export_stage(stage_cfg)
+        if existing_manifest is not None:
+            existing = _manifest_stage(existing_manifest, stage)
+            if (cfg.output_dir / existing.path).exists():
+                return existing
         # No checkpoint — try to reuse a pre-existing artefact.
         onnx_filename = f"{stage}.onnx"
         tok_filename = f"{stage}.tok.json"
@@ -330,6 +349,25 @@ def export_cascade(cfg: CascadeExportConfig) -> Manifest:
     )
     write_manifest(manifest, cfg.output_dir / "manifest.json")
     return manifest
+
+
+def _read_existing_manifest(path: Path) -> Manifest | None:
+    if not path.exists():
+        return None
+    try:
+        return read_manifest(path)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _manifest_stage(manifest: Manifest, stage: str) -> StageArtifact:
+    if stage == "linker":
+        return manifest.linker
+    if stage == "skeleton":
+        return manifest.skeleton
+    if stage == "slot_filler":
+        return manifest.slot_filler
+    raise ValueError(f"unknown stage: {stage!r}")
 
 
 def write_manifest(manifest: Manifest, dest: Path) -> Path:

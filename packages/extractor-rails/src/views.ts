@@ -21,10 +21,10 @@
  *   - i18n-resolved label      → 0.92 (FormOrTableLabel; same indirection
  *                                       penalty Laravel + Vue use)
  *
- * Skipped at v0.5:
+ * Deliberately skipped by this view reader:
  *
  *   - Custom form-builder helpers in plain Ruby (`f.label :email, …`)
- *     — needs a Ruby AST walker; deferred to v1.0.
+ *     — needs a Ruby AST walker.
  *   - Multi-line label blocks with conditional ERB — the regex
  *     conservatively matches only single-line label tags. False
  *     negatives, never false positives.
@@ -34,29 +34,29 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import {
-    sanitiseCanonical,
-    sanitiseLabel,
-    SanitiserError,
-    SourceLayer,
-    type LangIndex,
-    type VocabFragment,
+	type LangIndex,
+	SanitiserError,
+	SourceLayer,
+	type VocabFragment,
+	sanitiseCanonical,
+	sanitiseLabel,
 } from "@semsql/extractor-sdk";
 
 /** Result of one walk over `app/views/`. */
 export interface ViewsScanResult {
-    fragments: VocabFragment[];
-    /** Files we recognised as ERB views but couldn't fully parse. */
-    skipped: Array<{ file: string; reason: string }>;
+	fragments: VocabFragment[];
+	/** Files we recognised as ERB views but couldn't fully parse. */
+	skipped: Array<{ file: string; reason: string }>;
 }
 
 /** Optional cross-walker context for the views walker. */
 export interface ViewsScanOptions {
-    /**
-     * Locale index from [`scanLocales`]. When supplied, ERB labels
-     * containing `<%= t('key') %>` / `<%= I18n.t('key') %>` resolve
-     * against it; without it the i18n shape is silently dropped.
-     */
-    langIndex?: LangIndex;
+	/**
+	 * Locale index from [`scanLocales`]. When supplied, ERB labels
+	 * containing `<%= t('key') %>` / `<%= I18n.t('key') %>` resolve
+	 * against it; without it the i18n shape is silently dropped.
+	 */
+	langIndex?: LangIndex;
 }
 
 /**
@@ -65,35 +65,35 @@ export interface ViewsScanOptions {
  * `app/views/` produce an empty result.
  */
 export async function scanViews(
-    root: string,
-    options: ViewsScanOptions = {},
+	root: string,
+	options: ViewsScanOptions = {},
 ): Promise<ViewsScanResult> {
-    const result: ViewsScanResult = { fragments: [], skipped: [] };
-    await walk(path.join(root, "app", "views"), result, options);
-    return result;
+	const result: ViewsScanResult = { fragments: [], skipped: [] };
+	await walk(path.join(root, "app", "views"), result, options);
+	return result;
 }
 
 async function walk(
-    dir: string,
-    result: ViewsScanResult,
-    options: ViewsScanOptions,
+	dir: string,
+	result: ViewsScanResult,
+	options: ViewsScanOptions,
 ): Promise<void> {
-    let entries: string[];
-    try {
-        entries = await fs.readdir(dir);
-    } catch {
-        return;
-    }
-    for (const entry of entries) {
-        const full = path.join(dir, entry);
-        const stat = await fs.stat(full).catch(() => null);
-        if (!stat) continue;
-        if (stat.isDirectory()) {
-            await walk(full, result, options);
-        } else if (entry.endsWith(".erb")) {
-            await scanFile(full, result, options);
-        }
-    }
+	let entries: string[];
+	try {
+		entries = await fs.readdir(dir);
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		const full = path.join(dir, entry);
+		const stat = await fs.stat(full).catch(() => null);
+		if (!stat) continue;
+		if (stat.isDirectory()) {
+			await walk(full, result, options);
+		} else if (entry.endsWith(".erb")) {
+			await scanFile(full, result, options);
+		}
+	}
 }
 
 // `<label for="user_email">…inner…</label>`
@@ -109,19 +109,19 @@ async function walk(
 // Limitation: multi-word model classes (`OrderItem` → `order_item`)
 // produce form ids like `order_item_quantity`. The first-underscore
 // split mis-attributes the entity to `order`. The orchestrator can
-// disambiguate by supplying an entity allowlist in v1.0; until then
+// disambiguate by supplying an entity allowlist; until then
 // the walker silently produces the single-word reading. False
 // negatives (model not in schema), never injection-class false
 // positives.
 const LABEL_RX =
-    /<label\b[^>]*\bfor\s*=\s*(['"])([a-z][a-z0-9]*)_([a-z][a-z0-9_]*)\1[^>]*>([^<]*(?:<%=?[\s\S]*?%>[^<]*)*)<\/label>/gi;
+	/<label\b[^>]*\bfor\s*=\s*(['"])([a-z][a-z0-9]*)_([a-z][a-z0-9_]*)\1[^>]*>([^<]*(?:<%=?[\s\S]*?%>[^<]*)*)<\/label>/gi;
 
 // `<%= t('users.email') %>` / `<%= I18n.t("a.b.c") %>` / `<%= t :symbol %>`
 //   - first matched group is the key
 //   - rejects multi-arg calls (count interpolation, scope: opts) — these
 //     are dynamic and shouldn't be emitted as static vocabulary
 const T_CALL_RX =
-    /<%=?\s*(?:I18n\s*\.\s*)?t\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s*%>/g;
+	/<%=?\s*(?:I18n\s*\.\s*)?t\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s*%>/g;
 
 // Rails form-builder label helper:
 //
@@ -136,148 +136,148 @@ const T_CALL_RX =
 // but reject method-chain receivers (`form.fields_for(:address)
 // .label(...)`) — those bind to a different model.
 const F_LABEL_LITERAL_RX =
-    /<%=\s*([a-zA-Z_]\w*)\.label\s*\(?\s*:([a-z_][a-z0-9_]*)\s*,\s*(['"])((?:\\.|(?!\3).)*)\3\s*\)?\s*%>/g;
+	/<%=\s*([a-zA-Z_]\w*)\.label\s*\(?\s*:([a-z_][a-z0-9_]*)\s*,\s*(['"])((?:\\.|(?!\3).)*)\3\s*\)?\s*%>/g;
 const F_LABEL_I18N_RX =
-    /<%=\s*([a-zA-Z_]\w*)\.label\s*\(?\s*:([a-z_][a-z0-9_]*)\s*,\s*(?:I18n\s*\.\s*)?t\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s*\)?\s*%>/g;
+	/<%=\s*([a-zA-Z_]\w*)\.label\s*\(?\s*:([a-z_][a-z0-9_]*)\s*,\s*(?:I18n\s*\.\s*)?t\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s*\)?\s*%>/g;
 
 async function scanFile(
-    file: string,
-    result: ViewsScanResult,
-    options: ViewsScanOptions,
+	file: string,
+	result: ViewsScanResult,
+	options: ViewsScanOptions,
 ): Promise<void> {
-    const text = await fs.readFile(file, "utf8");
+	const text = await fs.readFile(file, "utf8");
 
-    // Path-inferred entity for form-builder calls. Rails convention:
-    //   app/views/<pluralized-model>/<action>.html.erb → entity = singular
-    // Best-effort — path lookup runs once per file and is reused for
-    // every `f.label :…` match. `null` skips the form-builder pass.
-    const pathEntity = inferEntityFromPath(file);
+	// Path-inferred entity for form-builder calls. Rails convention:
+	//   app/views/<pluralized-model>/<action>.html.erb → entity = singular
+	// Best-effort — path lookup runs once per file and is reused for
+	// every `f.label :…` match. `null` skips the form-builder pass.
+	const pathEntity = inferEntityFromPath(file);
 
-    for (const match of text.matchAll(LABEL_RX)) {
-        const entity = match[2]!;
-        const field = match[3]!;
-        const inner = match[4]!.trim();
-        const labelInfo = resolveLabel(inner, options.langIndex);
-        if (labelInfo === null) continue;
+	for (const match of text.matchAll(LABEL_RX)) {
+		const entity = match[2]!;
+		const field = match[3]!;
+		const inner = match[4]!.trim();
+		const labelInfo = resolveLabel(inner, options.langIndex);
+		if (labelInfo === null) continue;
 
-        let canonicalEntity: string;
-        let canonicalField: string;
-        let cleanedLabel: string;
-        try {
-            canonicalEntity = sanitiseCanonical(entity);
-            canonicalField = sanitiseCanonical(field);
-            cleanedLabel = sanitiseLabel(labelInfo.label);
-        } catch (e) {
-            if (e instanceof SanitiserError) {
-                result.skipped.push({ file, reason: e.message });
-                continue;
-            }
-            throw e;
-        }
-        result.fragments.push({
-            term: cleanedLabel.toLowerCase(),
-            canonical: {
-                kind: "field",
-                field: `${canonicalEntity}.${canonicalField}`,
-            },
-            confidence: labelInfo.viaI18n ? 0.92 : 0.95,
-            locator: {
-                file,
-                line: lineOf(text, match.index ?? 0),
-                layer: SourceLayer.FormOrTableLabel,
-                extractor: labelInfo.viaI18n
-                    ? `extractor-rails:views:label-i18n:${labelInfo.locale ?? "?"}`
-                    : "extractor-rails:views:label",
-            },
-        });
-    }
+		let canonicalEntity: string;
+		let canonicalField: string;
+		let cleanedLabel: string;
+		try {
+			canonicalEntity = sanitiseCanonical(entity);
+			canonicalField = sanitiseCanonical(field);
+			cleanedLabel = sanitiseLabel(labelInfo.label);
+		} catch (e) {
+			if (e instanceof SanitiserError) {
+				result.skipped.push({ file, reason: e.message });
+				continue;
+			}
+			throw e;
+		}
+		result.fragments.push({
+			term: cleanedLabel.toLowerCase(),
+			canonical: {
+				kind: "field",
+				field: `${canonicalEntity}.${canonicalField}`,
+			},
+			confidence: labelInfo.viaI18n ? 0.92 : 0.95,
+			locator: {
+				file,
+				line: lineOf(text, match.index ?? 0),
+				layer: SourceLayer.FormOrTableLabel,
+				extractor: labelInfo.viaI18n
+					? `extractor-rails:views:label-i18n:${labelInfo.locale ?? "?"}`
+					: "extractor-rails:views:label",
+			},
+		});
+	}
 
-    if (pathEntity !== null) {
-        // Form-builder literal: `<%= f.label :email, "Email Address" %>`
-        for (const match of text.matchAll(F_LABEL_LITERAL_RX)) {
-            const field = match[2]!;
-            const label = match[4]!;
-            emitFormBuilderFragment(
-                file,
-                text,
-                match.index ?? 0,
-                pathEntity,
-                field,
-                label,
-                /*viaI18n*/ false,
-                /*locale*/ null,
-                result,
-            );
-        }
-        // Form-builder i18n: `<%= f.label :email, t('users.email') %>`
-        if (options.langIndex !== undefined) {
-            for (const match of text.matchAll(F_LABEL_I18N_RX)) {
-                const field = match[2]!;
-                const key = match[3]!;
-                const entry = options.langIndex.get(key);
-                if (entry === undefined) continue;
-                emitFormBuilderFragment(
-                    file,
-                    text,
-                    match.index ?? 0,
-                    pathEntity,
-                    field,
-                    entry.label,
-                    /*viaI18n*/ true,
-                    entry.locale,
-                    result,
-                );
-            }
-        }
-    }
+	if (pathEntity !== null) {
+		// Form-builder literal: `<%= f.label :email, "Email Address" %>`
+		for (const match of text.matchAll(F_LABEL_LITERAL_RX)) {
+			const field = match[2]!;
+			const label = match[4]!;
+			emitFormBuilderFragment(
+				file,
+				text,
+				match.index ?? 0,
+				pathEntity,
+				field,
+				label,
+				/*viaI18n*/ false,
+				/*locale*/ null,
+				result,
+			);
+		}
+		// Form-builder i18n: `<%= f.label :email, t('users.email') %>`
+		if (options.langIndex !== undefined) {
+			for (const match of text.matchAll(F_LABEL_I18N_RX)) {
+				const field = match[2]!;
+				const key = match[3]!;
+				const entry = options.langIndex.get(key);
+				if (entry === undefined) continue;
+				emitFormBuilderFragment(
+					file,
+					text,
+					match.index ?? 0,
+					pathEntity,
+					field,
+					entry.label,
+					/*viaI18n*/ true,
+					entry.locale,
+					result,
+				);
+			}
+		}
+	}
 }
 
 function emitFormBuilderFragment(
-    file: string,
-    text: string,
-    matchIndex: number,
-    pathEntity: string,
-    rawField: string,
-    rawLabel: string,
-    viaI18n: boolean,
-    locale: string | null,
-    result: ViewsScanResult,
+	file: string,
+	text: string,
+	matchIndex: number,
+	pathEntity: string,
+	rawField: string,
+	rawLabel: string,
+	viaI18n: boolean,
+	locale: string | null,
+	result: ViewsScanResult,
 ): void {
-    let canonicalEntity: string;
-    let canonicalField: string;
-    let cleanedLabel: string;
-    try {
-        canonicalEntity = sanitiseCanonical(pathEntity);
-        canonicalField = sanitiseCanonical(rawField);
-        cleanedLabel = sanitiseLabel(rawLabel);
-    } catch (e) {
-        if (e instanceof SanitiserError) {
-            result.skipped.push({ file, reason: e.message });
-            return;
-        }
-        throw e;
-    }
-    result.fragments.push({
-        term: cleanedLabel.toLowerCase(),
-        canonical: {
-            kind: "field",
-            field: `${canonicalEntity}.${canonicalField}`,
-        },
-        // Form-builder fragments inherit a slightly lower confidence
-        // than `<label for=…>` matches because the entity is *inferred*
-        // from the view path rather than spelled out in the markup.
-        // The orchestrator is expected to override path-inferred
-        // entities via an explicit allowlist in v1.0.
-        confidence: viaI18n ? 0.88 : 0.9,
-        locator: {
-            file,
-            line: lineOf(text, matchIndex),
-            layer: SourceLayer.FormOrTableLabel,
-            extractor: viaI18n
-                ? `extractor-rails:views:f-label-i18n:${locale ?? "?"}`
-                : "extractor-rails:views:f-label",
-        },
-    });
+	let canonicalEntity: string;
+	let canonicalField: string;
+	let cleanedLabel: string;
+	try {
+		canonicalEntity = sanitiseCanonical(pathEntity);
+		canonicalField = sanitiseCanonical(rawField);
+		cleanedLabel = sanitiseLabel(rawLabel);
+	} catch (e) {
+		if (e instanceof SanitiserError) {
+			result.skipped.push({ file, reason: e.message });
+			return;
+		}
+		throw e;
+	}
+	result.fragments.push({
+		term: cleanedLabel.toLowerCase(),
+		canonical: {
+			kind: "field",
+			field: `${canonicalEntity}.${canonicalField}`,
+		},
+		// Form-builder fragments inherit a slightly lower confidence
+		// than `<label for=…>` matches because the entity is *inferred*
+		// from the view path rather than spelled out in the markup.
+		// The orchestrator is expected to override path-inferred
+		// entities via an explicit allowlist.
+		confidence: viaI18n ? 0.88 : 0.9,
+		locator: {
+			file,
+			line: lineOf(text, matchIndex),
+			layer: SourceLayer.FormOrTableLabel,
+			extractor: viaI18n
+				? `extractor-rails:views:f-label-i18n:${locale ?? "?"}`
+				: "extractor-rails:views:f-label",
+		},
+	});
 }
 
 /**
@@ -299,61 +299,61 @@ function emitFormBuilderFragment(
  * supply an explicit entity allowlist via the orchestrator.
  */
 export function inferEntityFromPath(file: string): string | null {
-    const norm = file.replace(/\\/g, "/");
-    const idx = norm.indexOf("/app/views/");
-    if (idx < 0) return null;
-    const after = norm.slice(idx + "/app/views/".length);
-    const seg = after.split("/")[0];
-    if (!seg) return null;
-    if (
-        seg === "shared" ||
-        seg === "layouts" ||
-        seg === "application" ||
-        seg === "partials"
-    ) {
-        return null;
-    }
-    return singularise(seg);
+	const norm = file.replace(/\\/g, "/");
+	const idx = norm.indexOf("/app/views/");
+	if (idx < 0) return null;
+	const after = norm.slice(idx + "/app/views/".length);
+	const seg = after.split("/")[0];
+	if (!seg) return null;
+	if (
+		seg === "shared" ||
+		seg === "layouts" ||
+		seg === "application" ||
+		seg === "partials"
+	) {
+		return null;
+	}
+	return singularise(seg);
 }
 
 function singularise(plural: string): string {
-    // Irregulars + tricky plurals first. Conservative — only
-    // common-by-volume forms; everything else falls through to the
-    // simple `-s` strip.
-    const IRREG: Record<string, string> = {
-        people: "person",
-        children: "child",
-        men: "man",
-        women: "woman",
-        feet: "foot",
-        teeth: "tooth",
-        mice: "mouse",
-        geese: "goose",
-        oxen: "ox",
-    };
-    if (IRREG[plural]) return IRREG[plural]!;
-    if (plural.endsWith("ies") && plural.length > 3) {
-        return plural.slice(0, -3) + "y";
-    }
-    if (
-        plural.endsWith("ses") ||
-        plural.endsWith("xes") ||
-        plural.endsWith("zes") ||
-        plural.endsWith("ches") ||
-        plural.endsWith("shes")
-    ) {
-        return plural.slice(0, -2);
-    }
-    if (plural.endsWith("s") && !plural.endsWith("ss")) {
-        return plural.slice(0, -1);
-    }
-    return plural;
+	// Irregulars + tricky plurals first. Conservative — only
+	// common-by-volume forms; everything else falls through to the
+	// simple `-s` strip.
+	const IRREG: Record<string, string> = {
+		people: "person",
+		children: "child",
+		men: "man",
+		women: "woman",
+		feet: "foot",
+		teeth: "tooth",
+		mice: "mouse",
+		geese: "goose",
+		oxen: "ox",
+	};
+	if (IRREG[plural]) return IRREG[plural]!;
+	if (plural.endsWith("ies") && plural.length > 3) {
+		return `${plural.slice(0, -3)}y`;
+	}
+	if (
+		plural.endsWith("ses") ||
+		plural.endsWith("xes") ||
+		plural.endsWith("zes") ||
+		plural.endsWith("ches") ||
+		plural.endsWith("shes")
+	) {
+		return plural.slice(0, -2);
+	}
+	if (plural.endsWith("s") && !plural.endsWith("ss")) {
+		return plural.slice(0, -1);
+	}
+	return plural;
 }
 
 interface ResolvedLabel {
-    label: string;
-    viaI18n: boolean;
-    locale: string | null;
+	label: string;
+	viaI18n: boolean;
+	locale: string | null;
 }
 
 /**
@@ -373,35 +373,35 @@ interface ResolvedLabel {
  * whitespace-only, unresolved t-call without static fallback).
  */
 function resolveLabel(
-    inner: string,
-    langIndex: LangIndex | undefined,
+	inner: string,
+	langIndex: LangIndex | undefined,
 ): ResolvedLabel | null {
-    const tCalls = Array.from(inner.matchAll(T_CALL_RX));
-    if (tCalls.length > 0 && langIndex !== undefined) {
-        for (const c of tCalls) {
-            const entry = langIndex.get(c[1]!);
-            if (entry !== undefined) {
-                return { label: entry.label, viaI18n: true, locale: entry.locale };
-            }
-        }
-    }
-    // Static fallback: strip ERB tags + collapse whitespace.
-    const stripped = inner
-        .replace(/<%[=#]?[\s\S]*?%>/g, "")
-        .replace(/\s+/g, " ")
-        .trim()
-        // Trim a trailing `:` punctuation that Rails templates often
-        // append — `Email Address:` should normalise to `Email Address`.
-        .replace(/[:\s]+$/, "")
-        .trim();
-    if (stripped.length === 0) return null;
-    return { label: stripped, viaI18n: false, locale: null };
+	const tCalls = Array.from(inner.matchAll(T_CALL_RX));
+	if (tCalls.length > 0 && langIndex !== undefined) {
+		for (const c of tCalls) {
+			const entry = langIndex.get(c[1]!);
+			if (entry !== undefined) {
+				return { label: entry.label, viaI18n: true, locale: entry.locale };
+			}
+		}
+	}
+	// Static fallback: strip ERB tags + collapse whitespace.
+	const stripped = inner
+		.replace(/<%[=#]?[\s\S]*?%>/g, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		// Trim a trailing `:` punctuation that Rails templates often
+		// append — `Email Address:` should normalise to `Email Address`.
+		.replace(/[:\s]+$/, "")
+		.trim();
+	if (stripped.length === 0) return null;
+	return { label: stripped, viaI18n: false, locale: null };
 }
 
 function lineOf(text: string, byteOffset: number): number {
-    let line = 1;
-    for (let i = 0; i < byteOffset && i < text.length; i++) {
-        if (text[i] === "\n") line++;
-    }
-    return line;
+	let line = 1;
+	for (let i = 0; i < byteOffset && i < text.length; i++) {
+		if (text[i] === "\n") line++;
+	}
+	return line;
 }

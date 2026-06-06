@@ -1,6 +1,6 @@
-//! Phase E grammar-fuzz tests.
+//! Grammar-fuzz tests.
 //!
-//! Acceptance criterion (per `docs/completion-plan.md`):
+//! Acceptance criterion:
 //!
 //! > grammar fuzz tests: every gold-decoded NatSQL is accepted
 //!
@@ -12,8 +12,7 @@
 //! to pass `validate_skeleton_against_schema` against an appropriate
 //! schema slice. Failure here indicates a missing arm in the grammar
 //! validator and would imply Stage 2 outputs that look like valid gold
-//! NatSQL but get rejected by the cascade — the highest-leverage class
-//! of regression to catch before Phase D retraining.
+//! NatSQL but get rejected by the cascade.
 
 use semsql_runtime::grammar::{
     build_natsql_grammar, validate_skeleton_against_schema, GrammarSchema,
@@ -36,11 +35,7 @@ fn accepts_star_select() {
 #[test]
 fn accepts_single_field() {
     let s = schema(&["users"], &["users.email", "users.id"]);
-    validate_skeleton_against_schema(
-        "SELECT users.email FROM users",
-        &s,
-    )
-    .unwrap();
+    validate_skeleton_against_schema("SELECT users.email FROM users", &s).unwrap();
 }
 
 #[test]
@@ -52,21 +47,14 @@ fn accepts_count_star() {
 #[test]
 fn accepts_aggregate_over_field() {
     let s = schema(&["users"], &["users.balance"]);
-    validate_skeleton_against_schema(
-        "SELECT SUM(users.balance) FROM users",
-        &s,
-    )
-    .unwrap();
+    validate_skeleton_against_schema("SELECT SUM(users.balance) FROM users", &s).unwrap();
 }
 
 #[test]
 fn accepts_where_compare_with_param() {
     let s = schema(&["users"], &["users.status_code"]);
-    validate_skeleton_against_schema(
-        "SELECT * FROM users WHERE users.status_code = :status",
-        &s,
-    )
-    .unwrap();
+    validate_skeleton_against_schema("SELECT * FROM users WHERE users.status_code = :status", &s)
+        .unwrap();
 }
 
 #[test]
@@ -92,34 +80,20 @@ fn accepts_where_between() {
 #[test]
 fn accepts_where_is_null_and_is_not_null() {
     let s = schema(&["users"], &["users.deleted_at", "users.id"]);
-    validate_skeleton_against_schema(
-        "SELECT * FROM users WHERE users.deleted_at IS NULL",
-        &s,
-    )
-    .unwrap();
-    validate_skeleton_against_schema(
-        "SELECT * FROM users WHERE users.id IS NOT NULL",
-        &s,
-    )
-    .unwrap();
+    validate_skeleton_against_schema("SELECT * FROM users WHERE users.deleted_at IS NULL", &s)
+        .unwrap();
+    validate_skeleton_against_schema("SELECT * FROM users WHERE users.id IS NOT NULL", &s).unwrap();
 }
 
 #[test]
 fn accepts_where_like() {
     let s = schema(&["users"], &["users.name"]);
-    validate_skeleton_against_schema(
-        "SELECT * FROM users WHERE users.name LIKE 'A%'",
-        &s,
-    )
-    .unwrap();
+    validate_skeleton_against_schema("SELECT * FROM users WHERE users.name LIKE 'A%'", &s).unwrap();
 }
 
 #[test]
 fn accepts_one_inner_join() {
-    let s = schema(
-        &["users", "orders"],
-        &["users.id", "orders.user_id"],
-    );
+    let s = schema(&["users", "orders"], &["users.id", "orders.user_id"]);
     validate_skeleton_against_schema(
         "SELECT * FROM users INNER JOIN orders ON orders.user_id = users.id",
         &s,
@@ -132,10 +106,7 @@ fn accepts_three_inner_joins() {
     let s = schema(
         &["a", "b", "c", "d"],
         &[
-            "a.id", "a.x",
-            "b.id", "b.a_id",
-            "c.id", "c.b_id",
-            "d.id", "d.c_id",
+            "a.id", "a.x", "b.id", "b.a_id", "c.id", "c.b_id", "d.id", "d.c_id",
         ],
     );
     validate_skeleton_against_schema(
@@ -150,10 +121,7 @@ fn accepts_three_inner_joins() {
 
 #[test]
 fn accepts_group_by_having() {
-    let s = schema(
-        &["users"],
-        &["users.status_code", "users.balance"],
-    );
+    let s = schema(&["users"], &["users.status_code", "users.balance"]);
     validate_skeleton_against_schema(
         "SELECT users.status_code FROM users \
          GROUP BY users.status_code \
@@ -176,11 +144,7 @@ fn accepts_order_by_limit() {
 #[test]
 fn accepts_limit_offset() {
     let s = schema(&["users"], &["users.id"]);
-    validate_skeleton_against_schema(
-        "SELECT * FROM users LIMIT 10 OFFSET 20",
-        &s,
-    )
-    .unwrap();
+    validate_skeleton_against_schema("SELECT * FROM users LIMIT 10 OFFSET 20", &s).unwrap();
 }
 
 #[test]
@@ -192,7 +156,7 @@ fn accepts_offset_only() {
 #[test]
 fn accepts_arithmetic_select_expr() {
     // SelectItem::Expr round-trip — division ratio with CAST, the BIRD
-    // shape that 20% of failures in v2-bird-smoke-failures.md hit.
+    // shape that earlier v0.2 BIRD diagnostics exposed repeatedly.
     let s = schema(&["frpm"], &["frpm.free_meals", "frpm.enrollment"]);
     validate_skeleton_against_schema(
         "SELECT CAST(frpm.free_meals AS REAL) / frpm.enrollment FROM frpm",
@@ -215,16 +179,27 @@ fn grammar_renders_for_typical_top_k_slice() {
     let s = schema(
         &["e_one", "e_two"],
         &[
-            "e_one.f_a", "e_one.f_b", "e_one.f_c", "e_one.f_d", "e_one.f_e",
-            "e_two.f_a", "e_two.f_b", "e_two.f_c", "e_two.f_d", "e_two.f_e",
+            "e_one.f_a",
+            "e_one.f_b",
+            "e_one.f_c",
+            "e_one.f_d",
+            "e_one.f_e",
+            "e_two.f_a",
+            "e_two.f_b",
+            "e_two.f_c",
+            "e_two.f_d",
+            "e_two.f_e",
         ],
     );
     let g = build_natsql_grammar(&s);
     assert!(g.contains("INNER"));
     assert!(g.contains("HAVING"));
     assert!(g.contains("arith_expr"));
-    assert!(g.contains("\"e_one\""));
-    assert!(g.contains("\"e_two.f_a\""));
+    assert!(g.contains("\"@entity1\""));
+    assert!(g.contains("\"@entity2\""));
+    assert!(g.contains("\"@field1\""));
+    assert!(!g.contains("\"e_one\""));
+    assert!(!g.contains("\"e_two.f_a\""));
 }
 
 #[test]
@@ -233,10 +208,17 @@ fn fuzz_every_form_against_universal_schema() {
     let s = schema(
         &["users", "orders", "items"],
         &[
-            "users.id", "users.email", "users.balance", "users.status_code",
-            "users.name", "users.deleted_at",
-            "orders.id", "orders.user_id", "orders.total",
-            "items.id", "items.order_id",
+            "users.id",
+            "users.email",
+            "users.balance",
+            "users.status_code",
+            "users.name",
+            "users.deleted_at",
+            "orders.id",
+            "orders.user_id",
+            "orders.total",
+            "items.id",
+            "items.order_id",
         ],
     );
     let forms = [
@@ -260,6 +242,10 @@ fn fuzz_every_form_against_universal_schema() {
     ];
     for form in forms {
         let r = validate_skeleton_against_schema(form, &s);
-        assert!(r.is_ok(), "validator rejected gold form `{form}`: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "validator rejected gold form `{form}`: {:?}",
+            r.err()
+        );
     }
 }

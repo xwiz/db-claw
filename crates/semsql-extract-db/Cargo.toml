@@ -19,11 +19,14 @@ sqlx = { workspace = true, optional = true }
 futures.workspace = true
 
 [features]
-default = ["postgres"]
+default = ["postgres", "mysql"]
 # Postgres backend via sqlx. Gated behind a feature flag because pulling
 # `sqlx` adds a non-trivial compile cost; downstream users embedding the
 # crate without Postgres can opt out with `default-features = false`.
 postgres = ["dep:sqlx"]
+# MySQL / MariaDB backend via sqlx. Shares the same optional sqlx dependency as
+# Postgres; downstream embedders can opt out with `default-features = false`.
+mysql = ["dep:sqlx"]
 
 [dev-dependencies]
 tempfile = "3"

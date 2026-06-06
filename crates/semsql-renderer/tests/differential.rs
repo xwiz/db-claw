@@ -13,9 +13,9 @@
 //! invariants (TOP placement, bracket emission, backtick guard) are
 //! enforced by the unit tests in `src/lib.rs`.
 
-use rusqlite::{Connection, types::Value};
+use rusqlite::{types::Value, Connection};
 use semsql_natsql::parse;
-use semsql_renderer::{Dialect, render};
+use semsql_renderer::{render, Dialect};
 
 /// Build an in-memory SQLite with a simple `users` schema + fixture
 /// rows that exercise integers, booleans (stored as `INTEGER`), and

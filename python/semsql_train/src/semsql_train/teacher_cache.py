@@ -3,8 +3,8 @@
 Why this exists
 ---------------
 
-`docs/stage2.md` §4.1 calls for a teacher fine-tune (M2) producing
-sequence-level KD targets. On the laptop recipe (`docs/training-on-laptop.md`)
+the Stage 2 training contract §4.1 calls for a teacher fine-tune (M2) producing
+sequence-level KD targets. On the laptop recipe (the local training rationale)
 we skip M2 entirely: Spider 1.0 + BIRD ship gold SQL, and the gold SQL
 *is* the answer the teacher would converge to. So we transpile gold SQL
 → NatSQL deterministically and treat the result as the teacher's
@@ -51,11 +51,30 @@ __all__ = [
     "convert_one",
 ]
 
-# NatSQL v0.3 subset (per docs/training-on-laptop-v2.md):
+# NatSQL v0.3 subset:
 # - Up to 3 INNER JOIN chain (was 1 in v0.2)
 # - HAVING with aggregate predicate (was rejected in v0.2)
 # - Subqueries / CTEs / set ops / OUTER JOINs still rejected
 _MAX_JOINS = 3
+_NON_CANONICAL_CHARS = re.compile(r"[^a-z0-9]+")
+
+
+def _canonicalize_name(raw: str) -> str:
+    """Mirror the runtime DB extractor's canonical snake-case naming."""
+    canonical = _NON_CANONICAL_CHARS.sub("_", raw.strip().lower()).strip("_")
+    canonical = re.sub(r"_+", "_", canonical)
+    if not canonical:
+        return "_"
+    if canonical[0].isdigit():
+        canonical = f"_{canonical}"
+    return canonical[:63]
+
+
+def _canonicalize_field_target(target: str) -> str:
+    if "." not in target:
+        return _canonicalize_name(target)
+    entity, field = target.split(".", 1)
+    return f"{_canonicalize_name(entity)}.{_canonicalize_name(field)}"
 
 
 @dataclass
@@ -123,7 +142,7 @@ def build_teacher_cache(
                 except _ConversionSkip as e:
                     _bucket_skip(stats, e)
                     continue
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     stats.skipped_parse_error += 1
                     if len(stats.skip_reasons) < keep_skip_reasons:
                         stats.skip_reasons.append(
@@ -163,7 +182,7 @@ def build_teacher_cache_from_sqale(
     rows never need to fit in RAM.
     """
     try:
-        import datasets  # noqa: F401  — pre-import for stack-overflow guard
+        import datasets
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "SQaLe ingest requires `pip install datasets`."
@@ -175,6 +194,7 @@ def build_teacher_cache_from_sqale(
     # Iterate either local parquet shards (offline, robust) or HF stream.
     if parquet_glob is not None:
         import glob
+
         import pyarrow.parquet as pq
 
         files = sorted(glob.glob(parquet_glob, recursive=True))
@@ -214,7 +234,7 @@ def build_teacher_cache_from_sqale(
             except _ConversionSkip as e:
                 _bucket_skip(stats, e)
                 continue
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 stats.skipped_parse_error += 1
                 if len(stats.skip_reasons) < keep_skip_reasons:
                     stats.skip_reasons.append(
@@ -270,7 +290,7 @@ def build_teacher_cache_from_omnisql(
     offline ingest from a local mirror.
     """
     try:
-        import datasets  # noqa: F401
+        import datasets
     except ImportError as e:  # pragma: no cover
         raise RuntimeError(
             "OmniSQL ingest requires `pip install datasets`."
@@ -281,6 +301,7 @@ def build_teacher_cache_from_omnisql(
 
     if parquet_glob is not None:
         import glob
+
         import pyarrow.parquet as pq
 
         files = sorted(glob.glob(parquet_glob, recursive=True))
@@ -320,7 +341,7 @@ def build_teacher_cache_from_omnisql(
             except _ConversionSkip as e:
                 _bucket_skip(stats, e)
                 continue
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 stats.skipped_parse_error += 1
                 if len(stats.skip_reasons) < keep_skip_reasons:
                     stats.skip_reasons.append(
@@ -427,7 +448,7 @@ def build_teacher_cache_from_omnisql_bird_json(
             except _ConversionSkip as e:
                 _bucket_skip(stats, e)
                 continue
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 stats.skipped_parse_error += 1
                 if len(stats.skip_reasons) < keep_skip_reasons:
                     stats.skip_reasons.append(
@@ -535,7 +556,7 @@ def build_teacher_cache_from_nstext2sql_jsonl(
             except _ConversionSkip as e:
                 _bucket_skip(stats, e)
                 continue
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 stats.skipped_parse_error += 1
                 if len(stats.skip_reasons) < keep_skip_reasons:
                     stats.skip_reasons.append(
@@ -622,7 +643,7 @@ def _bucket_skip(stats: ConversionStats, e: _ConversionSkip) -> None:
 def _check_v02_subset(node: exp.Expression) -> None:
     """NatSQL v0.3 subset check (kept legacy name for callers).
 
-    v0.3 changes from v0.2 (per docs/training-on-laptop-v2.md):
+    v0.3 conversion subset:
       - Up to ``_MAX_JOINS`` (=3) INNER JOIN chain (was 1).
       - HAVING clause when predicate references aggregate (was rejected).
       - OUTER / CROSS / FULL JOINs still rejected.
@@ -726,9 +747,10 @@ class _SkeletonBuilder:
             raise _ConversionSkip(
                 "other", f"FROM expects Table, got {type(from_src).__name__}"
             )
-        entity = (from_src.name or "").lower()
-        if not entity:
+        entity_raw = from_src.name or ""
+        if not entity_raw.strip():
             raise _ConversionSkip("other", "FROM table has no name")
+        entity = _canonicalize_name(entity_raw)
         # Register alias → canonical name (e.g. T1 → students).
         alias = (from_src.alias or "").lower()
         if alias and alias != entity:
@@ -740,7 +762,7 @@ class _SkeletonBuilder:
         # ``INNER JOIN @entityN ON @entityN.fieldX = @entityM.fieldY``
         # slot so Stage 2 learns to produce JOIN syntax. Without this,
         # the skeleton drops JOINs and the model never sees multi-table
-        # gold templates — the dominant Phase A failure (71% of BIRD
+        # gold templates — the dominant join-underemission failure in BIRD
         # smoke).
         joins = select.args.get("joins") or []
         join_clauses_sql: list[str] = []
@@ -748,7 +770,8 @@ class _SkeletonBuilder:
             join_src = j.this
             joined_slot: str | None = None
             if isinstance(join_src, exp.Table):
-                joined_name = (join_src.name or "").lower()
+                joined_raw = join_src.name or ""
+                joined_name = _canonicalize_name(joined_raw) if joined_raw.strip() else ""
                 joined_alias = (join_src.alias or "").lower()
                 if joined_name:
                     joined_slot = self._slot_for_entity(joined_name)
@@ -865,17 +888,20 @@ class _SkeletonBuilder:
 
     def _render_field(self, expr: exp.Expression) -> str:
         if isinstance(expr, exp.Column):
-            col = (expr.name or "").lower()
-            tbl_part = (expr.table or self._concrete_entity or "").lower()
+            col = _canonicalize_name(expr.name or "")
+            tbl_raw = expr.table or self._concrete_entity or ""
+            tbl_key = tbl_raw.lower()
             # Resolve SQL alias (T1, T2, …) → canonical table name.
-            tbl_part = self._alias_map.get(tbl_part, tbl_part)
+            tbl_part = self._alias_map.get(
+                tbl_key, _canonicalize_name(tbl_raw) if tbl_raw else ""
+            )
             qualified = f"{tbl_part}.{col}" if tbl_part else col
             return self._slot_for_field(qualified)
         if isinstance(expr, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
             return self._render_projection(expr)
         # Bare identifier without table prefix
         if isinstance(expr, exp.Identifier):
-            col = expr.name.lower()
+            col = _canonicalize_name(expr.name)
             entity = self._concrete_entity or ""
             entity = self._alias_map.get(entity, entity)
             qualified = f"{entity}.{col}" if entity else col
@@ -939,11 +965,14 @@ class _SkeletonBuilder:
     def _render_canonical_column(self, expr: exp.Expression) -> str | None:
         if not isinstance(expr, exp.Column):
             return None
-        col = (expr.name or "").lower()
+        col = _canonicalize_name(expr.name or "")
         if not col:
             return None
-        tbl = (expr.table or "").lower()
-        tbl = self._alias_map.get(tbl, tbl)
+        tbl_raw = expr.table or ""
+        tbl_key = tbl_raw.lower()
+        tbl = self._alias_map.get(
+            tbl_key, _canonicalize_name(tbl_raw) if tbl_raw else ""
+        )
         if not tbl:
             return None
         return f"{tbl}.{col}"
@@ -1036,12 +1065,14 @@ class _SkeletonBuilder:
     # ---- slot allocators ----------------------------------------------
 
     def _slot_for_entity(self, name: str) -> str:
+        name = _canonicalize_name(name)
         if name not in self._entity_idx:
             self._entity_idx[name] = f"@entity{self._next_entity}"
             self._next_entity += 1
         return self._entity_idx[name]
 
     def _slot_for_field(self, qualified: str) -> str:
+        qualified = _canonicalize_field_target(qualified)
         if qualified not in self._field_idx:
             self._field_idx[qualified] = f"@field{self._next_field}"
             self._next_field += 1

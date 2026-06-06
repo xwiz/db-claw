@@ -23,13 +23,16 @@
  * caller should fall back to the regex path in `filament.ts`.
  */
 
+import { createRequire } from "node:module";
 import type { default as ParserType } from "tree-sitter";
+
+const requireFromModule = createRequire(import.meta.url);
 
 let lazyParser: ParserType | null = null;
 let lazyParserError: unknown = null;
 
 interface Lazy {
-    parser: ParserType;
+	parser: ParserType;
 }
 
 /**
@@ -41,38 +44,36 @@ interface Lazy {
  * we want to degrade gracefully rather than crash the whole extractor.
  */
 export function getParser(): Lazy | null {
-    if (lazyParser !== null) {
-        return { parser: lazyParser };
-    }
-    if (lazyParserError !== null) {
-        return null;
-    }
-    try {
-        // CommonJS require shim — `tree-sitter` ships only CJS at the
-        // moment. Using `createRequire` keeps us compatible with the
-        // ESM-everywhere TypeScript build.
-        const { createRequire } = require("node:module") as {
-            createRequire: (filename: string) => (id: string) => unknown;
-        };
-        const r = createRequire(__filename);
-        const Parser = r("tree-sitter") as { new (): ParserType };
-        const phpModule = r("tree-sitter-php") as { php: unknown };
-        const parser = new Parser();
-        parser.setLanguage(phpModule.php as Parameters<ParserType["setLanguage"]>[0]);
-        lazyParser = parser;
-        return { parser };
-    } catch (e) {
-        lazyParserError = e;
-        return null;
-    }
+	if (lazyParser !== null) {
+		return { parser: lazyParser };
+	}
+	if (lazyParserError !== null) {
+		return null;
+	}
+	try {
+		// CommonJS require shim — `tree-sitter` ships only CJS at the
+		// moment. Using `createRequire` keeps us compatible with the
+		// ESM-everywhere TypeScript build.
+		const Parser = requireFromModule("tree-sitter") as { new (): ParserType };
+		const phpModule = requireFromModule("tree-sitter-php") as { php: unknown };
+		const parser = new Parser();
+		parser.setLanguage(
+			phpModule.php as Parameters<ParserType["setLanguage"]>[0],
+		);
+		lazyParser = parser;
+		return { parser };
+	} catch (e) {
+		lazyParserError = e;
+		return null;
+	}
 }
 
 /** A `Type::make('field')->...->label('Display')` chain found via AST walk. */
 export interface MakeLabelChain {
-    field: string;
-    label: string;
-    /** 1-indexed line of the `::make` token. */
-    line: number;
+	field: string;
+	label: string;
+	/** 1-indexed line of the `::make` token. */
+	line: number;
 }
 
 /**
@@ -83,11 +84,11 @@ export interface MakeLabelChain {
  * against the lang index at SDK time.
  */
 export interface MakeI18nChain {
-    field: string;
-    /** Lang-key argument to `__()`, e.g. `"users.full_name"`. */
-    i18nKey: string;
-    /** 1-indexed line of the `::make` token. */
-    line: number;
+	field: string;
+	/** Lang-key argument to `__()`, e.g. `"users.full_name"`. */
+	i18nKey: string;
+	/** 1-indexed line of the `::make` token. */
+	line: number;
 }
 
 /**
@@ -103,47 +104,49 @@ export interface MakeI18nChain {
  *  - Chains where the `make` argument is not a static string literal
  *    (e.g. `Type::make($field)`).
  *  - Chains where the `label` argument is not a static string literal
- *    (e.g. `->label(__('key'))` — i18n resolution lives in v0.5).
+ *    (e.g. `->label(__('key'))` — i18n resolution lives in lang scanning).
  *  - Chains rooted at a non-`make` static call.
  *
  * Returns `null` if the parser could not be loaded — callers should fall
  * back to the regex path.
  */
-export function extractMakeLabelChainsAst(text: string): MakeLabelChain[] | null {
-    const lazy = getParser();
-    if (!lazy) return null;
-    // tree-sitter-php only parses statements after a `<?php` tag. Files
-    // off-disk always have one; test fixtures and inline PHP fragments
-    // sometimes don't. Inject one transparently and offset line numbers
-    // back so callers see the original 1-indexed line.
-    const hasTag = /<\?(php|=|\s)/.test(text.slice(0, 32));
-    const source = hasTag ? text : `<?php\n${text}`;
-    const lineOffset = hasTag ? 0 : 1;
-    const tree = lazy.parser.parse(source);
-    const out: MakeLabelChain[] = [];
-    visit(tree.rootNode, (node) => {
-        if (node.type !== "member_call_expression") return;
-        const methodNode = node.childForFieldName("name");
-        if (!methodNode || methodNode.text !== "label") return;
+export function extractMakeLabelChainsAst(
+	text: string,
+): MakeLabelChain[] | null {
+	const lazy = getParser();
+	if (!lazy) return null;
+	// tree-sitter-php only parses statements after a `<?php` tag. Files
+	// off-disk always have one; test fixtures and inline PHP fragments
+	// sometimes don't. Inject one transparently and offset line numbers
+	// back so callers see the original 1-indexed line.
+	const hasTag = /<\?(php|=|\s)/.test(text.slice(0, 32));
+	const source = hasTag ? text : `<?php\n${text}`;
+	const lineOffset = hasTag ? 0 : 1;
+	const tree = lazy.parser.parse(source);
+	const out: MakeLabelChain[] = [];
+	visit(tree.rootNode, (node) => {
+		if (node.type !== "member_call_expression") return;
+		const methodNode = node.childForFieldName("name");
+		if (!methodNode || methodNode.text !== "label") return;
 
-        const labelLit = firstStringArgument(node);
-        if (labelLit === null) return;
+		const labelLit = firstStringArgument(node);
+		if (labelLit === null) return;
 
-        const root = followChainToRoot(node);
-        if (!root) return;
-        if (root.type !== "scoped_call_expression") return;
-        const rootMethod = root.childForFieldName("name");
-        if (!rootMethod || rootMethod.text !== "make") return;
-        const fieldLit = firstStringArgument(root);
-        if (fieldLit === null) return;
+		const root = followChainToRoot(node);
+		if (!root) return;
+		if (root.type !== "scoped_call_expression") return;
+		const rootMethod = root.childForFieldName("name");
+		if (!rootMethod || rootMethod.text !== "make") return;
+		const fieldLit = firstStringArgument(root);
+		if (fieldLit === null) return;
 
-        out.push({
-            field: fieldLit,
-            label: labelLit,
-            line: Math.max(1, root.startPosition.row + 1 - lineOffset),
-        });
-    });
-    return out;
+		out.push({
+			field: fieldLit,
+			label: labelLit,
+			line: Math.max(1, root.startPosition.row + 1 - lineOffset),
+		});
+	});
+	return out;
 }
 
 /**
@@ -161,46 +164,46 @@ export function extractMakeLabelChainsAst(text: string): MakeLabelChain[] | null
  * Returns `null` if tree-sitter could not be loaded.
  */
 export function extractMakeI18nChainsAst(text: string): MakeI18nChain[] | null {
-    const lazy = getParser();
-    if (!lazy) return null;
-    const hasTag = /<\?(php|=|\s)/.test(text.slice(0, 32));
-    const source = hasTag ? text : `<?php\n${text}`;
-    const lineOffset = hasTag ? 0 : 1;
-    const tree = lazy.parser.parse(source);
-    const out: MakeI18nChain[] = [];
-    visit(tree.rootNode, (node) => {
-        if (node.type !== "member_call_expression") return;
-        const methodNode = node.childForFieldName("name");
-        if (!methodNode || methodNode.text !== "label") return;
+	const lazy = getParser();
+	if (!lazy) return null;
+	const hasTag = /<\?(php|=|\s)/.test(text.slice(0, 32));
+	const source = hasTag ? text : `<?php\n${text}`;
+	const lineOffset = hasTag ? 0 : 1;
+	const tree = lazy.parser.parse(source);
+	const out: MakeI18nChain[] = [];
+	visit(tree.rootNode, (node) => {
+		if (node.type !== "member_call_expression") return;
+		const methodNode = node.childForFieldName("name");
+		if (!methodNode || methodNode.text !== "label") return;
 
-        const i18nKey = firstI18nKeyArgument(node);
-        if (i18nKey === null) return;
+		const i18nKey = firstI18nKeyArgument(node);
+		if (i18nKey === null) return;
 
-        const root = followChainToRoot(node);
-        if (!root) return;
-        if (root.type !== "scoped_call_expression") return;
-        const rootMethod = root.childForFieldName("name");
-        if (!rootMethod || rootMethod.text !== "make") return;
-        const fieldLit = firstStringArgument(root);
-        if (fieldLit === null) return;
+		const root = followChainToRoot(node);
+		if (!root) return;
+		if (root.type !== "scoped_call_expression") return;
+		const rootMethod = root.childForFieldName("name");
+		if (!rootMethod || rootMethod.text !== "make") return;
+		const fieldLit = firstStringArgument(root);
+		if (fieldLit === null) return;
 
-        out.push({
-            field: fieldLit,
-            i18nKey,
-            line: Math.max(1, root.startPosition.row + 1 - lineOffset),
-        });
-    });
-    return out;
+		out.push({
+			field: fieldLit,
+			i18nKey,
+			line: Math.max(1, root.startPosition.row + 1 - lineOffset),
+		});
+	});
+	return out;
 }
 
 type SyntaxNode = ParserType.SyntaxNode;
 
 function visit(node: SyntaxNode, fn: (n: SyntaxNode) => void): void {
-    fn(node);
-    for (let i = 0; i < node.namedChildCount; i++) {
-        const c = node.namedChild(i);
-        if (c) visit(c, fn);
-    }
+	fn(node);
+	for (let i = 0; i < node.namedChildCount; i++) {
+		const c = node.namedChild(i);
+		if (c) visit(c, fn);
+	}
 }
 
 /**
@@ -210,11 +213,11 @@ function visit(node: SyntaxNode, fn: (n: SyntaxNode) => void): void {
  * for Filament builders.
  */
 function followChainToRoot(node: SyntaxNode): SyntaxNode | null {
-    let cur: SyntaxNode | null = node;
-    while (cur && cur.type === "member_call_expression") {
-        cur = cur.childForFieldName("object");
-    }
-    return cur;
+	let cur: SyntaxNode | null = node;
+	while (cur && cur.type === "member_call_expression") {
+		cur = cur.childForFieldName("object");
+	}
+	return cur;
 }
 
 /**
@@ -224,23 +227,23 @@ function followChainToRoot(node: SyntaxNode): SyntaxNode | null {
  * for Filament idiom) and reject the rest.
  */
 function firstStringArgument(callExpr: SyntaxNode): string | null {
-    const args = callExpr.childForFieldName("arguments");
-    if (!args) return null;
-    let firstArg: SyntaxNode | null = null;
-    for (let i = 0; i < args.namedChildCount; i++) {
-        const c = args.namedChild(i);
-        if (!c) continue;
-        if (c.type === "argument") {
-            firstArg = c.namedChildCount > 0 ? c.namedChild(0) : c;
-            break;
-        }
-        // Some grammars expose the argument value directly without an
-        // `argument` wrapper; tolerate both.
-        firstArg = c;
-        break;
-    }
-    if (!firstArg) return null;
-    return parsePhpStringLiteral(firstArg);
+	const args = callExpr.childForFieldName("arguments");
+	if (!args) return null;
+	let firstArg: SyntaxNode | null = null;
+	for (let i = 0; i < args.namedChildCount; i++) {
+		const c = args.namedChild(i);
+		if (!c) continue;
+		if (c.type === "argument") {
+			firstArg = c.namedChildCount > 0 ? c.namedChild(0) : c;
+			break;
+		}
+		// Some grammars expose the argument value directly without an
+		// `argument` wrapper; tolerate both.
+		firstArg = c;
+		break;
+	}
+	if (!firstArg) return null;
+	return parsePhpStringLiteral(firstArg);
 }
 
 /**
@@ -259,76 +262,76 @@ function firstStringArgument(callExpr: SyntaxNode): string | null {
  *                                        added later; rare in practice)
  */
 function firstI18nKeyArgument(callExpr: SyntaxNode): string | null {
-    const args = callExpr.childForFieldName("arguments");
-    if (!args) return null;
-    let firstArg: SyntaxNode | null = null;
-    for (let i = 0; i < args.namedChildCount; i++) {
-        const c = args.namedChild(i);
-        if (!c) continue;
-        if (c.type === "argument") {
-            firstArg = c.namedChildCount > 0 ? c.namedChild(0) : c;
-            break;
-        }
-        firstArg = c;
-        break;
-    }
-    if (!firstArg) return null;
-    // First arg must be a function call expression named `__`.
-    if (firstArg.type !== "function_call_expression") return null;
-    const fnName = firstArg.childForFieldName("function");
-    if (!fnName || fnName.text !== "__") return null;
-    const fnArgs = firstArg.childForFieldName("arguments");
-    if (!fnArgs) return null;
-    // Reject calls with !==1 args — multi-arg `__()` carries replacements
-    // (`['count' => 1]`) which mean the string is dynamic.
-    let argCount = 0;
-    let inner: SyntaxNode | null = null;
-    for (let i = 0; i < fnArgs.namedChildCount; i++) {
-        const c = fnArgs.namedChild(i);
-        if (!c) continue;
-        if (c.type === "argument") {
-            argCount++;
-            if (argCount === 1) {
-                inner = c.namedChildCount > 0 ? c.namedChild(0) : c;
-            }
-        }
-    }
-    if (argCount !== 1 || inner === null) return null;
-    return parsePhpStringLiteral(inner);
+	const args = callExpr.childForFieldName("arguments");
+	if (!args) return null;
+	let firstArg: SyntaxNode | null = null;
+	for (let i = 0; i < args.namedChildCount; i++) {
+		const c = args.namedChild(i);
+		if (!c) continue;
+		if (c.type === "argument") {
+			firstArg = c.namedChildCount > 0 ? c.namedChild(0) : c;
+			break;
+		}
+		firstArg = c;
+		break;
+	}
+	if (!firstArg) return null;
+	// First arg must be a function call expression named `__`.
+	if (firstArg.type !== "function_call_expression") return null;
+	const fnName = firstArg.childForFieldName("function");
+	if (!fnName || fnName.text !== "__") return null;
+	const fnArgs = firstArg.childForFieldName("arguments");
+	if (!fnArgs) return null;
+	// Reject calls with !==1 args — multi-arg `__()` carries replacements
+	// (`['count' => 1]`) which mean the string is dynamic.
+	let argCount = 0;
+	let inner: SyntaxNode | null = null;
+	for (let i = 0; i < fnArgs.namedChildCount; i++) {
+		const c = fnArgs.namedChild(i);
+		if (!c) continue;
+		if (c.type === "argument") {
+			argCount++;
+			if (argCount === 1) {
+				inner = c.namedChildCount > 0 ? c.namedChild(0) : c;
+			}
+		}
+	}
+	if (argCount !== 1 || inner === null) return null;
+	return parsePhpStringLiteral(inner);
 }
 
 function parsePhpStringLiteral(node: SyntaxNode): string | null {
-    if (node.type === "string" || node.type === "encapsed_string") {
-        // Reject interpolated double-quoted strings — they are not
-        // statically known. tree-sitter-php exposes interpolation via
-        // child nodes of type `interpolation`.
-        for (let i = 0; i < node.namedChildCount; i++) {
-            const c = node.namedChild(i);
-            if (c && c.type !== "string_value" && c.type !== "escape_sequence") {
-                if (c.type === "interpolation") return null;
-            }
-        }
-        return decodePhpStringText(node.text);
-    }
-    return null;
+	if (node.type === "string" || node.type === "encapsed_string") {
+		// Reject interpolated double-quoted strings — they are not
+		// statically known. tree-sitter-php exposes interpolation via
+		// child nodes of type `interpolation`.
+		for (let i = 0; i < node.namedChildCount; i++) {
+			const c = node.namedChild(i);
+			if (c && c.type !== "string_value" && c.type !== "escape_sequence") {
+				if (c.type === "interpolation") return null;
+			}
+		}
+		return decodePhpStringText(node.text);
+	}
+	return null;
 }
 
 function decodePhpStringText(raw: string): string {
-    if (raw.length < 2) return "";
-    const q = raw[0];
-    if (q !== "'" && q !== '"') return "";
-    if (raw[raw.length - 1] !== q) return "";
-    const body = raw.slice(1, -1);
-    return body.replace(/\\(.)/g, (_full, ch: string) => {
-        switch (ch) {
-            case "n":
-                return "\n";
-            case "r":
-                return "\r";
-            case "t":
-                return "\t";
-            default:
-                return ch;
-        }
-    });
+	if (raw.length < 2) return "";
+	const q = raw[0];
+	if (q !== "'" && q !== '"') return "";
+	if (raw[raw.length - 1] !== q) return "";
+	const body = raw.slice(1, -1);
+	return body.replace(/\\(.)/g, (_full, ch: string) => {
+		switch (ch) {
+			case "n":
+				return "\n";
+			case "r":
+				return "\r";
+			case "t":
+				return "\t";
+			default:
+				return ch;
+		}
+	});
 }

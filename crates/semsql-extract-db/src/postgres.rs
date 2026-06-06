@@ -245,30 +245,19 @@ impl Introspect for PgIntrospect {
         Ok(out)
     }
 
-    async fn sample_values(
-        &self,
-        table: &str,
-        column: &str,
-        limit: u32,
-    ) -> Result<Vec<String>> {
-        // Identifier safety: any character outside the canonical regex
-        // means the value didn't come from our introspection (which
-        // produces canonical names) and we refuse to interpolate it. The
-        // value side is bound as a parameter; only the identifiers go
-        // through string formatting, behind this gate.
+    async fn sample_values(&self, table: &str, column: &str, limit: u32) -> Result<Vec<String>> {
         let (schema, base_table) = match table.split_once('.') {
             Some((s, t)) => (s, t),
             None => ("public", table),
         };
-        if !is_safe_ident(schema) || !is_safe_ident(base_table) || !is_safe_ident(column) {
-            return Err(SemsqlError::InvalidIdentifier(format!(
-                "{schema}.{base_table}.{column}"
-            )));
-        }
+        let schema_ident = quote_pg_ident(schema)?;
+        let table_ident = quote_pg_ident(base_table)?;
+        let column_ident = quote_pg_ident(column)?;
         let q = format!(
-            "SELECT DISTINCT \"{column}\"::text AS v \
-             FROM \"{schema}\".\"{base_table}\" \
-             WHERE \"{column}\" IS NOT NULL \
+            "SELECT DISTINCT {column_ident}::text AS v \
+             FROM {schema_ident}.{table_ident} \
+             WHERE {column_ident} IS NOT NULL \
+             ORDER BY v \
              LIMIT $1"
         );
         let mut stream = sqlx::query(&q).bind(limit as i64).fetch(&self.pool);
@@ -317,14 +306,11 @@ pub fn normalize_pg_type(data_type: &str, udt: &str) -> String {
     }
 }
 
-fn is_safe_ident(s: &str) -> bool {
-    if s.is_empty() || s.len() > 64 {
-        return false;
+fn quote_pg_ident(s: &str) -> Result<String> {
+    if s.is_empty() || s.len() > 128 || s.chars().any(|ch| ch == '\0' || ch.is_control()) {
+        return Err(SemsqlError::InvalidIdentifier(s.to_string()));
     }
-    let mut bytes = s.bytes();
-    let first = bytes.next().unwrap();
-    (first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    Ok(format!("\"{}\"", s.replace('"', "\"\"")))
 }
 
 #[cfg(test)]
@@ -337,30 +323,32 @@ mod tests {
         assert_eq!(normalize_pg_type("bigint", "int8"), "integer");
         assert_eq!(normalize_pg_type("boolean", "bool"), "boolean");
         assert_eq!(normalize_pg_type("text", "text"), "text");
-        assert_eq!(
-            normalize_pg_type("character varying", "varchar"),
-            "text"
-        );
+        assert_eq!(normalize_pg_type("character varying", "varchar"), "text");
         assert_eq!(normalize_pg_type("uuid", "uuid"), "uuid");
         assert_eq!(normalize_pg_type("jsonb", "jsonb"), "json");
         assert_eq!(
             normalize_pg_type("timestamp without time zone", "timestamp"),
             "timestamp"
         );
-        assert_eq!(normalize_pg_type("USER-DEFINED", "order_status"), "order_status");
+        assert_eq!(
+            normalize_pg_type("USER-DEFINED", "order_status"),
+            "order_status"
+        );
         assert_eq!(normalize_pg_type("ARRAY", "_int4"), "array<int4>");
     }
 
     #[test]
-    fn safe_ident_allows_canonical_names_only() {
-        assert!(is_safe_ident("users"));
-        assert!(is_safe_ident("order_items"));
-        assert!(is_safe_ident("_internal"));
-        assert!(!is_safe_ident(""));
-        assert!(!is_safe_ident("9start"));
-        assert!(!is_safe_ident("with space"));
-        assert!(!is_safe_ident("drop;table"));
-        assert!(!is_safe_ident("a".repeat(65).as_str()));
+    fn quote_ident_allows_display_names_and_escapes_quotes() {
+        assert_eq!(quote_pg_ident("users").unwrap(), "\"users\"");
+        assert_eq!(
+            quote_pg_ident("Charter Funding Type").unwrap(),
+            "\"Charter Funding Type\""
+        );
+        assert_eq!(quote_pg_ident("weird\"name").unwrap(), "\"weird\"\"name\"");
+        assert!(matches!(
+            quote_pg_ident("bad\0name"),
+            Err(SemsqlError::InvalidIdentifier(_))
+        ));
     }
 
     /// Live-DB integration tests — gated behind `SEMSQL_PG_TEST_URL` so
@@ -405,16 +393,14 @@ mod tests {
         assert!(tables.iter().any(|t| t.ends_with("users")));
 
         let cols = intro.list_columns().await.unwrap();
-        assert!(
-            cols.iter()
-                .any(|c| c.column == "tenant_id" && c.data_type == "integer")
-        );
+        assert!(cols
+            .iter()
+            .any(|c| c.column == "tenant_id" && c.data_type == "integer"));
 
         let fks = intro.list_foreign_keys().await.unwrap();
-        assert!(
-            fks.iter()
-                .any(|fk| fk.from_column == "tenant_id" && fk.to_column == "id")
-        );
+        assert!(fks
+            .iter()
+            .any(|fk| fk.from_column == "tenant_id" && fk.to_column == "id"));
 
         sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
             .execute(intro.pool())

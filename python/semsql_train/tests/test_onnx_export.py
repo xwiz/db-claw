@@ -3,11 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from semsql_train.onnx_export import (
+    MANIFEST_SCHEMA_VERSION,
     ExportConfig,
     Manifest,
-    MANIFEST_SCHEMA_VERSION,
     StageArtifact,
     export_stage,
     read_manifest,
@@ -140,3 +139,46 @@ class TestExportCascade:
         manifest = export_cascade(cfg)
         assert manifest.linker.tokenizer == "tokenizer.json"
         assert manifest.skeleton.tokenizer == "tokenizer.json"
+
+    def test_reuses_existing_manifest_artifact_paths(
+        self, tmp_path: Path
+    ) -> None:
+        """Seq2seq skeleton exports are directories, not single
+        ``skeleton.onnx`` files. Partial re-export should preserve those
+        manifest paths instead of requiring a legacy placeholder file."""
+        from semsql_train.onnx_export import (
+            CascadeExportConfig,
+            export_cascade,
+            write_manifest,
+        )
+
+        out = tmp_path / "cascade"
+        out.mkdir()
+        (out / "linker.onnx").write_bytes(b"")
+        (out / "linker.tok.json").write_bytes(b"")
+        (out / "_skeleton_export").mkdir()
+        (out / "_skeleton_export" / "tokenizer.json").write_bytes(b"")
+        (out / "slot_filler.onnx").write_bytes(b"")
+        (out / "slot_filler.tok.json").write_bytes(b"")
+        write_manifest(
+            Manifest(
+                cascade_version="old",
+                linker=StageArtifact("linker.onnx", "linker.tok.json", 10),
+                skeleton=StageArtifact(
+                    "_skeleton_export", "_skeleton_export/tokenizer.json", 20
+                ),
+                slot_filler=StageArtifact(
+                    "slot_filler.onnx", "slot_filler.tok.json", 30
+                ),
+            ),
+            out / "manifest.json",
+        )
+
+        manifest = export_cascade(
+            CascadeExportConfig(output_dir=out, cascade_version="new")
+        )
+
+        assert manifest.cascade_version == "new"
+        assert manifest.skeleton.path == "_skeleton_export"
+        assert manifest.skeleton.tokenizer == "_skeleton_export/tokenizer.json"
+        assert manifest.skeleton.params == 20

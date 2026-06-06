@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from semsql_train.generators import GeneratorConfig, generate_skeleton_pairs
 from semsql_train.trainers.skeleton import (
     DistillationConfig,
@@ -140,14 +139,14 @@ def _ml_extras_available() -> tuple[bool, str]:
     except ImportError as e:
         return False, f"ML extras not installed: {e}"
     try:
-        import accelerate  # noqa: F401
+        import accelerate
         from packaging.version import Version
 
         if Version(accelerate.__version__) < Version("0.26.0"):
             return False, f"accelerate {accelerate.__version__} < 0.26.0 required by HF Trainer"
     except ImportError:
         return False, "accelerate not installed (pip install 'accelerate>=0.26.0')"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return False, f"accelerate version check failed: {e}"
     try:
         from transformers import (
@@ -159,7 +158,7 @@ def _ml_extras_available() -> tuple[bool, str]:
         # missing — no implicit network round-trip.
         AutoTokenizer.from_pretrained("t5-small", local_files_only=True)
         AutoModelForSeq2SeqLM.from_pretrained("t5-small", local_files_only=True)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return False, f"t5-small not cached locally: {e}"
     return True, ""
 
@@ -260,7 +259,7 @@ class TestTrainSkeletonM1Smoke:
 
 
 class TestDistillationConfig:
-    """Defaults track `docs/stage2.md` §4.2; preflight tolerates the
+    """Defaults track the Stage 2 training contract §4.2; preflight tolerates the
     optional config; the config validates without torch installed."""
 
     def test_defaults_match_docs(self) -> None:

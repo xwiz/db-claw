@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from semsql_train.generators import GeneratorConfig, generate_slot_pairs
 from semsql_train.trainers.slot_filler import (
     SlotFillerTrainConfig,

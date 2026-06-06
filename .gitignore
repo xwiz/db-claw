@@ -31,18 +31,43 @@ data/
 *.jsonl
 *.onnx
 *.sqlite
+*.sqlite3
 *.db
+*.duckdb
+*.duckdb.wal
 
 # SemanticGraph artefacts
 *.semsql
 *.semsql-shm
 *.semsql-wal
 
+# Generated eval/report artifacts
+docs/results/*.json
+docs/results/**/*.json
+reports/
+artifacts/
+logs/
+*.log
+
+# Release/binary artifacts
+*.exe
+*.dll
+*.dylib
+*.so
+*.a
+*.lib
+*.pdb
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
 # Editor / OS
 .DS_Store
 .idea/
 .vscode/
 .claude/
+.playwright-mcp/
 *.swp
 *~
 

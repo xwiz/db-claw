@@ -15,13 +15,13 @@
 pub mod read;
 pub mod write;
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use semsql_core::{Result, SemsqlError};
 use std::path::Path;
 
 /// Latest schema version this build understands. Stored in the
 /// `semsql_metadata.schema_version` row inside the SQLite file.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Open or create a `.semsql` graph file. Migrations run on open.
 pub fn open<P: AsRef<Path>>(path: P) -> Result<Connection> {
@@ -60,6 +60,19 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         });
     }
 
+    if current < 2 {
+        migrate_v2_scope_predicate_vocabulary(conn)?;
+    }
+    if current < 3 {
+        migrate_v3_metric_definitions(conn)?;
+    }
+    if current < 4 {
+        migrate_v4_metric_aggregate_columns(conn)?;
+    }
+    if current < 5 {
+        migrate_v5_metric_distinct_column(conn)?;
+    }
+
     if current < SCHEMA_VERSION {
         conn.execute(
             "INSERT OR REPLACE INTO semsql_metadata (key, value) VALUES ('schema_version', ?1)",
@@ -68,6 +81,112 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .map_err(|e| SemsqlError::Other(e.to_string()))?;
     }
 
+    Ok(())
+}
+
+fn migrate_v2_scope_predicate_vocabulary(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS vocabulary_v2 (
+    term             TEXT NOT NULL,
+    canonical_kind   TEXT NOT NULL CHECK (canonical_kind IN ('entity','field','enum_value','relationship','scope_predicate')),
+    canonical_value  TEXT NOT NULL,
+    confidence       REAL NOT NULL,
+    source_layer     INTEGER NOT NULL,
+    source_locator   TEXT,
+    PRIMARY KEY (term, canonical_kind, canonical_value)
+);
+INSERT OR IGNORE INTO vocabulary_v2
+    (term, canonical_kind, canonical_value, confidence, source_layer, source_locator)
+SELECT term, canonical_kind, canonical_value, confidence, source_layer, source_locator
+FROM vocabulary;
+DROP TABLE vocabulary;
+ALTER TABLE vocabulary_v2 RENAME TO vocabulary;
+CREATE INDEX IF NOT EXISTS vocab_by_term      ON vocabulary(term);
+CREATE INDEX IF NOT EXISTS vocab_by_canonical ON vocabulary(canonical_kind, canonical_value);
+"#,
+    )
+    .map_err(|e| SemsqlError::Other(format!("migration v2 failed: {e}")))?;
+    Ok(())
+}
+
+fn migrate_v3_metric_definitions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS metric_definitions (
+    name                   TEXT PRIMARY KEY,
+    display_label          TEXT,
+    metric_kind            TEXT NOT NULL,
+    subject_entity         TEXT NOT NULL REFERENCES entities(canonical_name),
+    numerator_field        TEXT NOT NULL,
+    numerator_operator     TEXT NOT NULL,
+    numerator_value        TEXT NOT NULL,
+    numerator_value_kind   TEXT NOT NULL,
+    denominator_field      TEXT NOT NULL,
+    scale                  REAL NOT NULL,
+    required_entities_json TEXT NOT NULL,
+    aliases_json           TEXT NOT NULL,
+    source_locator         TEXT
+);
+CREATE INDEX IF NOT EXISTS metric_definitions_by_subject
+ON metric_definitions(subject_entity);
+"#,
+    )
+    .map_err(|e| SemsqlError::Other(format!("migration v3 failed: {e}")))?;
+    Ok(())
+}
+
+fn migrate_v4_metric_aggregate_columns(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "metric_definitions",
+        "measure_field",
+        "TEXT",
+        "migration v4 measure_field",
+    )?;
+    add_column_if_missing(
+        conn,
+        "metric_definitions",
+        "aggregate",
+        "TEXT",
+        "migration v4 aggregate",
+    )?;
+    Ok(())
+}
+
+fn migrate_v5_metric_distinct_column(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "metric_definitions",
+        "distinct_measure",
+        "INTEGER NOT NULL DEFAULT 0",
+        "migration v5 distinct_measure",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+    context: &str,
+) -> Result<()> {
+    let exists: bool = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))
+        .map_err(|e| SemsqlError::Other(format!("{context} probe prepare: {e}")))?
+        .exists([column])
+        .map_err(|e| SemsqlError::Other(format!("{context} probe: {e}")))?;
+    if exists {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )
+    .map_err(|e| SemsqlError::Other(format!("{context} alter: {e}")))?;
     Ok(())
 }
 
@@ -115,6 +234,8 @@ CREATE TABLE IF NOT EXISTS relationships (
 );
 CREATE INDEX IF NOT EXISTS rel_by_from ON relationships(from_entity);
 CREATE INDEX IF NOT EXISTS rel_by_to   ON relationships(to_entity);
+CREATE UNIQUE INDEX IF NOT EXISTS rel_unique_edge
+ON relationships(from_entity, from_field, to_entity, to_field, kind);
 
 -- Enums ----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS enums (
@@ -133,8 +254,8 @@ CREATE TABLE IF NOT EXISTS units (
 -- Vocabulary -----------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS vocabulary (
     term             TEXT NOT NULL,
-    canonical_kind   TEXT NOT NULL CHECK (canonical_kind IN ('entity','field','enum_value','relationship')),
-    canonical_value  TEXT NOT NULL,  -- entity name | "users.created_at" | "users.status_code:39"
+    canonical_kind   TEXT NOT NULL CHECK (canonical_kind IN ('entity','field','enum_value','relationship','scope_predicate')),
+    canonical_value  TEXT NOT NULL,  -- entity name | "users.created_at" | "users.status_code:39" | scope predicate JSON
     confidence       REAL NOT NULL,
     source_layer     INTEGER NOT NULL,
     source_locator   TEXT,           -- JSON

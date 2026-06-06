@@ -3,4 +3,4 @@
  * is the primary entry point).
  */
 
-export const CLI_VERSION = "0.1.0-dev";
+export { CLI_VERSION } from "./version.js";

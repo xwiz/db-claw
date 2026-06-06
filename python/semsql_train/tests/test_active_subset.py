@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from semsql_train.active_subset import (
     active_subset,
     deterministic_stride_subset,
@@ -15,9 +14,9 @@ from semsql_train.active_subset import (
 
 def _has_st() -> bool:
     try:
+        import numpy  # noqa: F401
         import sentence_transformers  # noqa: F401
         import sklearn  # noqa: F401
-        import numpy  # noqa: F401
     except ImportError:
         return False
     return True

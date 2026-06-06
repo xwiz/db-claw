@@ -1,11 +1,8 @@
 //! End-to-end test: build a fixture SemanticGraph, drive the cascade
 //! against a real NL query, assert the final SQL.
 //!
-//! v0.2 exercises the deterministic path only — Stage 0a → Stage 4. The
-//! model stages return ``NeedsModel`` and the cascade currently returns
-//! an error in that branch (by design — guessing without the trained
-//! cascade is a footgun). Once the model weights ship the orchestrator
-//! falls through to them automatically.
+//! These tests exercise the deterministic pre-resolution path. Model-backed
+//! benchmark coverage lives in eval reports and ONNX-gated runtime tests.
 
 use std::path::PathBuf;
 
@@ -51,12 +48,17 @@ fn fixture() -> Fixture {
 }
 
 #[test]
-fn deterministic_path_resolves_show_students() {
+fn deterministic_path_rejects_bare_entity_projection() {
     let fx = fixture();
     let cascade = Cascade::load(&fx.graph, Some(&fx.intent_yaml)).expect("load");
-    let outcome = cascade.run("show students").expect("run");
-    assert_eq!(outcome.sql_text, "SELECT * FROM users");
-    assert_eq!(outcome.confidences.stage_1, 1.0);
+    let err = cascade
+        .run("show students")
+        .expect_err("bare entity row projection should fail closed");
+    assert!(
+        err.to_string()
+            .contains("queryframe fail-closed before bare entity projection"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -85,7 +87,7 @@ fn intent_library_emits_hints_when_loaded() {
     // Bare-entity query so 0a still resolves; the intent hint is
     // surfaced in telemetry alongside the deterministic SQL.
     let outcome = cascade.run("show students bleeding money").expect_err(
-        "expected NeedsModel — pre-resolver shouldn't anchor on a more-than-2-word tail",
+        "expected NeedsModel - pre-resolver shouldn't anchor on a more-than-2-word tail",
     );
     let _ = outcome;
 }
@@ -94,7 +96,7 @@ fn intent_library_emits_hints_when_loaded() {
 fn unresolved_query_raises_clarification_error() {
     let fx = fixture();
     let cascade = Cascade::load(&fx.graph, None).expect("load");
-    let r = cascade.run("orgs whose balance is over $100k last quarter");
+    let r = cascade.run("organizations with churn risk over 9 last quarter");
     assert!(r.is_err(), "expected NeedsModel error path");
 }
 
@@ -126,9 +128,7 @@ fn deterministic_path_resolves_count_with_enum() {
 fn deterministic_path_resolves_ordering() {
     let fx = fixture();
     let cascade = Cascade::load(&fx.graph, None).expect("load");
-    let outcome = cascade
-        .run("students sorted by balance desc")
-        .expect("run");
+    let outcome = cascade.run("students sorted by balance desc").expect("run");
     assert_eq!(
         outcome.sql_text,
         "SELECT * FROM users ORDER BY users.balance DESC"

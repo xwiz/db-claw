@@ -13,8 +13,8 @@
 //! security. Two independent parsers, each verifying the same invariants,
 //! force the attacker to find bugs in *both* simultaneously.
 //!
-//! v0.1 establishes the public surface. The actual checks land alongside the
-//! Python rewriter as the test suite gives us shapes to verify.
+//! The checks here are intentionally independent of the Python rewriter so
+//! one parser bug cannot silently validate unsafe SQL.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -94,17 +94,16 @@ pub fn verify(sql: &str, inv: &Invariants) -> Result<()> {
 /// Run the independent second-pass over `sql` against a specific dialect.
 pub fn verify_with_dialect(sql: &str, inv: &Invariants, dialect: SqlDialect) -> Result<()> {
     let dyn_dialect = dialect.as_dyn();
-    let stmts = Parser::parse_sql(dyn_dialect.as_ref(), sql)
-        .map_err(|e| SemsqlError::ParserDisagreement {
+    let stmts = Parser::parse_sql(dyn_dialect.as_ref(), sql).map_err(|e| {
+        SemsqlError::ParserDisagreement {
             detail: format!("sqlparser-rs failed to parse: {e}"),
-        })?;
-
-    if inv.select_only {
-        if stmts.len() != 1 {
-            return Err(SemsqlError::ParserDisagreement {
-                detail: format!("expected exactly one statement, got {}", stmts.len()),
-            });
         }
+    })?;
+
+    if inv.select_only && stmts.len() != 1 {
+        return Err(SemsqlError::ParserDisagreement {
+            detail: format!("expected exactly one statement, got {}", stmts.len()),
+        });
     }
 
     for stmt in &stmts {
@@ -215,7 +214,11 @@ fn walk_expr_for_subqueries(
         Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
             walk_query_for_scope(q, inv, cte_names)?;
         }
-        Expr::InSubquery { expr: inner, subquery, .. } => {
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
             walk_expr_for_subqueries(inner, inv, cte_names)?;
             walk_query_for_scope(subquery, inv, cte_names)?;
         }
@@ -264,12 +267,19 @@ fn walk_expr_for_subqueries(
                 walk_expr_for_subqueries(e, inv, cte_names)?;
             }
         }
-        Expr::Between { expr: inner, low, high, .. } => {
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
             walk_expr_for_subqueries(inner, inv, cte_names)?;
             walk_expr_for_subqueries(low, inv, cte_names)?;
             walk_expr_for_subqueries(high, inv, cte_names)?;
         }
-        Expr::InList { expr: inner, list, .. } => {
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
             walk_expr_for_subqueries(inner, inv, cte_names)?;
             for e in list {
                 walk_expr_for_subqueries(e, inv, cte_names)?;
@@ -321,9 +331,9 @@ fn check_table_factor(
             Ok(())
         }
         TableFactor::Derived { subquery, .. } => walk_query_for_scope(subquery, inv, cte_names),
-        TableFactor::NestedJoin { table_with_joins, .. } => {
-            check_table_with_joins(table_with_joins, inv, cte_names, where_text)
-        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => check_table_with_joins(table_with_joins, inv, cte_names, where_text),
         // Unhandled variants (TVF, JSON_TABLE, etc.) — leave to a future
         // patch; the validator (sqlglot, in Python) is the primary gate.
         _ => Ok(()),
@@ -331,10 +341,7 @@ fn check_table_factor(
 }
 
 fn object_name_last(name: &ObjectName) -> String {
-    name.0
-        .last()
-        .map(|p| p.to_string())
-        .unwrap_or_default()
+    name.0.last().map(|p| p.to_string()).unwrap_or_default()
 }
 
 fn cte_name(cte: &Cte) -> &str {
@@ -392,10 +399,7 @@ mod tests {
     fn detects_subquery_aliasing_bypass() {
         // The inner `users` reference must be scoped; the outer alias `u`
         // is a derived-table reference and is fine.
-        let r = verify(
-            "SELECT * FROM (SELECT * FROM users) u",
-            &scope_users(),
-        );
+        let r = verify("SELECT * FROM (SELECT * FROM users) u", &scope_users());
         assert!(matches!(r, Err(SemsqlError::ScopeLeak { .. })), "{r:?}");
     }
 

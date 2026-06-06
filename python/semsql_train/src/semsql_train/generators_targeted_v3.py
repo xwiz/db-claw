@@ -1,8 +1,8 @@
 """Targeted v0.3 generator — produces examples that exercise the failure
-modes the Phase A BIRD smoke surfaced.
+modes the BIRD smoke surfaced.
 
-Per ``docs/results/v2-bird-smoke-failures.md`` the dominant failure
-buckets are:
+The earlier v0.2 BIRD diagnostics surfaced these dominant failure
+buckets:
 
   * **Missing JOIN** (71/100). NatSQL v0.2 couldn't model multi-table
     queries; v0.3 lifts that. We need training rows that exercise
@@ -40,12 +40,10 @@ Example:
 
 from __future__ import annotations
 
-import json
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from semsql_rewriter.graph_reader import GraphSnapshot, Relationship, load_graph
 
@@ -158,7 +156,7 @@ def _join_n(
         return
 
     natsql = (
-        f"SELECT @field1 FROM @entity1"
+        "SELECT @field1 FROM @entity1"
     )
     slot_map: dict[str, str] = {
         "@entity1": primary,
@@ -329,7 +327,7 @@ def _emit_arithmetic_templates(
                 break
         for a, b in pairs:
             natsql = (
-                f"SELECT CAST(@field1 AS REAL) / @field2 FROM @entity1"
+                "SELECT CAST(@field1 AS REAL) / @field2 FROM @entity1"
             )
             slot_map = {
                 "@entity1": entity.canonical_name,

@@ -21,7 +21,7 @@ The selection algorithm:
 
 Result: K rows that span the corpus. Empirically this matches the full-
 corpus quality at 1/10 the training cost on Spider-shape skeleton pairs.
-``docs/training-on-laptop.md` §4 has the full rationale.
+`the local training rationale §4 has the full rationale.
 
 This module is **lazy**: ``sentence-transformers`` and ``sklearn`` are
 imported inside the entry point so the cold-start surface stays
@@ -31,9 +31,9 @@ torch-free.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 __all__ = ["SubsetStats", "active_subset"]
 
@@ -90,9 +90,9 @@ def active_subset(
         )
 
     try:
+        import numpy as np  # type: ignore[import-not-found]
         from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
         from sklearn.cluster import MiniBatchKMeans  # type: ignore[import-not-found]
-        import numpy as np  # type: ignore[import-not-found]
     except ImportError as e:  # pragma: no cover — exercised only without ML extras
         raise RuntimeError(
             "active_subset requires `pip install sentence-transformers scikit-learn numpy`"
@@ -113,7 +113,7 @@ def active_subset(
         n_clusters=target_k,
         batch_size=4096,
         random_state=seed,
-        n_init=3,  # noqa: S107 — sklearn API value, not a secret
+        n_init=3,
     ).fit(vecs)
 
     # For each cluster, find the row whose embedding is nearest the centroid.

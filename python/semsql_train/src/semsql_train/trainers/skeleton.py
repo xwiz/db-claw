@@ -40,11 +40,12 @@ import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, TypeAlias, cast
 
 __all__ = [
-    "SkeletonTrainConfig",
     "DistillationConfig",
     "PreflightReport",
+    "SkeletonTrainConfig",
     "build_dataset",
     "preflight",
     "train_skeleton",
@@ -52,11 +53,12 @@ __all__ = [
 ]
 
 _REQUIRED_KEYS = ("nl", "natsql_skeleton", "ranked_schema", "slot_map")
+JsonObject: TypeAlias = dict[str, Any]
 
 
 @dataclass(frozen=True)
 class DistillationConfig:
-    """Knobs for sequence-level + token-level KD (M3, `docs/stage2.md` §4.1-4.2).
+    """Knobs for sequence-level + token-level KD (M3, the Stage 2 training contract §4.1-4.2).
 
     Loss formulation::
 
@@ -64,7 +66,7 @@ class DistillationConfig:
              + β · KL(student_logits || teacher_logits)  # token-level KD
              + γ · CE(student, gold_skeleton)          # gold supervision
 
-    Defaults match `docs/stage2.md` §4.2 (small grid-search-tuned).
+    Defaults match the Stage 2 training contract §4.2 (small grid-search-tuned).
     """
 
     teacher_model: str
@@ -95,7 +97,7 @@ class SkeletonTrainConfig:
     """HF Hub identifier for the seq2seq teacher (we distil + quantise at
     export time). ``t5-small`` is the M1 default — widely cached, runs
     on CPU. Production cuts upgrade to ``google/t5-efficient-base`` per
-    `docs/stage2.md` §2.1."""
+    the Stage 2 training contract §2.1."""
 
     epochs: int = 5
     batch_size: int = 32
@@ -103,8 +105,8 @@ class SkeletonTrainConfig:
     seed: int = 42
 
     # Distillation knobs — target ~20M params after pruning + int8 quant.
-    # The "scale" preset bumps these for the v1.0 ~50M-param variant per
-    # `docs/stage2.md` §10 / Plan §4.4 (escalation tier).
+    # The "scale" preset bumps these for the larger ~50M-param variant per
+    # the Stage 2 training contract §10 / Plan §4.4 (escalation tier).
     student_encoder_layers: int = 4
     student_decoder_layers: int = 4
     student_d_model: int = 384
@@ -115,11 +117,11 @@ class SkeletonTrainConfig:
         eval_jsonl: Path,
         output_dir: Path,
         **overrides: object,
-    ) -> "SkeletonTrainConfig":
-        """v1.0 ~50M-param config (`docs/stage2.md` §10, Plan §10).
+    ) -> SkeletonTrainConfig:
+        """Larger ~50M-param config from the Stage 2 training contract.
 
         Bumps encoder / decoder depth to 6 and `d_model` to 512 — the
-        "scaled-up Stage 2" path is the optional v1.0 config that trades
+        "scaled-up Stage 2" path is the optional config that trades
         a few MB and a few ms of latency for ~3-5 % skeleton-match lift
         on Spider. Caller can override any field via kwargs.
         """
@@ -143,7 +145,7 @@ class SkeletonTrainConfig:
 
     # Test / smoke knobs. ``max_steps`` caps the optimiser steps for
     # CI smoke runs (overrides ``epochs`` when set). ``gradient_accum``
-    # mirrors the batch-size×accum effective batch from `docs/stage2.md`
+    # mirrors the batch-size×accum effective batch from the Stage 2 training contract
     # §4.3 — kept tweakable so users with smaller GPUs can dial it up.
     max_steps: int | None = None
     gradient_accum: int = 1
@@ -153,7 +155,7 @@ class SkeletonTrainConfig:
     # and adds the seq-level + token-level KD components to the loss.
     distillation: DistillationConfig | None = None
 
-    # ── 2026 laptop accelerators (`docs/training-on-laptop.md` §3) ─────
+    # ── 2026 laptop accelerators (the local training rationale §3) ─────
     # Each is a one-flag toggle. Defaults are False so M1 / CI runs stay
     # dependency-light; explicit opt-in is required.
     bf16: bool = False
@@ -176,6 +178,10 @@ class SkeletonTrainConfig:
     """Wrap the student with ``torch.compile`` (inductor backend).
     Trades ~1.5-2× throughput for a ~30 sec compile-cache warm-up on the
     first step. Skip on tiny CI smoke runs where compile cost dominates."""
+
+    gradient_checkpointing: bool = False
+    """Trade compute for VRAM by checkpointing transformer activations.
+    Recommended for ``t5-base`` on 8 GB laptop GPUs."""
 
     liger_kernel: bool = False
     """Apply linkedin/Liger-Kernel monkey-patch to the HF model — fused
@@ -205,7 +211,7 @@ class PreflightReport:
 # ---------------------------------------------------------------------------
 
 
-def build_dataset(jsonl_path: Path) -> Iterator[dict]:
+def build_dataset(jsonl_path: Path) -> Iterator[JsonObject]:
     """Stream JSONL records and validate each on the fly.
 
     Yields the dict verbatim; a missing key, malformed slot map, or empty
@@ -221,6 +227,8 @@ def build_dataset(jsonl_path: Path) -> Iterator[dict]:
                 rec = json.loads(line)
             except json.JSONDecodeError as e:
                 raise ValueError(f"{jsonl_path}:{lineno}: invalid JSON: {e}") from e
+            if not isinstance(rec, dict):
+                raise ValueError(f"{jsonl_path}:{lineno}: record must be an object")
             for key in _REQUIRED_KEYS:
                 if key not in rec:
                     raise ValueError(
@@ -293,9 +301,9 @@ def preflight(cfg: SkeletonTrainConfig) -> PreflightReport:
 def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
     """Run skeleton-generator fine-tuning. Returns the output directory.
 
-    Implements milestone M1 from `docs/stage2.md`: train_skeleton runs
+    Smoke-tests that train_skeleton runs
     end-to-end on the synthetic mini-corpus. Distillation (sequence-level
-    + token-level KD) lands in M3 — this M1 cut is straight supervised
+    + token-level KD) is separate; this path is straight supervised
     fine-tuning on the gold (source, skeleton) pairs.
 
     Imports torch / transformers / datasets only inside this function so
@@ -318,8 +326,8 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
         # while the call stack is still shallow, loads all Cython
         # extensions cleanly and populates sys.modules so the later
         # `import datasets` inside Trainer.__init__ is a no-op lookup.
-        import pandas  # noqa: F401
-        import datasets  # noqa: F401
+        import datasets  # type: ignore[import-untyped]  # noqa: F401
+        import pandas  # type: ignore[import-untyped]  # noqa: F401
         import torch
         import transformers
     except ImportError as e:  # pragma: no cover — exercised only without ML extras
@@ -329,7 +337,9 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
 
     transformers.set_seed(cfg.seed)
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.base_model)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(  # type: ignore[no-untyped-call]
+        cfg.base_model
+    )
 
     # Forward attn_implementation when the user opted in. HF accepts
     # ``"flash_attention_2"`` or ``"sdpa"``; passing None keeps the model's
@@ -375,6 +385,12 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
         # only pays back on long-running batches > a few hundred steps.
         model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
 
+    if cfg.gradient_checkpointing:
+        if hasattr(model, "config"):
+            model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+
     # M3: optional teacher for distillation. Loaded once, frozen, kept
     # in eval mode. Tokenizer is shared with the student — every M3
     # config we ship pairs students and teachers from the same family
@@ -401,7 +417,7 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
     )
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    args_kwargs: dict[str, object] = dict(
+    args = transformers.Seq2SeqTrainingArguments(
         output_dir=str(cfg.output_dir),
         num_train_epochs=cfg.epochs,
         per_device_train_batch_size=cfg.batch_size,
@@ -418,7 +434,7 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
         # below auto-detects the latest `<output_dir>/checkpoint-N/`).
         save_strategy="steps",
         save_steps=500,
-        save_total_limit=2,
+        save_total_limit=1,
         report_to=[],
         # Skip eval at end-of-step time during M1 — eval correctness
         # lands in `python/semsql_eval/per_stage.py::skeleton_exact`,
@@ -439,14 +455,13 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
             and torch.cuda.is_available()
             and torch.cuda.is_bf16_supported()
         ),
+        gradient_checkpointing=cfg.gradient_checkpointing,
         # Suppress the pin-memory warning when running on CPU; HF
         # defaults this on, which is harmless but emits a warning that
         # CI's `-W error` policy treats as a failure.
         dataloader_pin_memory=torch.cuda.is_available(),
+        max_steps=cfg.max_steps if cfg.max_steps is not None else -1,
     )
-    if cfg.max_steps is not None:
-        args_kwargs["max_steps"] = cfg.max_steps
-    args = transformers.Seq2SeqTrainingArguments(**args_kwargs)
 
     collator = transformers.DataCollatorForSeq2Seq(
         tokenizer=tokenizer, model=model, padding="longest"
@@ -484,7 +499,8 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
         trainer = transformers.Seq2SeqTrainer(**trainer_kwargs)
 
     # Auto-resume from latest checkpoint if any exist in output_dir.
-    import glob, os
+    import glob
+    import os
     ckpts = sorted(
         glob.glob(os.path.join(str(cfg.output_dir), "checkpoint-*")),
         key=lambda p: int(p.rsplit("-", 1)[-1]) if p.rsplit("-", 1)[-1].isdigit() else 0,
@@ -524,7 +540,7 @@ def train_skeleton(cfg: SkeletonTrainConfig) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _build_distillation_trainer_class():
+def _build_distillation_trainer_class() -> type[Any]:
     """Construct the trainer subclass lazily so the import only happens
     inside :func:`train_skeleton`'s code path. We can't define the class
     at module scope unconditionally — that would import torch on every
@@ -539,12 +555,24 @@ def _build_distillation_trainer_class():
         """Seq2SeqTrainer with seq-level + token-level KD on top of
         gold supervision."""
 
-        def __init__(self, teacher_model, distillation: DistillationConfig, **kwargs):
+        def __init__(
+            self,
+            teacher_model: Any,
+            distillation: DistillationConfig,
+            **kwargs: Any,
+        ) -> None:
             super().__init__(**kwargs)
             self._teacher = teacher_model
             self._kd = distillation
 
-        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        def compute_loss(
+            self,
+            model: Any,
+            inputs: dict[str, Any],
+            return_outputs: bool = False,
+            num_items_in_batch: Any | None = None,
+        ) -> Any:
+            _ = num_items_in_batch
             # Stock CE loss against gold labels — unchanged from the
             # base Seq2SeqTrainer. `outputs.loss` is the per-token CE
             # the seq-level KD weight α multiplies through (effectively
@@ -559,8 +587,10 @@ def _build_distillation_trainer_class():
             if self._kd.beta > 0.0:
                 with torch.no_grad():
                     teacher_inputs = {
-                        k: v for k, v in inputs.items()
-                        if k in {"input_ids", "attention_mask", "labels", "decoder_input_ids"}
+                        k: v
+                        for k, v in inputs.items()
+                        if k
+                        in {"input_ids", "attention_mask", "labels", "decoder_input_ids"}
                     }
                     teacher_out = self._teacher(**teacher_inputs)
                 T = self._kd.temperature
@@ -587,7 +617,7 @@ def _build_distillation_trainer_class():
                 else:
                     kd_loss = kl_per_tok.mean() * (T * T)
 
-            # Final blend per `docs/stage2.md` §4.2.
+            # Final blend per the Stage 2 training contract §4.2.
             loss = (
                 (self._kd.alpha + self._kd.gamma) * ce_gold
                 + self._kd.beta * kd_loss
@@ -599,9 +629,9 @@ def _build_distillation_trainer_class():
 
 # Lazy attribute — populated on first access from inside `train_skeleton`.
 class _LazyDistillationTrainer:
-    _cached = None
+    _cached: type[Any] | None = None
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if _LazyDistillationTrainer._cached is None:
             _LazyDistillationTrainer._cached = _build_distillation_trainer_class()
         return _LazyDistillationTrainer._cached(*args, **kwargs)
@@ -617,8 +647,8 @@ _DistillationTrainer = _LazyDistillationTrainer()
 # ---------------------------------------------------------------------------
 
 
-def _format_source(record: dict) -> str:
-    """Render the encoder input per `docs/stage2.md` §2.3.
+def _format_source(record: JsonObject) -> str:
+    """Render the encoder input per the Stage 2 training contract §2.3.
 
     Format (v0.3 — FK-aware):
 
@@ -640,7 +670,7 @@ def _format_source(record: dict) -> str:
     while preserving first-seen order so the encoder input is a stable
     function of the record.
     """
-    nl = record["nl"]
+    nl = str(record["nl"])
     by_entity: dict[str, list[str]] = {}
     fk_lines: list[str] = []
     seen_fk: set[str] = set()
@@ -671,8 +701,8 @@ def _format_source(record: dict) -> str:
     return f"question: {nl}  ¦  schema:\n  {schema}"
 
 
-def _format_target(record: dict) -> str:
-    return record["natsql_skeleton"]
+def _format_target(record: JsonObject) -> str:
+    return cast(str, record["natsql_skeleton"])
 
 
 class _SkeletonDataset:
@@ -683,8 +713,8 @@ class _SkeletonDataset:
 
     def __init__(
         self,
-        examples: list[dict],
-        tokenizer,
+        examples: list[JsonObject],
+        tokenizer: Any,
         max_source_tokens: int,
         max_target_tokens: int,
     ) -> None:
@@ -696,7 +726,7 @@ class _SkeletonDataset:
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         rec = self.examples[idx]
         source = _format_source(rec)
         target = _format_target(rec)
@@ -719,7 +749,7 @@ class _SkeletonDataset:
                 truncation=True,
             )
             enc["labels"] = tgt["input_ids"]
-        return enc
+        return cast(dict[str, Any], enc)
 
 
 # ---------------------------------------------------------------------------
@@ -727,7 +757,7 @@ class _SkeletonDataset:
 # ---------------------------------------------------------------------------
 
 
-def write_jsonl(records: Iterable[dict], dest: Path) -> int:
+def write_jsonl(records: Iterable[JsonObject], dest: Path) -> int:
     """Serialise records to JSONL and return the count."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)

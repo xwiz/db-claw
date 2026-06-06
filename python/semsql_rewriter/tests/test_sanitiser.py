@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-
 from semsql_rewriter import SanitiserError, sanitise_canonical_name, sanitise_label
 
 

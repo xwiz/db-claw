@@ -1,9 +1,8 @@
 //! HuggingFace `tokenizers` ↔ llguidance `TokenizerEnv` bridge.
 //!
-//! Phase E of the completion plan replaces the permissive
-//! `query_llguidance_mask` stub in [`stage_skeleton`](crate::stage_skeleton)
-//! with a real per-token mask. To do that, llguidance needs a
-//! [`toktrie::TokenizerEnv`] that:
+//! [`stage_skeleton`](crate::stage_skeleton) uses this bridge to turn
+//! llguidance parser state into a real per-token mask for the ONNX decoder.
+//! To do that, llguidance needs a [`toktrie::TokenizerEnv`] that:
 //!
 //! 1. Exposes a [`TokTrie`] over the model's full vocabulary, indexed by
 //!    token id, so the per-step bias computation can intersect grammar
@@ -24,9 +23,9 @@
 
 use std::sync::Arc;
 
+use llguidance::toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 use semsql_core::{Result, SemsqlError};
 use tokenizers::Tokenizer;
-use llguidance::toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 
 /// Bridge between a HuggingFace `Tokenizer` and llguidance's
 /// `TokenizerEnv`. Owns the per-id byte rendering used by the trie plus
@@ -63,13 +62,26 @@ impl OnnxTokEnv {
         // `decode([id], false)` resolves SentencePiece `▁` and BPE `Ġ`
         // markers consistently with how the model's text outputs are
         // detokenised at inference time, so the trie's byte transitions
-        // match what the user actually sees.
+        // match what the user actually sees. T5's standalone `▁` boundary
+        // token decodes to an empty string in isolation; llguidance cannot
+        // consume zero-byte tokens, so represent that marker as whitespace.
         let mut words: Vec<Vec<u8>> = Vec::with_capacity(vocab_size);
         for id in 0..vocab_size as u32 {
+            let raw_token = tokenizer.id_to_token(id);
             let bytes = tokenizer
                 .decode(&[id], false)
                 .ok()
-                .map(String::into_bytes)
+                .map(|decoded| {
+                    if decoded.is_empty()
+                        && raw_token
+                            .as_deref()
+                            .is_some_and(|token| token == "▁" || token == "Ġ")
+                    {
+                        b" ".to_vec()
+                    } else {
+                        decoded.into_bytes()
+                    }
+                })
                 .unwrap_or_default();
             words.push(bytes);
         }
@@ -102,7 +114,23 @@ impl TokenizerEnv for OnnxTokEnv {
             Err(_) => return Vec::new(),
         };
         match self.tokenizer.encode(text, false) {
-            Ok(enc) => enc.get_ids().to_vec(),
+            Ok(enc) => {
+                let mut ids = enc.get_ids().to_vec();
+                if !text
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_whitespace())
+                    && ids.first().is_some_and(|id| {
+                        self.tokenizer
+                            .id_to_token(*id)
+                            .as_deref()
+                            .is_some_and(|token| token == "▁" || token == "Ġ")
+                    })
+                {
+                    let _ = ids.remove(0);
+                }
+                ids
+            }
             Err(_) => Vec::new(),
         }
     }
@@ -128,6 +156,7 @@ mod tests {
         // training run yet) the test is a no-op, since the bridge needs
         // a real vocab to exercise meaningfully.
         for candidate in [
+            "target/cascade-v02-local/_skeleton_export/tokenizer.json",
             "target/cascade-v2/skeleton/tokenizer.json",
             "target/cascade-v3/skeleton/tokenizer.json",
         ] {

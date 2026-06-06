@@ -21,17 +21,17 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from semsql_rewriter.graph_reader import EnumDef, Entity, Field, GraphSnapshot, load_graph
+from semsql_rewriter.graph_reader import Field, GraphSnapshot, load_graph
 
 from .paraphrase import ParaphraseConfig, paraphrase
 from .templates import TemplateContext, expand
 
 __all__ = [
     "GeneratorConfig",
+    "generate_e2e_pairs",
     "generate_linker_pairs",
     "generate_skeleton_pairs",
     "generate_slot_pairs",
-    "generate_e2e_pairs",
 ]
 
 

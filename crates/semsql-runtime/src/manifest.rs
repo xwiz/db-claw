@@ -88,9 +88,8 @@ impl CascadeManifest {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
             .map_err(|e| SemsqlError::Other(format!("read manifest `{}`: {e}", path.display())))?;
-        let mut raw: CascadeManifest = serde_json::from_str(&text).map_err(|e| {
-            SemsqlError::Other(format!("parse manifest `{}`: {e}", path.display()))
-        })?;
+        let mut raw: CascadeManifest = serde_json::from_str(&text)
+            .map_err(|e| SemsqlError::Other(format!("parse manifest `{}`: {e}", path.display())))?;
         if raw.schema_version > MANIFEST_SCHEMA_VERSION {
             return Err(SemsqlError::Other(format!(
                 "manifest `{}` schema_version={} is newer than runtime supports ({})",
@@ -240,7 +239,14 @@ mod tests {
     fn missing_default_grammar_is_tolerated_but_explicit_one_is_not() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        for name in ["linker.onnx", "linker.tok", "sk.onnx", "sk.tok", "sl.onnx", "sl.tok"] {
+        for name in [
+            "linker.onnx",
+            "linker.tok",
+            "sk.onnx",
+            "sk.tok",
+            "sl.onnx",
+            "sl.tok",
+        ] {
             touch(&root.join(name));
         }
 
@@ -267,10 +273,7 @@ mod tests {
         let mp2 = root.join("explicit.json");
         std::fs::write(&mp2, json_explicit.to_string()).unwrap();
         let err = CascadeManifest::load(&mp2).unwrap_err();
-        assert!(
-            format!("{err}").contains("missing grammar"),
-            "got: {err}"
-        );
+        assert!(format!("{err}").contains("missing grammar"), "got: {err}");
     }
 
     #[test]

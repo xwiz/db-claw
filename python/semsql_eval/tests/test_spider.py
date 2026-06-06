@@ -5,7 +5,6 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from semsql_eval.spider import Example, SpiderSuite, evaluate
 
 

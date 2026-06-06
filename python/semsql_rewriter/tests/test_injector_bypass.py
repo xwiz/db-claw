@@ -1,6 +1,6 @@
 """Mandatory-filter bypass corpus — the 10 documented attack classes.
 
-This is the v1.0 deployment gate. Any failure in this suite ships nothing.
+This is the deployment safety gate. Any failure in this suite ships nothing.
 
 Attack classes covered (drawn from Apache Superset CVE-2025-48912 patterns
 and the bytebase RLS-footguns blog series):
@@ -24,9 +24,8 @@ that fails closed. There is no third outcome.
 from __future__ import annotations
 
 import sqlglot
-from sqlglot import exp
-
 from semsql_rewriter.injector import ScopeRule, inject
+from sqlglot import exp
 
 _DIALECT = "sqlite"
 
@@ -254,26 +253,23 @@ class TestValidatorRejects:
     """These should never reach the injector. The validator gates them."""
 
     def test_multi_statement_rejected_by_validator(self) -> None:
-        from semsql_rewriter.validator import ValidationError, validate
-
         import pytest
+        from semsql_rewriter.validator import ValidationError, validate
 
         with pytest.raises(ValidationError):
             validate("SELECT * FROM users; DROP TABLE users")
 
     def test_writable_cte_rejected_by_validator(self) -> None:
-        from semsql_rewriter.validator import ValidationError, validate
-
         import pytest
+        from semsql_rewriter.validator import ValidationError, validate
 
         with pytest.raises(ValidationError):
             # Postgres-only writable CTE.
             validate("WITH d AS (DELETE FROM users RETURNING *) SELECT * FROM d")
 
     def test_dml_rejected_by_validator(self) -> None:
-        from semsql_rewriter.validator import ValidationError, validate
-
         import pytest
+        from semsql_rewriter.validator import ValidationError, validate
 
         with pytest.raises(ValidationError):
             validate("DELETE FROM users WHERE id = 1")

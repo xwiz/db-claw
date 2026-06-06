@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from semsql_train.trainers.distill import DistillConfig, preflight
 
 

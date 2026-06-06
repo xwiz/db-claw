@@ -4,7 +4,6 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-
 from semsql_eval.exec_acc import exec_eq, execute
 
 
@@ -33,6 +32,18 @@ class TestExecute:
         r = execute(db, "SELECT * FROM nonexistent")
         assert r.is_error
         assert r.rows == ()
+
+    def test_interrupts_long_running_query(self, db: Path) -> None:
+        r = execute(
+            db,
+            "WITH RECURSIVE cnt(x) AS ("
+            "SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000000"
+            ") SELECT sum(x) FROM cnt",
+            timeout_seconds=0.001,
+        )
+
+        assert r.timed_out
+        assert r.error == "sqlite execution timed out"
 
 
 class TestExecEq:

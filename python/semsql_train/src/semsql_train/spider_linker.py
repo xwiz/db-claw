@@ -50,12 +50,12 @@ import sqlglot
 from sqlglot import expressions as exp
 
 __all__ = [
-    "TableSchema",
     "DbSchemas",
     "SpiderLinkerConfig",
-    "load_tables_json",
+    "TableSchema",
     "extract_referenced_items",
     "generate_linker_pairs_from_spider",
+    "load_tables_json",
 ]
 
 

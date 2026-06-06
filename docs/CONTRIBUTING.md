@@ -1,35 +1,121 @@
-# Contributing to SemanticSQL
+# Contributing
 
-Thanks for considering a contribution. SemanticSQL is built to be reviewed and adopted by senior engineers worldwide — we keep the bar high so the codebase rewards careful reading.
+SemanticSQL has Rust, Python, and TypeScript pieces. You do not need to
+understand all of them to contribute. Pick the layer you are changing, run the
+checks for that layer, and keep generated artifacts out of Git.
 
-## Pick your layer
+## Start Here
 
-Each layer has its own README with focused setup instructions:
+- Runtime or CLI changes: `crates/semsql-runtime`, `crates/semsql-cli`.
+- SQL safety changes: `python/semsql_rewriter`, `crates/semsql-second-pass`.
+- Database extraction: `crates/semsql-extract-db`.
+- Framework extraction: `packages/extractor-*`.
+- Eval and canaries: `python/semsql_eval`.
+- Training/export: `python/semsql_train`.
+- Docs and release notes: `README.md`, `docs/`, `docs/results/*.md`.
 
-- **Rust** → see each crate under `crates/`.
-- **Python** → [`python/semsql_rewriter/README.md`](../python/semsql_rewriter/README.md) is the security-critical layer; start there.
-- **TypeScript extractors** → [`packages/extractor-sdk`](../packages/extractor-sdk).
-- **Intent patterns** → [`intent-library/README.md`](../intent-library/README.md). No code required.
+The cross-language contract is the `.semsql` graph schema. When a change affects
+that contract, update the readers/writers and tests together.
 
-You don't need to know every layer to contribute. The protobuf schema is the contract; everything else is layer-local.
+## Local Checks
 
-## Conventions
-
-- **Comments**: explain the *why*, not the *what*. Well-named identifiers describe what the code does. Comments are reserved for non-obvious constraints, hidden invariants, and references to external incidents (e.g. CVEs the design defends against).
-- **Error handling**: every Rust crate re-exports `semsql_core::SemsqlError`. New errors are additive; never repurpose a discriminant.
-- **Security**: any change that touches the validator, injector, sanitiser, or second-pass requires:
-    1. A unit test for the new behaviour.
-    2. An adversarial test in `python/semsql_eval/src/semsql_eval/adversarial.py`.
-    3. Confirmation that both parsers (sqlglot + sqlparser-rs) still agree.
-- **Sanitisation parity**: the canonical-name allow-list is mirrored in three places (Rust, Python, TypeScript). Change one, change all. CI enforces this with a parity test.
-
-## Running the suite locally
+Run the smallest useful check first, then broaden before publishing a branch.
 
 ```bash
-just build
-just test
+# Rust
+cargo test --workspace
+cargo clippy --workspace --all-targets
+
+# Python
+uv run pytest
+uv run ruff check .
+uv run mypy .
+
+# TypeScript extractors
+pnpm test
+pnpm lint
+pnpm typecheck
+
+# Artifact guard
+python scripts/check_git_artifacts.py --all
+
+# No static query/app shortcuts in production runtime paths
+python scripts/audit_static_query_shortcuts.py
+
+# Living-doc size guard
+python scripts/check_docs_hygiene.py
+```
+
+Use release binaries for timing-sensitive benchmark probes. Debug builds are fine
+for normal development, but model-path latency can look worse in debug mode.
+
+## Safety Rules
+
+If you touch any of these areas, add focused tests:
+
+- SQL validation or rendering;
+- tenant/RLS scoping;
+- vocabulary sanitization;
+- QueryFrame routing;
+- LLM handoff packets;
+- database or framework extraction.
+
+Generated SQL must stay boring. If a question cannot be grounded, scoped, and
+validated, the runtime should reject or ask for a narrower question.
+
+## Docs Rules
+
+Public docs should be contributor-facing:
+
+- explain what someone can run or change;
+- link to the compact living doc instead of copying histories;
+- keep dashboards, ledgers, plans, and checklists compact;
+- move run matrices into one retained report or ignored artifact;
+- avoid raw JSON dumps, local paths, private database names, and screenshots
+  unless they are intentional and small.
+
+Use `docs/results/v02-current-status.md` for the decision read,
+`docs/results/v02-evidence-ledger.md` for gate numbers, and
+`docs/results/README.md` for retained-report pointers.
+
+Run the docs hygiene check when changing living status, gate, or plan docs:
+
+```bash
+python scripts/check_docs_hygiene.py --fail-current-looking --fail-large-retained --top 12
+```
+
+Use the warning mode during broad cleanup passes:
+
+```bash
+python scripts/check_docs_hygiene.py --warn-current-looking --top 12
+```
+
+## Artifact Rules
+
+Do not commit:
+
+- `data/`, `.venv/`, `target/`, `node_modules/`, local caches;
+- ONNX models, SQLite/DB files, `.semsql` graphs;
+- raw eval JSON under `docs/results/`;
+- binaries, archives, logs, or release builds.
+
+Generated outputs should live under ignored directories such as `target/`,
+`reports/`, or `artifacts/`. Release binaries belong in GitHub Releases, not the
+repository.
+
+Before committing, run:
+
+```bash
+python scripts/check_git_artifacts.py
+```
+
+Use `--all` when doing a hygiene pass:
+
+```bash
+python scripts/check_git_artifacts.py --all
 ```
 
 ## License
 
-By contributing, you agree your work will ship under the project's dual-license: Apache-2.0 OR MIT.
+By contributing, you agree your work will ship under the project's dual license:
+Apache-2.0 OR MIT.

@@ -16,18 +16,25 @@
  */
 
 export {
-    type Canonical,
-    type Confidence,
-    type Extractor,
-    type ExtractCtx,
-    type LangIndex,
-    type LangIndexEntry,
-    type Locator,
-    SourceLayer,
-    type VocabFragment,
+	type Canonical,
+	type Confidence,
+	type Extractor,
+	type ExtractCtx,
+	type LangIndex,
+	type LangIndexEntry,
+	type Locator,
+	type MetricDefinitionFragment,
+	type MetricKind,
+	type SemanticFragment,
+	SourceLayer,
+	type VocabFragment,
 } from "./types.js";
 
 export { mergeFragments, type MergeResult } from "./merge.js";
-export { sanitiseCanonical, sanitiseLabel, SanitiserError } from "./sanitise.js";
+export {
+	sanitiseCanonical,
+	sanitiseLabel,
+	SanitiserError,
+} from "./sanitise.js";
 
-export const SDK_VERSION = "0.1.0-dev";
+export { SDK_VERSION } from "./version.js";

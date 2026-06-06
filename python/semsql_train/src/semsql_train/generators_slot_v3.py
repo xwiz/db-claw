@@ -3,7 +3,7 @@
 The shipping Stage 3 corpus (``data/slot_train.jsonl``) carries only ~278
 rows. With that little data the cross-encoder picks NL stop-words like
 ``'highest'``, ``'students'``, ``'opened'`` for the ``@val`` slot — the
-dominant Phase A failure mode (~100% of BIRD-100 wrong).
+dominant current failure mode in the BIRD-100 diagnostic.
 
 This generator takes v3 teacher-cache rows (each carries
 ``natsql_skeleton`` + ``slot_map`` + ``ranked_schema``) and emits one
@@ -52,6 +52,7 @@ _CAP_RX = re.compile(
 )
 _HYPHENATED_NUM_RX = re.compile(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b")
 _TOKEN_RX = re.compile(r"\b[A-Za-z]+\b")
+_NON_CANONICAL_CHARS = re.compile(r"[^a-z0-9]+")
 
 # A small fixed set of NL stop-words and common verbs that bird/spider
 # slot-fillers consistently mis-pick. We hand them in as hard negatives so
@@ -84,9 +85,9 @@ def derive_slot_pairs(
     Two-pass over the input — first pass collects per-slot-kind value
     pools AND a ``table -> set(columns)`` index. Same-table sibling
     columns become the primary @field hard-negative pool because the
-    Phase D BIRD-100 analysis showed Stage 3 mostly fails by picking
-    the wrong column FROM THE SAME TABLE (e.g. ``Percent ... K-12``
-    where gold needed ``County Name`` — both on ``frpm``).
+    Current BIRD-100 diagnostics show Stage 3 often fails by picking the wrong
+    column from the same table (e.g. ``Percent ... K-12`` where gold needed
+    ``County Name``; both are on ``frpm``).
     """
     rng = random.Random(cfg.seed)
     entity_pool: list[str] = []
@@ -101,6 +102,9 @@ def derive_slot_pairs(
             except json.JSONDecodeError:
                 continue
             for slot, gold in (rec.get("slot_map") or {}).items():
+                if not isinstance(slot, str) or not isinstance(gold, str):
+                    continue
+                gold = _canonicalize_slot_value(slot, gold)
                 if slot.startswith("@entity"):
                     entity_pool.append(gold)
                 elif slot.startswith("@field"):
@@ -125,12 +129,12 @@ def derive_slot_pairs(
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            slot_map = rec.get("slot_map") or {}
+            slot_map = _canonicalize_slot_map(rec.get("slot_map") or {})
             if not slot_map:
                 continue
             nl = rec.get("nl") or ""
             skeleton = rec.get("natsql_skeleton") or ""
-            ranked = rec.get("ranked_schema") or []
+            ranked = _canonicalize_ranked_schema(rec.get("ranked_schema") or [])
             for slot, gold in slot_map.items():
                 cands = _make_candidates(slot, gold, nl, ranked, cfg, rng)
                 # For @field slots, inject up to 3 same-table sibling
@@ -258,3 +262,52 @@ def _make_candidates(
         cands = [gold] + kept[1 : cfg.candidates_per_slot]
     rng.shuffle(cands)
     return cands
+
+
+def _canonicalize_slot_map(slot_map: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for slot, value in slot_map.items():
+        if isinstance(slot, str) and isinstance(value, str):
+            out[slot] = _canonicalize_slot_value(slot, value)
+    return out
+
+
+def _canonicalize_ranked_schema(ranked: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for item in ranked:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        target = row.get("target")
+        kind = row.get("kind")
+        if isinstance(target, str) and kind == "entity":
+            row["target"] = _canonicalize_name(target)
+        elif isinstance(target, str) and kind == "field":
+            row["target"] = _canonicalize_field_target(target)
+        out.append(row)
+    return out
+
+
+def _canonicalize_slot_value(slot: str, value: str) -> str:
+    if slot.startswith("@entity"):
+        return _canonicalize_name(value)
+    if slot.startswith("@field"):
+        return _canonicalize_field_target(value)
+    return value
+
+
+def _canonicalize_field_target(target: str) -> str:
+    if "." not in target:
+        return _canonicalize_name(target)
+    entity, field = target.split(".", 1)
+    return f"{_canonicalize_name(entity)}.{_canonicalize_name(field)}"
+
+
+def _canonicalize_name(raw: str) -> str:
+    canonical = _NON_CANONICAL_CHARS.sub("_", raw.strip().lower()).strip("_")
+    canonical = re.sub(r"_+", "_", canonical)
+    if not canonical:
+        return "_"
+    if canonical[0].isdigit():
+        canonical = f"_{canonical}"
+    return canonical[:63]

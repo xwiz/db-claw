@@ -3,6 +3,7 @@
   "version": "0.1.0-dev",
   "description": "Browser-only CSV and public Google Sheets query demo runtime for SemanticSQL.",
   "license": "Apache-2.0 OR MIT",
+  "private": true,
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,9 +14,6 @@
     }
   },
   "files": ["dist"],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "clean": "node -e \"const fs=require('fs'); for (const p of ['dist','tsconfig.tsbuildinfo','tsconfig.build.tsbuildinfo']) fs.rmSync(p,{recursive:true,force:true})\"",
     "build": "pnpm run clean && tsc -p tsconfig.build.json",
