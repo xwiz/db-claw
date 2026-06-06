@@ -10,10 +10,10 @@ Release checklist only. Numbers live in [v02-evidence-ledger.md](v02-evidence-le
 | Runtime | atlas/queryframe tests, static shortcut audit, artifact guard | pass |
 | Product | CI/release pathway/queryframe gate, aliases, fallback, real DB/framework probes, sharding ambiguity | pass |
 | Packaging | alpha rehearsal, launcher/local registry/dlx, package version/runtime-literal/metadata/scope checks | pass |
-| Release | clean non-dev tag preflight, real workflow, public package smoke without local binary override | in progress |
+| Release | clean non-dev tag preflight, real workflow, public package smoke without local binary override | binary pass; npm pending |
 
 Run `pnpm -r typecheck` before `pnpm -r build`; build scripts clean `dist`.
-`alpha.1`-`alpha.3` failed before release creation on CI/package wiring; `alpha.4` passed product/build gates but failed recursive GitHub asset upload. Use `v0.1.0-alpha.5` for the corrected release run.
+`v0.1.0-alpha.5` passed the GitHub binary release workflow; npm publication remains manual.
 Npm publication is manual via `workflow_dispatch publish_npm=true`; tag pushes should not publish packages by accident.
 `v0.1.0-dev` must fail as JSON, not a traceback.
 Diagnostics must expose evidence, fields/values/joins/metrics/date anchors, fail-closed reason, fallback packet, and result shape.
