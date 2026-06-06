@@ -5,9 +5,9 @@ Date: 2026-06-06. Retained release packaging proof; status lives in
 
 ## Result
 
-Local public-registry smoke against `@semsql/*@0.1.0-alpha.5` passed after
-switching the smoke command from `pnpm dlx --package ...` to the portable
-`pnpm --package ... dlx ...` form.
+Local and GitHub Actions public-registry smoke against
+`@semsql/*@0.1.0-alpha.5` passed after switching the smoke command from
+`pnpm dlx --package ...` to the portable `pnpm --package ... dlx ...` form.
 
 Checks:
 
@@ -21,6 +21,7 @@ Checks:
 Artifact:
 
 - `target/package-public-smoke-local-alpha5-portable/report.json`
+- GitHub Actions run `27074347744`, artifact `semsql-package-public-smoke`
 
 ## CI Root Cause
 
@@ -33,5 +34,5 @@ that the runner treated `--package` as a package name:
 That means the failure was command-shape incompatibility in the smoke harness
 and docs, not package publication, npm auth, release assets, or binary download.
 
-Next proof: rerun the release workflow after committing the portable command
-shape and require CI public smoke to pass.
+Final proof: GitHub release run `27074347744` passed with public package smoke
+status `PASS` and all six checks green.

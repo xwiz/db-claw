@@ -1,5 +1,5 @@
 # v0.2 Current Status
 2026-06-06: pilot-safe for grounded read routes; not broad NL-to-SQL go-live.
 Evidence: Python/Rust+`onnx`/pnpm pass; Pathway `31/31`, rejects `13/13`, wrong SQL `0`; QueryFrame `144/144`, rejects `18/18`. See [v02-evidence-ledger.md](v02-evidence-ledger.md).
-Caveat: BIRD100 `5/100` is research-only; `v0.1.0-alpha.5` GitHub binary release and npm publish passed.
-Next: rerun CI public package smoke after the portable `pnpm --package ... dlx` command fix.
+Caveat: BIRD100 `5/100` is research-only; `v0.1.0-alpha.5` GitHub binary release, npm publish, and public package smoke passed.
+Next: private alpha trials on real read-only app databases; keep broad BIRD as research.
