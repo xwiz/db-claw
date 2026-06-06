@@ -246,12 +246,6 @@ importers:
         specifier: ^5.6.2
         version: 5.9.3
 
-  target/v02/package-launcher-smoke-v1/fresh-install:
-    dependencies:
-      '@semsql/cli':
-        specifier: file:C:/dev/db-claw/target/v02/package-launcher-smoke-v1/npm/semsql-cli-0.1.0-dev.tgz
-        version: file:target/v02/package-launcher-smoke-v1/npm/semsql-cli-0.1.0-dev.tgz
-
 packages:
 
   '@babel/helper-string-parser@7.27.1':
@@ -745,11 +739,6 @@ packages:
     resolution: {integrity: sha512-hPt/bgL5cE+Qp+/TPHBqptcAgPzgj46mPcg/16zNUmbQk0j+mOEQV/+Lqu8QRtDV3Ek95Q6FeFITpuhl6OTsAA==}
     cpu: [x64]
     os: [win32]
-
-  '@semsql/cli@file:target/v02/package-launcher-smoke-v1/npm/semsql-cli-0.1.0-dev.tgz':
-    resolution: {integrity: sha512-QVctic9MMsKo3Her0y5u6wB7krbzNVUp4rKmCihwC4fDiMYF88vGtlsxpsswpf74vdCnbPvyh7BUF+Tjn6SQYA==, tarball: file:target/v02/package-launcher-smoke-v1/npm/semsql-cli-0.1.0-dev.tgz}
-    version: 0.1.0-dev
-    hasBin: true
 
   '@types/estree@1.0.8':
     resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
@@ -1333,8 +1322,6 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.60.3':
     optional: true
-
-  '@semsql/cli@file:target/v02/package-launcher-smoke-v1/npm/semsql-cli-0.1.0-dev.tgz': {}
 
   '@types/estree@1.0.8': {}
 

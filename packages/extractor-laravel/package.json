@@ -1,7 +1,7 @@
 {
   "name": "@semsql/extractor-laravel",
-  "version": "0.1.0-dev",
-  "description": "Laravel + Filament extractor — i18n, Eloquent, and Filament Resources/Forms/Tables.",
+  "version": "0.1.0-alpha.1",
+  "description": "Laravel + Filament extractor \u2014 i18n, Eloquent, and Filament Resources/Forms/Tables.",
   "license": "Apache-2.0 OR MIT",
   "repository": {
     "type": "git",
@@ -17,7 +17,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },

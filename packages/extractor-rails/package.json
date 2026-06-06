@@ -1,7 +1,7 @@
 {
   "name": "@semsql/extractor-rails",
-  "version": "0.1.0-dev",
-  "description": "Rails + ActiveRecord extractor — schema.rb, locales, model enums, and view labels.",
+  "version": "0.1.0-alpha.1",
+  "description": "Rails + ActiveRecord extractor \u2014 schema.rb, locales, model enums, and view labels.",
   "license": "Apache-2.0 OR MIT",
   "repository": {
     "type": "git",
@@ -17,7 +17,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },

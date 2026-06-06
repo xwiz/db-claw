@@ -1,7 +1,7 @@
 {
   "name": "@semsql/extractor-i18n",
-  "version": "0.1.0-dev",
-  "description": "i18n parsers (ICU / gettext / Rails YAML / Laravel lang) — used by every framework adapter.",
+  "version": "0.1.0-alpha.1",
+  "description": "i18n parsers (ICU / gettext / Rails YAML / Laravel lang) \u2014 used by every framework adapter.",
   "license": "Apache-2.0 OR MIT",
   "repository": {
     "type": "git",
@@ -17,7 +17,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },

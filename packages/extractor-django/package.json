@@ -1,7 +1,7 @@
 {
   "name": "@semsql/extractor-django",
-  "version": "0.1.0-dev",
-  "description": "Django extractor — models.py and Meta verbose_name.",
+  "version": "0.1.0-alpha.1",
+  "description": "Django extractor \u2014 models.py and Meta verbose_name.",
   "license": "Apache-2.0 OR MIT",
   "repository": {
     "type": "git",
@@ -17,7 +17,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },

@@ -1,7 +1,7 @@
 {
   "name": "@semsql/extractor-vue",
-  "version": "0.1.0-dev",
-  "description": "Vue 3 SFC extractor — label and v-model field associations.",
+  "version": "0.1.0-alpha.1",
+  "description": "Vue 3 SFC extractor \u2014 label and v-model field associations.",
   "license": "Apache-2.0 OR MIT",
   "repository": {
     "type": "git",
@@ -17,7 +17,9 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
