@@ -59,6 +59,31 @@ def test_package_public_smoke_markdown_lists_package_versions() -> None:
     assert "requires published packages" in rendered
 
 
+def test_package_public_smoke_markdown_lists_failed_command_tails() -> None:
+    report = {
+        "status": "fail",
+        "registry_url": "https://registry.npmjs.org/",
+        "version": "0.1.0-alpha.1",
+        "native_binary_mode": "default_release_manifest",
+        "artifacts": {"graph": "target/fixture/app.semsql"},
+        "checks": {"dlx_version_ok": False},
+        "packages": [],
+        "commands": {
+            "dlx_version": {
+                "args": ["pnpm", "dlx", "--package", "@semsql/cli", "semsql"],
+                "returncode": 1,
+                "stdout_tail": "",
+                "stderr_tail": "download failed",
+            }
+        },
+        "limits": [],
+    }
+    rendered = render_package_public_smoke_markdown(report)
+    assert "Failed Commands" in rendered
+    assert "`dlx_version`" in rendered
+    assert "download failed" in rendered
+
+
 def test_parse_npm_view_version_accepts_json_and_plain_text() -> None:
     assert _parse_npm_view_version('"0.1.0-alpha.1"\n') == "0.1.0-alpha.1"
     assert _parse_npm_view_version("0.1.0-alpha.1\n") == "0.1.0-alpha.1"

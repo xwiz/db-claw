@@ -453,7 +453,8 @@ jobs:
             --out-md target/package-public-smoke/report.md
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: semsql-package-public-smoke
           path: target/package-public-smoke/*
-          if-no-files-found: error
+          if-no-files-found: warn

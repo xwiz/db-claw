@@ -280,10 +280,38 @@ def render_package_public_smoke_markdown(report: dict[str, Any]) -> str:
     for item in report["packages"]:
         result = "PASS" if item["returncode"] == 0 and item["resolved"] == item["requested"] else "FAIL"
         lines.append(f"| `{item['name']}` | `{item['resolved'] or ''}` | `{result}` |")
+    failed_commands = _failed_command_summaries(report.get("commands", {}))
+    if failed_commands:
+        lines.extend(["", "## Failed Commands", ""])
+        for name, command in failed_commands:
+            lines.append(f"### `{name}`")
+            args = " ".join(str(part) for part in command.get("args", []))
+            lines.append("")
+            lines.append(f"- returncode: `{command.get('returncode')}`")
+            lines.append(f"- args: `{args}`")
+            stdout_tail = str(command.get("stdout_tail", "")).strip()
+            stderr_tail = str(command.get("stderr_tail", "")).strip()
+            if stdout_tail:
+                lines.extend(["", "stdout:", "", "```text", stdout_tail, "```"])
+            if stderr_tail:
+                lines.extend(["", "stderr:", "", "```text", stderr_tail, "```"])
     lines.extend(["", "## Limits", ""])
     for item in report["limits"]:
         lines.append(f"- {item}")
     return "\n".join(lines) + "\n"
+
+
+def _failed_command_summaries(
+    commands: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    failures: list[tuple[str, dict[str, Any]]] = []
+    for name, command in commands.items():
+        if not isinstance(command, dict):
+            continue
+        returncode = command.get("returncode")
+        if returncode not in (0, None):
+            failures.append((name, command))
+    return failures
 
 
 def _reset_child_dir(parent: Path, child_name: str) -> Path:
