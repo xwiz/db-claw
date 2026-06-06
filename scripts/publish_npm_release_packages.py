@@ -53,6 +53,7 @@ def publish_release_packages(
     npm = shutil.which(npm_bin)
     if npm is None:
         raise RuntimeError(f"{npm_bin} executable not found")
+    package_dir = package_dir.resolve()
     tarballs = _ordered_tarballs(package_dir, expected_version)
     tag = dist_tag or default_dist_tag(expected_version)
     results: list[dict[str, Any]] = []
