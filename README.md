@@ -75,8 +75,8 @@ pnpm dlx --package @semsql/cli --package @semsql/extractor-cli \
   --db-url "$DATABASE_URL" \
   --no-sample-values \
   -o storage/semsql/app.semsql
-pnpm dlx @semsql/cli doctor --graph storage/semsql/app.semsql
-pnpm dlx @semsql/cli query --graph storage/semsql/app.semsql "count active users"
+pnpm dlx --package @semsql/cli semsql doctor --graph storage/semsql/app.semsql
+pnpm dlx --package @semsql/cli semsql query --graph storage/semsql/app.semsql "count active users"
 ```
 
 ## How It Works

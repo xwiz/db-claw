@@ -99,7 +99,7 @@ def run_package_public_smoke(
     )
 
     version_cmd = _run(
-        [pnpm, "dlx", f"@semsql/cli@{version}", "semsql", "--version"],
+        _semsql_dlx_command(pnpm, version, "--version"),
         cwd=root,
         timeout_seconds=timeout_seconds,
         env=runtime_env,
@@ -131,11 +131,7 @@ def run_package_public_smoke(
     )
     query = _run(
         [
-            pnpm,
-            "dlx",
-            "--package",
-            f"@semsql/cli@{version}",
-            "semsql",
+            *_semsql_dlx_command(pnpm, version),
             "query",
             "--graph",
             str(graph),
@@ -429,6 +425,17 @@ def _parse_npm_view_version(stdout: str) -> str | None:
 def _version_command_matches(stdout: str, version: str) -> bool:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     return bool(lines) and lines[0] == f"semsql {version}"
+
+
+def _semsql_dlx_command(pnpm: str, version: str, *args: str) -> list[str]:
+    return [
+        pnpm,
+        "dlx",
+        "--package",
+        f"@semsql/cli@{version}",
+        "semsql",
+        *args,
+    ]
 
 
 def _run(

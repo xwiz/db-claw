@@ -8,6 +8,7 @@ from semsql_eval.__main__ import cli
 from semsql_eval.package_public_smoke import (
     _parse_npm_view_version,
     _runtime_env,
+    _semsql_dlx_command,
     _skipped_command,
     _version_command_matches,
     _view_packages_with_retries,
@@ -68,6 +69,17 @@ def test_version_command_matches_expected_native_version() -> None:
     assert _version_command_matches("semsql 0.1.0-alpha.1\n", "0.1.0-alpha.1")
     assert not _version_command_matches("semsql 0.1.0-dev\n", "0.1.0-alpha.1")
     assert not _version_command_matches("warning\nsemsql 0.1.0-alpha.1\n", "0.1.0-alpha.1")
+
+
+def test_semsql_dlx_command_uses_explicit_package_form() -> None:
+    assert _semsql_dlx_command("pnpm", "0.1.0-alpha.1", "--version") == [
+        "pnpm",
+        "dlx",
+        "--package",
+        "@semsql/cli@0.1.0-alpha.1",
+        "semsql",
+        "--version",
+    ]
 
 
 def test_skipped_command_records_reason() -> None:
