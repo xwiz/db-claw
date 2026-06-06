@@ -432,7 +432,7 @@ def package_dlx_smoke_cmd(
     out_json: Path | None,
     out_md: Path | None,
 ) -> None:
-    """Smoke `pnpm dlx --package <@semsql/cli tarball> semsql`."""
+    """Smoke `pnpm --package <@semsql/cli tarball> dlx semsql`."""
     report = run_package_dlx_smoke(
         out_dir=out_dir,
         semsql_bin=semsql_bin,

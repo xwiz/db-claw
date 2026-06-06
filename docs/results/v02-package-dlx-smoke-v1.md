@@ -4,7 +4,7 @@ Date: 2026-06-06
 
 ## Result
 
-PASS. `pnpm dlx --package <local @semsql/cli tarball> semsql --version`
+PASS. `pnpm --package <local @semsql/cli tarball> dlx semsql --version`
 works through both `SEMSQL_BIN` and manifest download/cache, and fails closed
 when downloads are disabled.
 

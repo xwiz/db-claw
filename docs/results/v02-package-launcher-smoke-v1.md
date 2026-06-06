@@ -21,4 +21,4 @@ release-style manifest, and failed closed when downloads were disabled.
 This closes the local fresh-install launcher gap that unit tests and the PATH
 bridge probe did not cover. It still does not replace a real tagged-release
 run, signed or attested assets, published packages, or fresh
-`pnpm dlx @semsql/cli@<version>` proof.
+`pnpm --package @semsql/cli@<version> dlx semsql ...` proof.

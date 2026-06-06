@@ -76,7 +76,7 @@ def run_package_dlx_smoke(
     tarball_spec = f"file:{tarball}"
 
     override = _run(
-        [tool, "dlx", "--package", tarball_spec, "semsql", "--version"],
+        [tool, "--package", tarball_spec, "dlx", "semsql", "--version"],
         cwd=root,
         env=_launcher_env({"SEMSQL_BIN": str(semsql_bin)}),
         timeout_seconds=timeout_seconds,
@@ -89,7 +89,7 @@ def run_package_dlx_smoke(
         target=target,
     )
     manifest = _run(
-        [tool, "dlx", "--package", tarball_spec, "semsql", "--version"],
+        [tool, "--package", tarball_spec, "dlx", "semsql", "--version"],
         cwd=root,
         env=_launcher_env(
             {
@@ -103,7 +103,7 @@ def run_package_dlx_smoke(
     cached_binary = cache_dir / "0.1.0-local-dlx-smoke" / target.key / target.binary_name
 
     skip_download = _run(
-        [tool, "dlx", "--package", tarball_spec, "semsql", "--version"],
+        [tool, "--package", tarball_spec, "dlx", "semsql", "--version"],
         cwd=root,
         env=_launcher_env(
             {
@@ -174,7 +174,7 @@ def render_package_dlx_smoke_markdown(report: dict[str, Any]) -> str:
             "",
             "## Read",
             "",
-            "`pnpm dlx --package <local @semsql/cli tarball> semsql --version`",
+            "`pnpm --package <local @semsql/cli tarball> dlx semsql --version`",
             "works with `SEMSQL_BIN`, works with manifest download/cache, and",
             "fails closed when downloads are disabled.",
             "",

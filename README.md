@@ -69,14 +69,14 @@ uv run --package semsql-eval python -m semsql_eval llm-resolution-fallback-query
 ## Laravel Alpha Shape
 
 ```bash
-pnpm dlx --package @semsql/cli --package @semsql/extractor-cli \
+pnpm --package @semsql/cli --package @semsql/extractor-cli dlx \
   semsql extract . \
   --framework laravel \
   --db-url "$DATABASE_URL" \
   --no-sample-values \
   -o storage/semsql/app.semsql
-pnpm dlx --package @semsql/cli semsql doctor --graph storage/semsql/app.semsql
-pnpm dlx --package @semsql/cli semsql query --graph storage/semsql/app.semsql "count active users"
+pnpm --package @semsql/cli dlx semsql doctor --graph storage/semsql/app.semsql
+pnpm --package @semsql/cli dlx semsql query --graph storage/semsql/app.semsql "count active users"
 ```
 
 ## How It Works

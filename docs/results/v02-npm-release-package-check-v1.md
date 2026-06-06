@@ -21,4 +21,4 @@ found no unresolved `workspace:` dependencies in packed metadata.
 
 This replaces the brittle inline release-workflow package checks with a local
 and CI-reusable verifier. It still does not prove package publishing or a fresh
-`pnpm dlx @semsql/cli@<version>` install from the public registry.
+`pnpm --package @semsql/cli@<version> dlx semsql ...` install from the public registry.

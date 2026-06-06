@@ -107,13 +107,11 @@ def run_package_public_smoke(
     )
     extract = _run(
         [
-            pnpm,
-            "dlx",
-            "--package",
-            f"@semsql/cli@{version}",
-            "--package",
-            f"@semsql/extractor-cli@{version}",
-            "semsql",
+            *_pnpm_dlx_command(
+                pnpm,
+                [f"@semsql/cli@{version}", f"@semsql/extractor-cli@{version}"],
+                "semsql",
+            ),
             "extract",
             str(fixture_dir),
             "--framework",
@@ -145,28 +143,14 @@ def run_package_public_smoke(
         check=False,
     )
     extractor_help = _run(
-        [
-            pnpm,
-            "dlx",
-            "--package",
-            f"@semsql/extractor-cli@{version}",
-            "semsql-extract",
-            "--help",
-        ],
+        _extractor_dlx_command(pnpm, version, "--help"),
         cwd=root,
         timeout_seconds=timeout_seconds,
         env=_registry_env(registry_url),
         check=False,
     )
     extractor_version = _run(
-        [
-            pnpm,
-            "dlx",
-            "--package",
-            f"@semsql/extractor-cli@{version}",
-            "semsql-extract",
-            "--version",
-        ],
+        _extractor_dlx_command(pnpm, version, "--version"),
         cwd=root,
         timeout_seconds=timeout_seconds,
         env=_registry_env(registry_url),
@@ -456,12 +440,30 @@ def _version_command_matches(stdout: str, version: str) -> bool:
 
 
 def _semsql_dlx_command(pnpm: str, version: str, *args: str) -> list[str]:
+    return _pnpm_dlx_command(pnpm, [f"@semsql/cli@{version}"], "semsql", *args)
+
+
+def _extractor_dlx_command(pnpm: str, version: str, *args: str) -> list[str]:
+    return _pnpm_dlx_command(
+        pnpm,
+        [f"@semsql/extractor-cli@{version}"],
+        "semsql-extract",
+        *args,
+    )
+
+
+def _pnpm_dlx_command(
+    pnpm: str,
+    packages: list[str],
+    executable: str,
+    *args: str,
+) -> list[str]:
+    package_args = [part for package in packages for part in ("--package", package)]
     return [
         pnpm,
+        *package_args,
         "dlx",
-        "--package",
-        f"@semsql/cli@{version}",
-        "semsql",
+        executable,
         *args,
     ]
 

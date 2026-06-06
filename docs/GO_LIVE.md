@@ -52,16 +52,16 @@ separate `workflow_dispatch publish_npm=true draft=false` step, followed by
 ## Laravel Alpha
 
 ```bash
-pnpm dlx --package @semsql/cli@0.1.0-alpha.5 \
-  --package @semsql/extractor-cli@0.1.0-alpha.5 \
+pnpm --package @semsql/cli@0.1.0-alpha.5 \
+  --package @semsql/extractor-cli@0.1.0-alpha.5 dlx \
   semsql extract . \
   --framework laravel \
   --db-url "$DATABASE_URL" \
   --no-sample-values \
   -o storage/semsql/app.semsql
 
-pnpm dlx --package @semsql/cli@0.1.0-alpha.5 semsql doctor --graph storage/semsql/app.semsql
-pnpm dlx --package @semsql/cli@0.1.0-alpha.5 semsql query --graph storage/semsql/app.semsql "count active users"
+pnpm --package @semsql/cli@0.1.0-alpha.5 dlx semsql doctor --graph storage/semsql/app.semsql
+pnpm --package @semsql/cli@0.1.0-alpha.5 dlx semsql query --graph storage/semsql/app.semsql "count active users"
 ```
 
 For production-like schemas:
@@ -91,7 +91,7 @@ Private alpha is reasonable after all of these are true:
 - the release workflow has passed on a real pre-release tag;
 - release assets are signed or attested;
 - `@semsql/cli` is published under the same non-dev version;
-- fresh `pnpm dlx --package @semsql/cli@<version> semsql ...` downloads and runs the tagged binary;
+- fresh `pnpm --package @semsql/cli@<version> dlx semsql ...` downloads and runs the tagged binary;
 - extractor package tarballs are clean and versioned;
 - fresh installs expose `semsql-extract` to native `semsql extract`;
 - Laravel extraction has real-app smokes;

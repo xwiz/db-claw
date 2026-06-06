@@ -70,7 +70,7 @@ def test_package_public_smoke_markdown_lists_failed_command_tails() -> None:
         "packages": [],
         "commands": {
             "dlx_version": {
-                "args": ["pnpm", "dlx", "--package", "@semsql/cli", "semsql"],
+                "args": ["pnpm", "--package", "@semsql/cli", "dlx", "semsql"],
                 "returncode": 1,
                 "stdout_tail": "",
                 "stderr_tail": "download failed",
@@ -99,9 +99,9 @@ def test_version_command_matches_expected_native_version() -> None:
 def test_semsql_dlx_command_uses_explicit_package_form() -> None:
     assert _semsql_dlx_command("pnpm", "0.1.0-alpha.1", "--version") == [
         "pnpm",
-        "dlx",
         "--package",
         "@semsql/cli@0.1.0-alpha.1",
+        "dlx",
         "semsql",
         "--version",
     ]

@@ -130,11 +130,11 @@ def run_package_registry_smoke(
         extract = _run(
             [
                 pnpm,
-                "dlx",
                 "--package",
                 f"@semsql/cli@{version}",
                 "--package",
                 f"@semsql/extractor-cli@{version}",
+                "dlx",
                 "semsql",
                 "extract",
                 str(fixture_dir),
@@ -153,9 +153,9 @@ def run_package_registry_smoke(
         query = _run(
             [
                 pnpm,
-                "dlx",
                 "--package",
                 f"@semsql/cli@{version}",
+                "dlx",
                 "semsql",
                 "query",
                 "--graph",
@@ -171,9 +171,9 @@ def run_package_registry_smoke(
         extractor_help = _run(
             [
                 pnpm,
-                "dlx",
                 "--package",
                 f"@semsql/extractor-cli@{version}",
+                "dlx",
                 "semsql-extract",
                 "--help",
             ],
@@ -184,9 +184,9 @@ def run_package_registry_smoke(
         extractor_version = _run(
             [
                 pnpm,
-                "dlx",
                 "--package",
                 f"@semsql/extractor-cli@{version}",
+                "dlx",
                 "semsql-extract",
                 "--version",
             ],

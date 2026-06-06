@@ -59,4 +59,4 @@ Date: 2026-06-05
 - Run the workflow on a real pre-release tag.
 - Execute the wired release-asset attestation on a real tag run.
 - Publish `@semsql/cli` and extractor packages under the same non-dev version.
-- Verify fresh `pnpm dlx @semsql/cli@<version>` install/download behavior.
+- Verify fresh `pnpm --package @semsql/cli@<version> dlx semsql ...` install/download behavior.
