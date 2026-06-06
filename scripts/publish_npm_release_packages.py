@@ -56,6 +56,29 @@ def publish_release_packages(
     package_dir = package_dir.resolve()
     tarballs = _ordered_tarballs(package_dir, expected_version)
     tag = dist_tag or default_dist_tag(expected_version)
+    auth = None if dry_run else _npm_auth_report(npm, package_dir, registry_url)
+    if auth is not None and auth["returncode"] != 0:
+        return {
+            "schema_version": 1,
+            "status": "fail",
+            "expected_version": expected_version,
+            "registry_url": registry_url,
+            "dist_tag": tag,
+            "provenance": provenance,
+            "skip_existing": skip_existing,
+            "dry_run": dry_run,
+            "auth": auth,
+            "package_count": len(tarballs),
+            "results": [],
+            "failures": [
+                {
+                    "kind": "npm_auth",
+                    "message": "npm whoami failed; check NPM_TOKEN permissions.",
+                    "auth": auth,
+                }
+            ],
+            "diagnosis": "npm_auth_failed",
+        }
     results: list[dict[str, Any]] = []
     for package in tarballs:
         existing: dict[str, Any] | None = None
@@ -138,9 +161,11 @@ def publish_release_packages(
         "provenance": provenance,
         "skip_existing": skip_existing,
         "dry_run": dry_run,
+        "auth": auth,
         "package_count": len(tarballs),
         "results": results,
         "failures": failures,
+        "diagnosis": _diagnose_failures(failures),
     }
 
 
@@ -180,6 +205,40 @@ def _parse_npm_view_version(stdout: str) -> str | None:
     except json.JSONDecodeError:
         return text.strip('"')
     return parsed if isinstance(parsed, str) else None
+
+
+def _npm_auth_report(npm: str, package_dir: Path, registry_url: str) -> dict[str, Any]:
+    whoami = _run(
+        [npm, "whoami", "--registry", registry_url],
+        cwd=package_dir,
+        check=False,
+    )
+    return {
+        "returncode": whoami["returncode"],
+        "username": _parse_npm_whoami(whoami["stdout"]),
+        "command": _summarize_command(whoami),
+    }
+
+
+def _parse_npm_whoami(stdout: str) -> str | None:
+    username = stdout.strip().strip('"')
+    return username or None
+
+
+def _diagnose_failures(failures: list[dict[str, Any]]) -> str | None:
+    if not failures:
+        return None
+    publish_tails = [
+        str(item.get("publish", {}).get("stderr_tail", ""))
+        for item in failures
+        if isinstance(item.get("publish"), dict)
+    ]
+    if publish_tails and all(
+        "npm error code E404" in tail and "Not Found - PUT" in tail
+        for tail in publish_tails
+    ):
+        return "npm_scope_permission_or_missing_org"
+    return "npm_publish_failed"
 
 
 def _run(args: list[str], *, cwd: Path, check: bool = True) -> dict[str, Any]:
