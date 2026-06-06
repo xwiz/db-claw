@@ -29,7 +29,7 @@
     "prepack": "pnpm run build",
     "test": "vitest run --passWithNoTests",
     "lint": "biome check src",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -b tsconfig.json --pretty false"
   },
   "dependencies": {
     "@semsql/extractor-sdk": "workspace:*",

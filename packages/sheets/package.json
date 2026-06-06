@@ -20,7 +20,7 @@
     "prepack": "pnpm run build",
     "test": "vitest run",
     "lint": "biome check src",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -b tsconfig.json --pretty false"
   },
   "devDependencies": {
     "@types/node": "^22.7.4",

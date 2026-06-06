@@ -30,7 +30,7 @@
     "test": "vitest run",
     "lint": "biome check src",
     "format": "biome format --write src",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -b tsconfig.json --pretty false"
   },
   "dependencies": {
     "zod": "^3.23.8"
