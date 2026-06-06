@@ -1875,7 +1875,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "semsql-cli"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "prost",
  "prost-build",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-extract-db"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-ffi"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "semsql-core",
  "semsql-graph",
@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-graph"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "indexmap",
  "prost",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-intent"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "fancy-regex",
  "indexmap",
@@ -1965,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-natsql"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "semsql-core",
  "serde",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-renderer"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "rusqlite",
  "semsql-core",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-runtime"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "ahash",
  "async-trait",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "semsql-second-pass"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "ahash",
  "semsql-core",

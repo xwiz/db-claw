@@ -1,6 +1,6 @@
 {
   "name": "@semsql/extractor-cli",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "`semsql-extract` Node binary \u2014 orchestrates framework adapters and emits a SemanticGraph.",
   "license": "Apache-2.0 OR MIT",
   "repository": {
