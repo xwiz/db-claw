@@ -13,7 +13,7 @@ Release checklist only. Numbers live in [v02-evidence-ledger.md](v02-evidence-le
 | Release | clean non-dev tag preflight, real workflow, public package smoke without local binary override | in progress |
 
 Run `pnpm -r typecheck` before `pnpm -r build`; build scripts clean `dist`.
-`alpha.1`/`alpha.2` failed before release creation on CI wiring, not route quality; use `v0.1.0-alpha.3` for the corrected release run.
+`alpha.1`-`alpha.3` failed before release creation on CI/package wiring, not route quality; use `v0.1.0-alpha.4` for the corrected release run.
 Npm publication is manual via `workflow_dispatch publish_npm=true`; tag pushes should not publish packages by accident.
 `v0.1.0-dev` must fail as JSON, not a traceback.
 Diagnostics must expose evidence, fields/values/joins/metrics/date anchors, fail-closed reason, fallback packet, and result shape.

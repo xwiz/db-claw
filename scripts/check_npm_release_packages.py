@@ -34,6 +34,7 @@ DEPENDENCY_SECTIONS = (
 DEV_VERSION_LITERAL = "0.1.0-dev"
 RUNTIME_MEMBER_PREFIXES = ("package/dist/",)
 RUNTIME_MEMBER_SUFFIXES = (".js", ".cjs", ".mjs", ".d.ts", ".map")
+RUN_CHECK_SCRIPTS = ("lint", "build", "test", "typecheck")
 
 
 def repo_root() -> Path:
@@ -105,7 +106,7 @@ def check_release_packages(
         for package in packages:
             package_dir = root / "packages" / str(package["dir"])
             if run_checks:
-                for script in ("lint", "test", "typecheck"):
+                for script in RUN_CHECK_SCRIPTS:
                     command_results.append(
                         _run(
                             [

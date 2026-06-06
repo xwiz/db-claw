@@ -29,19 +29,19 @@ Generate the manifest from built release assets:
 
 ```bash
 uv run python scripts/generate_semsql_downloads_manifest.py \
-  --version 0.1.0-alpha.3 \
-  --base-url https://github.com/xwiz/db-claw/releases/download/v0.1.0-alpha.3 \
+  --version 0.1.0-alpha.4 \
+  --base-url https://github.com/xwiz/db-claw/releases/download/v0.1.0-alpha.4 \
   --asset linux-x64=target/release/semsql \
   --asset win32-x64=target/release/semsql.exe \
   --out semsql-downloads.json
 ```
 
 Retained proofs live in `docs/results`; before publishing, rehearse with
-`python scripts/rehearse_release_packages.py --version 0.1.0-alpha.3`.
+`python scripts/rehearse_release_packages.py --version 0.1.0-alpha.4`.
 After publishing, run `python -m semsql_eval package-public-smoke --version <version>` without `--semsql-bin`.
 
 Prepare the actual tag with `python scripts/prepare_release_versions.py
---version 0.1.0-alpha.3 --apply`.
+--version 0.1.0-alpha.4 --apply`.
 
 Release automation must build/smoke every target, generate downloads metadata,
 pack npm artifacts, reject `workspace:` leaks, version drift, and bad repository
@@ -52,16 +52,16 @@ separate `workflow_dispatch publish_npm=true draft=false` step, followed by
 ## Laravel Alpha
 
 ```bash
-pnpm dlx --package @semsql/cli@0.1.0-alpha.3 \
-  --package @semsql/extractor-cli@0.1.0-alpha.3 \
+pnpm dlx --package @semsql/cli@0.1.0-alpha.4 \
+  --package @semsql/extractor-cli@0.1.0-alpha.4 \
   semsql extract . \
   --framework laravel \
   --db-url "$DATABASE_URL" \
   --no-sample-values \
   -o storage/semsql/app.semsql
 
-pnpm dlx @semsql/cli@0.1.0-alpha.3 doctor --graph storage/semsql/app.semsql
-pnpm dlx @semsql/cli@0.1.0-alpha.3 query --graph storage/semsql/app.semsql "count active users"
+pnpm dlx @semsql/cli@0.1.0-alpha.4 doctor --graph storage/semsql/app.semsql
+pnpm dlx @semsql/cli@0.1.0-alpha.4 query --graph storage/semsql/app.semsql "count active users"
 ```
 
 For production-like schemas:

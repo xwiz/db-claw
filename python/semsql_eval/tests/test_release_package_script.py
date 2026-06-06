@@ -24,6 +24,11 @@ def test_expected_version_from_tag() -> None:
     assert module.expected_version_from_args("v0.1.0", "0.2.0") == "0.2.0"
 
 
+def test_run_checks_build_before_test() -> None:
+    module = _load_script()
+    assert module.RUN_CHECK_SCRIPTS == ("lint", "build", "test", "typecheck")
+
+
 def test_tarball_inspection_flags_workspace_dependency(tmp_path: Path) -> None:
     module = _load_script()
     tarball = tmp_path / "pkg.tgz"
