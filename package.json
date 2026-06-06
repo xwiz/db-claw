@@ -1,7 +1,7 @@
 {
   "name": "semsql-monorepo",
   "private": true,
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "SemanticSQL workspace \u2014 TypeScript extractors and CLI",
   "license": "Apache-2.0 OR MIT",
   "engines": {

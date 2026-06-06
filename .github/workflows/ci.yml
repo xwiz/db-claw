@@ -113,8 +113,6 @@ jobs:
         with:
           node-version: "20"
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Lint
@@ -182,11 +180,11 @@ jobs:
         run: cargo build -p semsql-cli
       - name: Materialise the mini-corpus
         run: |
-          uv run python -m semsql_eval build-mini-corpus \
+          uv run --package semsql-eval python -m semsql_eval build-mini-corpus \
             --out target/spider_mini
       - name: Run cascade against the mini-corpus
         run: |
-          uv run python -m semsql_eval spider \
+          uv run --package semsql-eval python -m semsql_eval spider \
             --questions target/spider_mini/dev.json \
             --db-root target/spider_mini/database \
             --semsql-bin target/debug/semsql \
@@ -233,7 +231,7 @@ jobs:
         run: cargo build -p semsql-cli --locked
       - name: Run pathway product gate
         run: >
-          uv run python -m semsql_eval pathway-benchmark
+          uv run --package semsql-eval python -m semsql_eval pathway-benchmark
           --out target/product-gate/pathway
           --semsql-bin target/debug/semsql
           --schema-variant semantic_alias
@@ -242,7 +240,7 @@ jobs:
           --strict
       - name: Run QueryFrame canary product gate
         run: >
-          uv run python -m semsql_eval queryframe-canary-suite
+          uv run --package semsql-eval python -m semsql_eval queryframe-canary-suite
           --out target/product-gate/queryframe
           --semsql-bin target/debug/semsql
           --out-json target/product-gate/queryframe.json
@@ -261,14 +259,12 @@ jobs:
         with:
           node-version: "20"
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Rehearse alpha npm release packages
         run: >
           python scripts/rehearse_release_packages.py
-          --version 0.1.0-alpha.1
+          --version 0.1.0-alpha.3
           --skip-run-checks
           --pack-destination target/release-rehearsal/npm-alpha
           --out-json target/release-rehearsal/npm-alpha-report.json
