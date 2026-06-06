@@ -1,6 +1,4 @@
-# v0.2 Quality Gate
-
-Date: 2026-06-06
+# v0.2 Quality Gate, 2026-06-06
 
 Release checklist only. Numbers live in [v02-evidence-ledger.md](v02-evidence-ledger.md); aggregate with `python -m semsql_eval production-readiness-report`.
 
@@ -12,10 +10,12 @@ Release checklist only. Numbers live in [v02-evidence-ledger.md](v02-evidence-le
 | Runtime | atlas/queryframe tests, static shortcut audit, artifact guard | pass |
 | Product | CI/release pathway/queryframe gate, aliases, fallback, real DB/framework probes, sharding ambiguity | pass |
 | Packaging | alpha rehearsal, launcher/local registry/dlx, package version/runtime-literal/metadata/scope checks | pass |
-| Release | clean non-dev tag preflight, real workflow, public package smoke without local binary override | blocked |
+| Release | clean non-dev tag preflight, real workflow, public package smoke without local binary override | in progress |
 
 Run `pnpm -r typecheck` before `pnpm -r build`; build scripts clean `dist`.
-`v0.1.0-alpha.1` tag preflight must pass; `v0.1.0-dev` must fail as JSON, not a traceback.
+`v0.1.0-alpha.1` failed in CI before product execution due eval-package invocation, not route quality; use `v0.1.0-alpha.2` for the corrected release run.
+Npm publication is manual via `workflow_dispatch publish_npm=true`; tag pushes should not publish packages by accident.
+`v0.1.0-dev` must fail as JSON, not a traceback.
 Diagnostics must expose evidence, fields/values/joins/metrics/date anchors, fail-closed reason, fallback packet, and result shape.
 
 ## Stop Release If

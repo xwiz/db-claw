@@ -171,7 +171,7 @@ jobs:
 
       - name: Pathway product gate
         run: >
-          uv run python -m semsql_eval pathway-benchmark
+          uv run --package semsql-eval python -m semsql_eval pathway-benchmark
           --out target/release-product-gates/pathway
           --semsql-bin target/debug/semsql
           --schema-variant semantic_alias
@@ -181,7 +181,7 @@ jobs:
 
       - name: QueryFrame canary product gate
         run: >
-          uv run python -m semsql_eval queryframe-canary-suite
+          uv run --package semsql-eval python -m semsql_eval queryframe-canary-suite
           --out target/release-product-gates/queryframe
           --semsql-bin target/debug/semsql
           --out-json target/release-product-gates/queryframe.json
@@ -379,7 +379,7 @@ jobs:
   publish-npm:
     name: Publish npm packages
     needs: [release]
-    if: ${{ github.event_name == 'push' || (inputs.publish_npm && !inputs.draft) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm && !inputs.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -418,7 +418,7 @@ jobs:
   package-public-smoke:
     name: Public package smoke
     needs: [release, publish-npm]
-    if: ${{ github.event_name == 'push' || (inputs.publish_npm && !inputs.draft) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_npm && !inputs.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:

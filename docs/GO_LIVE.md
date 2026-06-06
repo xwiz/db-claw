@@ -44,8 +44,9 @@ Prepare the actual tag with `python scripts/prepare_release_versions.py
 --version 0.1.0-alpha.1 --apply`.
 
 Release automation must build/smoke every target, generate downloads metadata,
-pack/publish npm artifacts, reject `workspace:` leaks, version drift, and bad
-repository metadata, attest assets, upload releases, and run
+pack npm artifacts, reject `workspace:` leaks, version drift, and bad repository
+metadata, attest assets, and upload GitHub release assets. Npm publication is a
+separate `workflow_dispatch publish_npm=true draft=false` step, followed by
 `package-public-smoke`.
 
 ## Laravel Alpha
@@ -71,7 +72,6 @@ For production-like schemas:
 - execute selected SQL only after local validation/rendering.
 
 ## Composer Wrapper
-
 A later Composer package can expose:
 
 ```bash
