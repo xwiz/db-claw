@@ -15,7 +15,9 @@ count projections use generic identifier signals.
 | QueryFrame suite | `9/9`, `144/144` routed, `18/18` rejects |
 | aggregate readiness | `pilot_safe=True`, `release_candidate=False` |
 
-Release blocker remains public package smoke: `@semsql/*` `0.1.0-alpha.1`
-packages are not visible on npm yet.
+Superseded release blocker: this report predates `v0.1.0-alpha.5`.
+GitHub binary release, npm publish, public package smoke, and strict production
+readiness later passed; see
+[v02-production-readiness-release-candidate-v1.md](v02-production-readiness-release-candidate-v1.md).
 
 Artifacts: `target/production_readiness_after_cli_fallback_cleanup/`.

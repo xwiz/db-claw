@@ -23,6 +23,16 @@ MIN_FRAMEWORK_EVIDENCE_COUNT = 2
 MIN_FRAMEWORK_COUNT = 5
 MIN_FRAMEWORK_QUERY_CHECKS = 3
 MIN_FRAMEWORK_SOURCE_VOCAB_GROUNDED = 1
+ANALYTICS_EXPECTED_KINDS = frozenset(
+    {
+        "conditional_rate",
+        "grouped_avg",
+        "filtered_grouped_avg",
+        "value_filtered_grouped_avg",
+        "joined_filtered_grouped_avg",
+        "multi_joined_filtered_grouped_avg",
+    }
+)
 
 
 def load_json_report(path: Path) -> JsonObject:
@@ -409,13 +419,15 @@ def _single_evidence_report_row(report: JsonObject) -> JsonObject:
     summary = _as_object(report.get("summary"))
     status = str(report.get("status") or "unknown")
     summary_pass = summary.get("pass")
+    analytics_questions, analytics_source = _analytics_questions_from_summary(summary)
     return {
         "status": status,
         "engine": str(report.get("engine") or ""),
         "summary_pass": summary_pass if isinstance(summary_pass, bool) else None,
         "questions": int(summary.get("questions") or 0),
         "required_questions": int(summary.get("required_questions") or 0),
-        "analytics_questions": int(summary.get("analytics_questions") or 0),
+        "analytics_questions": analytics_questions,
+        "analytics_question_source": analytics_source,
         "frameworks": int(summary.get("frameworks") or 0),
         "query_checks": int(summary.get("query_checks") or 0),
         "query_ok": int(
@@ -429,6 +441,20 @@ def _single_evidence_report_row(report: JsonObject) -> JsonObject:
         "run_passed": int(summary.get("run_passed") or 0),
         "source": report.get("source"),
     }
+
+
+def _analytics_questions_from_summary(summary: JsonObject) -> tuple[int, str]:
+    if "analytics_questions" in summary:
+        return int(summary.get("analytics_questions") or 0), "summary.analytics_questions"
+
+    expected_kind_counts = _as_object(summary.get("expected_kind_counts"))
+    derived = sum(
+        int(expected_kind_counts.get(kind) or 0)
+        for kind in ANALYTICS_EXPECTED_KINDS
+    )
+    if derived:
+        return derived, "summary.expected_kind_counts"
+    return 0, "none"
 
 
 def _package_public_surface(report: JsonObject | None) -> JsonObject:

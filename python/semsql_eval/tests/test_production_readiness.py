@@ -193,6 +193,66 @@ def test_production_readiness_blocks_shallow_dynamic_evidence() -> None:
     )
 
 
+def test_production_readiness_derives_analytics_from_expected_kind_counts() -> None:
+    report = build_production_readiness_report(
+        pathway_report=_pathway_report(),
+        queryframe_canary_report=_queryframe_report(),
+        llm_safety_report=_llm_safety_report(),
+        realdb_reports=[
+            _realdb_report(
+                engine="mysql",
+                questions=53,
+                analytics=None,
+                expected_kind_counts={
+                    "conditional_rate": 9,
+                    "grouped_avg": 9,
+                    "filtered_grouped_avg": 9,
+                    "value_filtered_grouped_avg": 8,
+                    "joined_filtered_grouped_avg": 9,
+                    "multi_joined_filtered_grouped_avg": 9,
+                },
+            ),
+            _realdb_report(engine="postgres", questions=4, analytics=0),
+        ],
+        framework_reports=[_framework_bridge_report(), _real_app_framework_report()],
+        package_public_smoke_report=_package_public_report(),
+        require_public_package_smoke=True,
+    )
+
+    realdb = report["surfaces"]["realdb"]
+    assert report["summary"]["readiness_level"] == "release_candidate"
+    assert realdb["status"] == "pass"
+    assert realdb["analytics_question_count"] == 53
+    assert realdb["reports"][0]["analytics_question_source"] == (
+        "summary.expected_kind_counts"
+    )
+
+
+def test_production_readiness_does_not_treat_shallow_kinds_as_analytics() -> None:
+    report = build_production_readiness_report(
+        pathway_report=_pathway_report(),
+        queryframe_canary_report=_queryframe_report(),
+        llm_safety_report=_llm_safety_report(),
+        realdb_reports=[
+            _realdb_report(
+                engine="mysql",
+                questions=12,
+                analytics=None,
+                expected_kind_counts={"count": 8, "list": 4},
+            ),
+            _realdb_report(engine="postgres", questions=4, analytics=0),
+        ],
+        framework_reports=[_framework_bridge_report(), _real_app_framework_report()],
+        package_public_smoke_report=_package_public_report(),
+    )
+
+    realdb = report["surfaces"]["realdb"]
+    assert report["summary"]["readiness_level"] == "blocked"
+    assert realdb["status"] == "fail"
+    assert realdb["analytics_question_count"] == 0
+    assert "realdb_analytics_question_count_below_minimum" in realdb["failures"]
+
+
 def test_production_readiness_cli_strict_fails_when_core_missing() -> None:
     result = CliRunner().invoke(cli, ["production-readiness-report", "--strict"])
 
@@ -331,18 +391,23 @@ def _realdb_report(
     passed: bool = True,
     engine: str = "mysql",
     questions: int = 12,
-    analytics: int = 4,
+    analytics: int | None = 4,
+    expected_kind_counts: dict[str, int] | None = None,
 ) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "pass": passed,
+        "questions": questions,
+        "required_questions": min(questions, 8),
+    }
+    if analytics is not None:
+        summary["analytics_questions"] = analytics
+    if expected_kind_counts is not None:
+        summary["expected_kind_counts"] = expected_kind_counts
     return {
         "schema_version": 1,
         "engine": engine,
         "status": status,
-        "summary": {
-            "pass": passed,
-            "questions": questions,
-            "required_questions": min(questions, 8),
-            "analytics_questions": analytics,
-        },
+        "summary": summary,
     }
 
 
