@@ -129,3 +129,5 @@ def test_ablation_gap_cli_writes_markdown_and_json(tmp_path: Path) -> None:
     assert markdown.exists()
     data = json.loads(out_json.read_text(encoding="utf-8"))
     assert data["partitions"]["stage2_shape_blocked"] == 1
+    assert data["provenance"]["generated_at_utc"].endswith("Z")
+    assert data["provenance"]["semsql_eval_version"] == "0.1.0.dev0"

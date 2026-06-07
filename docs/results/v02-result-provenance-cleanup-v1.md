@@ -4,6 +4,7 @@ Date: 2026-06-07. Retained cleanup note; current status remains in [v02-current-
 ## Implemented
 
 - BIRD/Spider JSON reports now include `metadata.provenance` with run start time, report write time, `semsql_eval` version, and `semsql --version` output.
+- Top-level CLI JSON result reports now include `provenance.generated_at_utc` and `provenance.semsql_eval_version`; protocol-shaped packets, request previews, schema cards, and generated suite fixtures are left unchanged.
 - Production-readiness JSON/Markdown reports now include generation provenance and exact input report paths.
 - Docs hygiene now supports `--fail-missing-provenance-for-changed`, requiring new or edited `docs/results/*.md` reports to carry a top-of-file date stamp or exact package/version.
 
@@ -32,4 +33,5 @@ These remain release-surface reruns, not local deterministic reruns:
 
 - `v02-current-status.md` no longer cites the stale June 2 BIRD `5/100` diagnostic.
 - `v02-evidence-ledger.md` labels that BIRD artifact as historical research.
+- Ignored local JSON under `artifacts/results-json/docs-results` was quarantined to `artifacts/results-json/archive-20260607/docs-results` to keep stale June 2/June 4 artifacts out of the current-looking docs-results cache.
 - Legacy retained reports without top-of-file provenance are tolerated only as archive history; any touched or new retained report must be stamped before hygiene passes.

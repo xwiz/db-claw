@@ -436,3 +436,5 @@ def test_oracle_gap_cli_writes_markdown_and_json(tmp_path: Path) -> None:
     assert out.exists()
     data = json.loads(out_json.read_text(encoding="utf-8"))
     assert data["live_stage3_recovery"] == 1.0
+    assert data["provenance"]["generated_at_utc"].endswith("Z")
+    assert data["provenance"]["semsql_eval_version"] == "0.1.0.dev0"

@@ -307,6 +307,8 @@ def test_production_readiness_cli_writes_reports(tmp_path: Path) -> None:
     assert "readiness: `pilot_safe`" in result.output
     payload = json.loads(out_json.read_text(encoding="utf-8"))
     assert payload["summary"]["pilot_safe"] is True
+    assert payload["provenance"]["generated_at_utc"].endswith("Z")
+    assert payload["provenance"]["semsql_eval_version"] == "0.1.0.dev0"
     assert payload["provenance"]["input_reports"]["pathway"] == str(pathway)
     assert payload["provenance"]["input_reports"]["realdb"] == [
         str(realdb),

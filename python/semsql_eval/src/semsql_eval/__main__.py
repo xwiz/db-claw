@@ -6353,8 +6353,7 @@ def realdb_shard_audit_mysql_cmd(
     )
     rendered = render_mysql_sharding_audit_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -6549,8 +6548,7 @@ def llm_resolution_packets_from_pathway_cmd(
     )
     rendered = render_pathway_packet_index_markdown(summary)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -6589,8 +6587,7 @@ def llm_resolution_validate_cmd(
     proposal = proposal_payload.get("proposal", proposal_payload)
     validation = validate_resolution_proposal(packet, proposal)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(validation, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, validation)
     click.echo(json.dumps(validation, indent=2))
     if strict and not validation["valid"]:
         raise click.ClickException("LLM resolution proposal failed validation")
@@ -6635,8 +6632,7 @@ def llm_resolution_render_cmd(
     proposal = proposal_payload.get("proposal", proposal_payload)
     result = render_resolution_proposal(packet, proposal, dialect=dialect)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, result)
     click.echo(json.dumps(result, indent=2))
     if strict and not result["valid"]:
         raise click.ClickException("LLM resolution proposal failed render validation")
@@ -6782,8 +6778,7 @@ def llm_resolution_resolve_packet_cmd(
     )
     rendered = _render_llm_resolution_resolve_packet_markdown(summary)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -7792,8 +7787,7 @@ def llm_resolution_render_batch_cmd(
     )
     rendered = render_resolution_batch_markdown(summary)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -7838,8 +7832,7 @@ def llm_resolution_safety_gate_cmd(
     )
     rendered = render_resolution_safety_expectations_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -7970,8 +7963,7 @@ def llm_resolution_resolve_batch_cmd(
     )
     rendered = render_resolution_provider_batch_markdown(summary)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -8030,8 +8022,7 @@ def llm_resolution_openai_request_batch_cmd(
     )
     rendered = render_openai_request_batch_markdown(summary)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -8238,11 +8229,10 @@ def llm_resolution_capture_query_cmd(
         "artifacts": artifacts,
     }
     rendered = _render_llm_resolution_capture_markdown(summary)
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    _write_json_report(summary_path, summary)
     summary_md_path.write_text(rendered, encoding="utf-8")
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -8471,8 +8461,7 @@ def llm_resolution_fallback_query_cmd(
     )
     rendered = _render_llm_resolution_fallback_query_markdown(summary)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -8733,7 +8722,7 @@ def _run_llm_resolution_fallback_query(
         "artifacts": artifacts,
     }
     rendered = _render_llm_resolution_fallback_query_markdown(summary)
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    _write_json_report(summary_path, summary)
     summary_md_path.write_text(rendered, encoding="utf-8")
     return summary
 
@@ -9137,11 +9126,10 @@ def llm_resolution_fallback_batch_cmd(
     summary_path = out_dir / "fallback-batch.json"
     summary_md_path = out_dir / "fallback-batch.md"
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    _write_json_report(summary_path, summary)
     summary_md_path.write_text(rendered, encoding="utf-8")
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, summary)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
