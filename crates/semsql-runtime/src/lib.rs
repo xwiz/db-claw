@@ -2637,6 +2637,15 @@ fn runtime_bound_query_plan_from_trace(
                     predicate.field, predicate.operator, predicate.value
                 ),
             });
+            plan.predicates.push(BoundPlanPredicateTrace {
+                field: predicate.field.clone(),
+                operator: predicate.operator.clone(),
+                value: predicate.value.clone(),
+                backed_by_atlas,
+                evidence,
+            });
+            plan.reject_reason = Some("missing_value_evidence".to_string());
+            return plan;
         }
         plan.predicates.push(BoundPlanPredicateTrace {
             field: predicate.field.clone(),
@@ -3903,6 +3912,14 @@ fn runtime_predicate_value_evidence(
     }
     if graph_named_date_window_predicate_is_grounded(nl, predicate, field) {
         evidence.push("named_date_window".to_string());
+    }
+    if graph_inferred_date_window_predicate_is_grounded(
+        nl,
+        predicate,
+        field,
+        &atlas.sample_values.values().cloned().collect::<Vec<_>>(),
+    ) {
+        evidence.push("inferred_date_window".to_string());
     }
     if graph_field_looks_date_like(field)
         && (graph_is_date_like(&predicate.value)
@@ -26812,6 +26829,153 @@ mod graph_schema_atlas_tests {
     }
 
     #[test]
+    fn bound_query_plan_requires_value_evidence_for_text_predicates() {
+        let entities = vec![entity_row("accounts")];
+        let fields = vec![
+            field_row("accounts", "company_name"),
+            field_row("accounts", "segment"),
+        ];
+        let trace = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "show enterprise accounts".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT \"accounts\".\"company_name\" FROM \"accounts\" WHERE \"accounts\".\"segment\" = 'enterprise'"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: Some("accounts.company_name".to_string()),
+                fields: vec!["accounts.company_name".to_string()],
+                expression: "\"accounts\".\"company_name\"".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "accounts.segment".to_string(),
+                value: "enterprise".to_string(),
+                operator: "=".to_string(),
+            }],
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+
+        let empty_atlas = semantic_runtime_atlas(&entities, &fields, &[], &[], &[]);
+        let empty_intent =
+            runtime_intent_frame_from_trace("show enterprise accounts", &trace, &empty_atlas);
+        let empty_plan = runtime_bound_query_plan_from_trace(
+            "show enterprise accounts",
+            &trace,
+            &empty_atlas,
+            &empty_intent,
+        );
+
+        assert!(!empty_plan.valid, "{empty_plan:?}");
+        assert_eq!(
+            empty_plan.reject_reason.as_deref(),
+            Some("missing_value_evidence")
+        );
+        assert!(
+            empty_plan
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "missing_value_evidence"),
+            "{empty_plan:?}"
+        );
+
+        let samples = vec![sample_row("accounts.segment", &["enterprise"])];
+        let sampled_atlas = semantic_runtime_atlas(&entities, &fields, &[], &samples, &[]);
+        let sampled_intent =
+            runtime_intent_frame_from_trace("show enterprise accounts", &trace, &sampled_atlas);
+        let sampled_plan = runtime_bound_query_plan_from_trace(
+            "show enterprise accounts",
+            &trace,
+            &sampled_atlas,
+            &sampled_intent,
+        );
+
+        assert!(sampled_plan.valid, "{sampled_plan:?}");
+        assert_eq!(
+            sampled_plan.predicates[0].evidence,
+            vec!["sample_value".to_string()]
+        );
+    }
+
+    #[test]
+    fn bound_query_plan_allows_typed_source_free_literals() {
+        let entities = vec![entity_row("transactions")];
+        let fields = vec![
+            field_row("transactions", "transaction_code"),
+            typed_field_row("transactions", "speed_score", "INTEGER"),
+            typed_field_row("transactions", "created_at", "DATETIME"),
+        ];
+        let trace = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "show transactions with speed score 20 in February 2024".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT \"transactions\".\"transaction_code\" FROM \"transactions\" \
+                 WHERE \"transactions\".\"speed_score\" = 20 \
+                 AND \"transactions\".\"created_at\" >= '2024-02-01' \
+                 AND \"transactions\".\"created_at\" < '2024-03-01'"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "transactions".to_string(),
+                field: Some("transactions.transaction_code".to_string()),
+                fields: vec!["transactions.transaction_code".to_string()],
+                expression: "\"transactions\".\"transaction_code\"".to_string(),
+            }),
+            predicates: vec![
+                RuntimeQueryFramePredicateTrace {
+                    field: "transactions.speed_score".to_string(),
+                    value: "20".to_string(),
+                    operator: "=".to_string(),
+                },
+                RuntimeQueryFramePredicateTrace {
+                    field: "transactions.created_at".to_string(),
+                    value: "2024-02-01..2024-03-01".to_string(),
+                    operator: "range".to_string(),
+                },
+            ],
+            required_entities: vec!["transactions".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        let atlas = semantic_runtime_atlas(&entities, &fields, &[], &[], &[]);
+        let intent = runtime_intent_frame_from_trace(
+            "show transactions with speed score 20 in February 2024",
+            &trace,
+            &atlas,
+        );
+        let plan = runtime_bound_query_plan_from_trace(
+            "show transactions with speed score 20 in February 2024",
+            &trace,
+            &atlas,
+            &intent,
+        );
+
+        assert!(plan.valid, "{plan:?}");
+        assert!(
+            plan.predicates
+                .iter()
+                .any(|predicate| predicate.evidence == vec!["structured_number".to_string()]),
+            "{plan:?}"
+        );
+        assert!(
+            plan.predicates
+                .iter()
+                .any(|predicate| predicate.evidence.contains(&"structured_date".to_string())),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
     fn bound_query_plan_allows_projected_entity_when_alias_ties_first_mention() {
         let entities = vec![entity_row("clients"), entity_row("customer_events")];
         let fields = vec![
@@ -31505,6 +31669,15 @@ mod graph_schema_atlas_tests {
             )
             .unwrap();
         }
+        insert_sample_values(
+            &conn,
+            SampleValuesInsert {
+                field_canonical: "users.displayname",
+                examples_json: r#"["csgillespie"]"#,
+                pii_redacted: false,
+            },
+        )
+        .unwrap();
         drop(conn);
 
         let cascade = Cascade::load(&path, None).unwrap();
