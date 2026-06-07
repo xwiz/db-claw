@@ -94,6 +94,14 @@ def test_spider_cli_applies_oracle_filter_before_offset_and_limit(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(report.read_text(encoding="utf-8"))
+    provenance = payload["metadata"]["provenance"]
+    assert provenance["run_started_at_utc"].endswith("Z")
+    assert provenance["report_written_at_utc"].endswith("Z")
+    assert provenance["semsql_eval_version"] == "0.1.0.dev0"
+    assert (
+        provenance["semsql_bin_version"]["path"].replace("\\", "/")
+        == "target/debug/semsql.exe"
+    )
     assert payload["metadata"]["source_total"] == 4
     assert payload["metadata"]["filtered_total"] == 3
     assert payload["metadata"]["offset"] == 1

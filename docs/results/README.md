@@ -12,10 +12,12 @@ Only Start Here docs are live; other Markdown is retained one-run history.
 
 ## Hygiene Contract
 ```bash
-python scripts/check_docs_hygiene.py --fail-current-looking --fail-unregistered-current-looking --fail-large-retained --fail-missing-historical-banner --top 12
+python scripts/check_docs_hygiene.py --fail-current-looking --fail-unregistered-current-looking --fail-large-retained --fail-missing-historical-banner --fail-missing-provenance-for-changed --top 12
 python scripts/check_git_artifacts.py --all
 ```
 
 Run `python scripts/audit_v02_artifacts.py` before deleting under `target/v02`.
 Living docs stay short; retained reports explain one run only. Promote durable
 numbers to the ledger; register, rename, or banner anything that looks current.
+New or edited retained reports must carry a clear date stamp or exact package
+version near the top.

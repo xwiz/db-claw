@@ -164,6 +164,19 @@ def render_production_readiness_markdown(report: JsonObject) -> str:
     lines = [
         "# SemSQL Production Readiness Report",
         "",
+    ]
+    provenance = report.get("provenance")
+    if isinstance(provenance, dict):
+        generated_at = provenance.get("generated_at_utc")
+        eval_version = provenance.get("semsql_eval_version")
+        if generated_at:
+            lines.append(f"- generated: `{generated_at}`")
+        if eval_version:
+            lines.append(f"- semsql_eval version: `{eval_version}`")
+        if generated_at or eval_version:
+            lines.append("")
+
+    lines.extend([
         f"- readiness: `{summary['readiness_level']}`",
         f"- pilot safe: `{summary['pilot_safe']}`",
         f"- release candidate: `{summary['release_candidate']}`",
@@ -174,7 +187,7 @@ def render_production_readiness_markdown(report: JsonObject) -> str:
         "",
         "| Surface | Status | Wrong accepted SQL | Route gaps | Notes |",
         "|---|---:|---:|---:|---|",
-    ]
+    ])
     for name in (
         "pathway",
         "queryframe_canary",

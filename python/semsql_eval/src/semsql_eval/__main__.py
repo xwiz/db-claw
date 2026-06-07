@@ -25,6 +25,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -35,6 +36,7 @@ from urllib.parse import unquote, urlsplit
 
 import click
 
+from . import __version__ as SEMSQL_EVAL_VERSION
 from .ablation_gap import (
     ablation_gap_report,
     ablation_gap_report_to_json,
@@ -253,8 +255,7 @@ def framework_bridge_probe_cmd(
     rendered = render_framework_bridge_probe_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -310,8 +311,7 @@ def package_bridge_probe_cmd(
     rendered = render_package_bridge_probe_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -376,8 +376,7 @@ def package_launcher_smoke_cmd(
     rendered = render_package_launcher_smoke_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -442,8 +441,7 @@ def package_dlx_smoke_cmd(
     rendered = render_package_dlx_smoke_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -515,8 +513,7 @@ def package_registry_smoke_cmd(
     rendered = render_package_registry_smoke_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -629,8 +626,7 @@ def package_public_smoke_cmd(
     rendered = render_package_public_smoke_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -770,8 +766,7 @@ def real_app_framework_probe_cmd(
     rendered = render_real_app_framework_probe_markdown(report)
     click.echo(rendered.rstrip())
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -845,8 +840,7 @@ def binder_probe_cmd(
         only_mismatches=only_mismatches,
     )
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(report.to_json() + "\n", encoding="utf-8")
+        _write_json_report_text(out_json, report.to_json())
     markdown = render_binder_probe_markdown(report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
@@ -931,8 +925,7 @@ def queryframe_probe_cmd(
         exec_timeout_seconds=exec_timeout_seconds,
     )
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(report.to_json() + "\n", encoding="utf-8")
+        _write_json_report_text(out_json, report.to_json())
     markdown = render_queryframe_probe_markdown(report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
@@ -974,7 +967,7 @@ def semantic_atlas_assessment_cmd(
     md_path = out_md or (out_dir / "semantic_atlas_assessment.md")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    _write_json_report(json_path, report)
     rendered = render_semantic_atlas_assessment_markdown(report)
     md_path.write_text(rendered, encoding="utf-8")
     click.echo(rendered)
@@ -1202,6 +1195,8 @@ def spider_cmd(
         indexed_examples = indexed_examples[:limit]
     selected_total = len(indexed_examples)
     dataset_hash = _sha256_file(questions_path)
+    run_started_at_utc = _utc_timestamp()
+    semsql_bin_version = _semsql_bin_version(semsql_bin)
 
     oracle_stats = {
         "stage2_hits": 0,
@@ -1357,6 +1352,8 @@ def spider_cmd(
                 exec_timeout_seconds=exec_timeout_seconds,
                 checkpoint_every=checkpoint_every,
                 progress_every=progress_every,
+                run_started_at_utc=run_started_at_utc,
+                semsql_bin_version=semsql_bin_version,
                 summary=summary,
                 timeout_count=timeout_count,
                 stage_counts=stage_counts,
@@ -1498,6 +1495,8 @@ def _spider_report_payload(
     exec_timeout_seconds: float,
     checkpoint_every: int,
     progress_every: int,
+    run_started_at_utc: str,
+    semsql_bin_version: dict[str, object],
     summary: EvalSummary,
     timeout_count: int,
     stage_counts: dict[str, int],
@@ -1512,6 +1511,12 @@ def _spider_report_payload(
     return {
         "schema_version": 2,
         "metadata": {
+            "provenance": {
+                "run_started_at_utc": run_started_at_utc,
+                "report_written_at_utc": _utc_timestamp(),
+                "semsql_eval_version": SEMSQL_EVAL_VERSION,
+                "semsql_bin_version": semsql_bin_version,
+            },
             "dataset_hash": dataset_hash,
             "questions_path": str(questions_path),
             "db_root": str(db_root),
@@ -1924,6 +1929,79 @@ def _command_metadata(ctx: click.Context) -> dict[str, Any]:
     }
 
 
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _semsql_bin_version(semsql_bin: Path) -> dict[str, object]:
+    try:
+        proc = subprocess.run(
+            [str(semsql_bin), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except OSError as exc:
+        return {
+            "path": str(semsql_bin),
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "path": str(semsql_bin),
+            "ok": False,
+            "error": "timeout running --version",
+        }
+    stdout = proc.stdout.strip()
+    stderr = proc.stderr.strip()
+    return {
+        "path": str(semsql_bin),
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def _result_provenance() -> dict[str, object]:
+    return {
+        "generated_at_utc": _utc_timestamp(),
+        "semsql_eval_version": SEMSQL_EVAL_VERSION,
+    }
+
+
+def _with_result_provenance(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+        payload["provenance"] = provenance
+    for key, value in _result_provenance().items():
+        provenance.setdefault(key, value)
+    return payload
+
+
+def _write_json_report(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(_with_result_provenance(payload), indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_json_report_text(path: Path, payload: str) -> None:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(payload.rstrip() + "\n", encoding="utf-8")
+        return
+    _write_json_report(path, parsed)
+
+
 @cli.command("gate-report")
 @click.option(
     "--profile",
@@ -2058,8 +2136,7 @@ def diagnose_report_cmd(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(rendered, encoding="utf-8")
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(diagnosis_report_to_json(report) + "\n", encoding="utf-8")
+        _write_json_report_text(out_json, diagnosis_report_to_json(report))
 
 
 @cli.command("ablation-gap")
@@ -2137,8 +2214,7 @@ def ablation_gap_cmd(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(rendered, encoding="utf-8")
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(ablation_gap_report_to_json(report) + "\n", encoding="utf-8")
+        _write_json_report_text(out_json, ablation_gap_report_to_json(report))
 
 
 @cli.command("oracle-gap")
@@ -2208,8 +2284,7 @@ def oracle_gap_cmd(
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(rendered, encoding="utf-8")
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(oracle_gap_report_to_json(report) + "\n", encoding="utf-8")
+        _write_json_report_text(out_json, oracle_gap_report_to_json(report))
 
 
 @cli.command("build-mini-corpus")
@@ -2509,7 +2584,7 @@ def pathway_benchmark_cmd(
     md_path = out_md or (out_dir / "pathway_benchmark.md")
     json_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    _write_json_report(json_path, report)
     md_path.write_text(rendered, encoding="utf-8")
     click.echo(rendered.rstrip())
     failures = pathway_product_gate_failures(report)
@@ -2610,10 +2685,27 @@ def production_readiness_report_cmd(
         ),
         require_public_package_smoke=require_public_package_smoke,
     )
+    report["provenance"] = {
+        "generated_at_utc": _utc_timestamp(),
+        "semsql_eval_version": SEMSQL_EVAL_VERSION,
+        "input_reports": {
+            "pathway": str(pathway_report_json) if pathway_report_json else None,
+            "queryframe_canary": (
+                str(queryframe_canary_json) if queryframe_canary_json else None
+            ),
+            "llm_safety": str(llm_safety_json) if llm_safety_json else None,
+            "realdb": [str(path) for path in realdb_json],
+            "framework": [str(path) for path in framework_json],
+            "package_public_smoke": (
+                str(package_public_smoke_json)
+                if package_public_smoke_json
+                else None
+            ),
+        },
+    }
     rendered = render_production_readiness_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -2735,8 +2827,7 @@ def queryframe_canary_cmd(
     )
     rendered = render_queryframe_canary_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -2855,8 +2946,7 @@ def queryframe_canary_postgres_cmd(
     )
     rendered = render_queryframe_postgres_canary_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -2971,8 +3061,7 @@ def queryframe_canary_mysql_cmd(
     )
     rendered = render_queryframe_mysql_canary_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -3109,8 +3198,7 @@ def realdb_schema_probe_mysql_cmd(
     )
     rendered = render_mysql_realdb_schema_probe_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -3255,8 +3343,7 @@ def realdb_schema_probe_mysql_suite_cmd(
     )
     rendered = render_mysql_realdb_schema_probe_suite_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -3385,8 +3472,7 @@ def realdb_schema_probe_postgres_cmd(
     )
     rendered = render_postgres_realdb_schema_probe_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -3523,8 +3609,7 @@ def realdb_schema_probe_postgres_suite_cmd(
     )
     rendered = render_postgres_realdb_schema_probe_suite_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -3700,8 +3785,7 @@ def realdb_typed_fallback_mysql_cmd(
     )
     rendered = _render_realdb_typed_fallback_mysql_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -3888,8 +3972,7 @@ def realdb_typed_fallback_mysql_suite_cmd(
     )
     rendered = _render_realdb_typed_fallback_mysql_suite_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -4066,8 +4149,7 @@ def realdb_typed_fallback_postgres_cmd(
     )
     rendered = _render_realdb_typed_fallback_postgres_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -4255,8 +4337,7 @@ def realdb_typed_fallback_postgres_suite_cmd(
     )
     rendered = _render_realdb_typed_fallback_postgres_suite_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -4688,8 +4769,7 @@ def realdb_typed_fallback_recover_report_cmd(
     )
     rendered = _render_realdb_typed_fallback_recovery_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")
@@ -9777,8 +9857,7 @@ def queryframe_canary_suite_cmd(
     )
     rendered = render_queryframe_canary_suite_markdown(report)
     if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        _write_json_report(out_json, report)
     if out_md is not None:
         out_md.parent.mkdir(parents=True, exist_ok=True)
         out_md.write_text(rendered, encoding="utf-8")

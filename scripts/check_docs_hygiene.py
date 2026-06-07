@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -64,6 +65,12 @@ RETAINED_REPORT_NAMES = (
     "slice",
 )
 
+PROVENANCE_DATE_RE = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+PROVENANCE_VERSION_RE = re.compile(
+    r"(?i)(package version|version:\s*`?\d|@semsql/cli@|"
+    r"semsql\s+\d+\.\d+\.\d+|v\d+\.\d+\.\d+|0\.1\.0-)"
+)
+
 
 def repo_root() -> Path:
     git = shutil.which("git")
@@ -84,6 +91,35 @@ def line_count(path: Path) -> int:
 
 def size_kib(path: Path) -> float:
     return path.stat().st_size / 1024
+
+
+def has_result_provenance(path: Path) -> bool:
+    header = "\n".join(path.read_text(encoding="utf-8").splitlines()[:10])
+    return bool(PROVENANCE_DATE_RE.search(header) or PROVENANCE_VERSION_RE.search(header))
+
+
+def changed_result_markdown(root: Path) -> list[Path]:
+    git = shutil.which("git")
+    if git is None:
+        return []
+    proc = subprocess.run(
+        [git, "status", "--short", "--", "docs/results"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=root,
+    )
+    paths: list[Path] = []
+    for line in proc.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        raw = line[3:]
+        if " -> " in raw:
+            raw = raw.split(" -> ", 1)[1]
+        path = root / raw
+        if path.suffix == ".md" and path.exists() and path.name != "README.md":
+            paths.append(path)
+    return sorted(paths)
 
 
 def main() -> int:
@@ -129,6 +165,22 @@ def main() -> int:
         help=(
             "fail when known superseded or strategy-looking reports do not "
             "declare their historical/retained status near the top"
+        ),
+    )
+    parser.add_argument(
+        "--fail-missing-provenance-for-changed",
+        action="store_true",
+        help=(
+            "fail when changed docs/results Markdown reports do not declare "
+            "a date stamp or exact package/version provenance near the top"
+        ),
+    )
+    parser.add_argument(
+        "--fail-missing-provenance",
+        action="store_true",
+        help=(
+            "fail when any docs/results Markdown report does not declare a "
+            "date stamp or exact package/version provenance near the top"
         ),
     )
     parser.add_argument(
@@ -220,6 +272,22 @@ def main() -> int:
                     "superseded/strategy-looking report is missing a retained "
                     f"banner near the top: {path.relative_to(root).as_posix()}"
                 )
+
+    provenance_paths: list[Path] = []
+    if args.fail_missing_provenance:
+        provenance_paths = [
+            path
+            for path in sorted((root / "docs/results").glob("*.md"))
+            if path.name != "README.md"
+        ]
+    elif args.fail_missing_provenance_for_changed:
+        provenance_paths = changed_result_markdown(root)
+    for path in provenance_paths:
+        if not has_result_provenance(path):
+            failures.append(
+                "result report is missing date/version provenance near the top: "
+                f"{path.relative_to(root).as_posix()}"
+            )
 
     if args.top > 0:
         reports = sorted(

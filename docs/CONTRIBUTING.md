@@ -84,10 +84,12 @@ Run the docs hygiene check when changing living status, gate, or plan docs:
 python scripts/check_docs_hygiene.py --fail-current-looking --fail-large-retained --top 12
 ```
 
-Use the warning mode during broad cleanup passes:
+Retained result reports need provenance near the top: `Date: YYYY-MM-DD` or
+the exact package/version used. Use warning/provenance modes during cleanup:
 
 ```bash
 python scripts/check_docs_hygiene.py --warn-current-looking --top 12
+python scripts/check_docs_hygiene.py --fail-missing-provenance-for-changed
 ```
 
 ## Artifact Rules

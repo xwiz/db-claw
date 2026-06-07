@@ -33,7 +33,7 @@ or `artifacts/`.
 Run the strict docs gate before committing docs:
 
 ```bash
-python scripts/check_docs_hygiene.py --fail-current-looking --fail-unregistered-current-looking --fail-large-retained --fail-missing-historical-banner --top 12
+python scripts/check_docs_hygiene.py --fail-current-looking --fail-unregistered-current-looking --fail-large-retained --fail-missing-historical-banner --fail-missing-provenance-for-changed --top 12
 ```
 
 Use `--warn-current-looking` only during exploratory cleanup.

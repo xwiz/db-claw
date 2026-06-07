@@ -305,7 +305,13 @@ def test_production_readiness_cli_writes_reports(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "readiness: `pilot_safe`" in result.output
-    assert json.loads(out_json.read_text(encoding="utf-8"))["summary"]["pilot_safe"] is True
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["summary"]["pilot_safe"] is True
+    assert payload["provenance"]["input_reports"]["pathway"] == str(pathway)
+    assert payload["provenance"]["input_reports"]["realdb"] == [
+        str(realdb),
+        str(realdb_extra),
+    ]
     assert "SemSQL Production Readiness Report" in out_md.read_text(encoding="utf-8")
 
 
