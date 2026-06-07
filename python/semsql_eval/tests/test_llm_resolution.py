@@ -440,6 +440,7 @@ def test_schema_card_summarizes_graph_and_shard_family(tmp_path: Path) -> None:
     card = build_schema_card(graph)
 
     assert card["summary"]["entity_count"] == 4
+    assert card["summary"]["physical_table_family_count"] == 1
     assert card["summary"]["ambiguous_physical_family_count"] == 1
     assert card["summary"]["value_dictionary_count"] == 2
     mails = next(entity for entity in card["entities"] if entity["name"] == "mails")
@@ -448,6 +449,10 @@ def test_schema_card_summarizes_graph_and_shard_family(tmp_path: Path) -> None:
     assert "ordered_on" in mails["date_fields"]
     assert "joined_on" in mails["date_fields"]
     assert mails["fields"][0]["samples"] == []
+    assert card["physical_table_families"][0]["base_table"] == "mails"
+    assert card["physical_table_families"][0]["requires_clarification"] is True
+    assert card["physical_table_families"][0]["members"][0]["entity"] == "mails"
+    assert card["physical_table_families"][0]["members"][0]["role"] == "base_table"
     assert card["shard_families"][0]["base"] == "mails"
     assert card["shard_families"][0]["ambiguous_without_anchor"] is True
 
@@ -471,6 +476,12 @@ def test_rejected_query_packet_marks_ambiguous_family(tmp_path: Path) -> None:
     assert packet["allowed_resolution_contract"]["must_not_emit_final_sql"] is True
     assert (
         packet["allowed_resolution_contract"][
+            "must_clarify_ambiguous_physical_table_families"
+        ]
+        is True
+    )
+    assert (
+        packet["allowed_resolution_contract"][
             "must_clarify_ambiguous_physical_shard_families"
         ]
         is True
@@ -479,7 +490,9 @@ def test_rejected_query_packet_marks_ambiguous_family(tmp_path: Path) -> None:
     assert packet["allowed_resolution_contract"]["row_list_routes_are_locally_capped"] is True
     families = packet["local_candidates"]["ambiguous_physical_families_mentioned"]
     assert len(families) == 1
+    assert families[0]["base_table"] == "mails"
     assert families[0]["base"] == "mails"
+    assert families[0]["requires_clarification"] is True
     value_hit = next(
         hit
         for hit in packet["local_candidates"]["value_dictionary_hits"]
@@ -577,6 +590,32 @@ def test_resolution_proposal_rejects_ambiguous_shard_family_route(
     }
     assert result["valid"] is False
     assert result["sql"] is None
+
+
+def test_resolution_proposal_rejects_cli_style_physical_family_packet(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_graph(graph, include_shards=True)
+    packet = build_rejected_query_packet(graph, "show mails sent today")
+    packet["schema_card"].pop("shard_families", None)
+    family = packet["schema_card"]["physical_table_families"][0]
+    packet["local_candidates"]["ambiguous_physical_families_mentioned"] = [
+        {
+            "base_table": family["base_table"],
+            "anchor": family["anchor"],
+            "member_count": family["member_count"],
+            "matched_tokens": ["mail", "mails"],
+            "requires_clarification": True,
+        }
+    ]
+
+    validation = validate_resolution_proposal(packet, _valid_sent_mail_proposal())
+
+    assert validation["valid"] is False
+    assert "ambiguous_shard_family_route" in {
+        issue["code"] for issue in validation["issues"]
+    }
 
 
 def test_pathway_rejected_packet_batch_uses_fail_closed_route_rows(tmp_path: Path) -> None:

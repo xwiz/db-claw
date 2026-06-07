@@ -204,7 +204,8 @@ def build_schema_card(
     for field in fields:
         fields_by_entity[str(field["entity"])].append(field)
 
-    shard_families = _detect_shard_families(entities)
+    physical_table_families = _detect_physical_table_families(entities)
+    shard_families = _legacy_shard_family_cards(physical_table_families)
     shard_entity_names = {
         member
         for family in shard_families
@@ -249,6 +250,7 @@ def build_schema_card(
             "relationship_count": len(relationships),
             "metric_definition_count": len(metric_definitions),
             "sample_values_included": include_samples,
+            "physical_table_family_count": len(physical_table_families),
             "shard_family_count": len(shard_families),
             "ambiguous_physical_family_count": len(ambiguous_families),
             "value_dictionary_count": sum(
@@ -265,6 +267,7 @@ def build_schema_card(
         "entities": entity_cards,
         "relationships": relationship_cards,
         "metric_definitions": metric_definitions,
+        "physical_table_families": physical_table_families,
         "shard_families": shard_families,
         "safety": {
             "samples_policy": (
@@ -274,6 +277,7 @@ def build_schema_card(
             ),
             "llm_may_not_execute_sql": True,
             "llm_sql_must_be_revalidated": True,
+            "ambiguous_physical_tables_fail_closed": True,
             "value_dictionary_policy": (
                 "field_scoped_scope_predicate_vocabulary_only"
             ),
@@ -312,6 +316,7 @@ def build_rejected_query_packet(
             "must_reference_schema_card_entities_and_fields": True,
             "value_filters_should_use_schema_card_value_dictionary_samples_or_enum_hits": True,
             "must_ask_clarifying_questions_on_ambiguity": True,
+            "must_clarify_ambiguous_physical_table_families": True,
             "must_clarify_ambiguous_physical_shard_families": True,
             "must_not_route_sensitive_schema": True,
             "row_list_routes_are_locally_capped": True,
@@ -410,13 +415,7 @@ def _enrich_schema_card_with_seed_fields(
             requested_fields,
         )
 
-    shard_entity_names = {
-        member
-        for family in schema_card.get("shard_families", [])
-        if isinstance(family, dict)
-        for member in family.get("member_entities", [])
-        if isinstance(member, str)
-    }
+    shard_entity_names = _schema_card_physical_family_members(schema_card)
     entity_added = 0
     for entity_name in sorted(requested_entities):
         if entity_name in entity_cards:
@@ -669,7 +668,7 @@ def render_schema_card_markdown(card: JsonObject) -> str:
         f"- entities: `{summary['entity_count']}`",
         f"- fields: `{summary['field_count']}`",
         f"- relationships: `{summary['relationship_count']}`",
-        f"- shard families: `{summary['shard_family_count']}`",
+        f"- physical table families: `{summary.get('physical_table_family_count', summary['shard_family_count'])}`",
         f"- ambiguous physical families: `{summary['ambiguous_physical_family_count']}`",
         f"- value dictionary terms: `{summary.get('value_dictionary_count', 0)}`",
         f"- sample values: `{card['safety']['samples_policy']}`",
@@ -687,12 +686,27 @@ def render_schema_card_markdown(card: JsonObject) -> str:
             f"`{', '.join(entity['status_fields']) or '-'}` | "
             f"`{entity['sensitive']}` |"
         )
-    if card["shard_families"]:
+    physical_families = card.get("physical_table_families") or card.get("shard_families", [])
+    if physical_families:
         lines.extend(["", "## Physical Table Families", ""])
-        for family in card["shard_families"]:
+        for family in physical_families:
+            if "members" in family:
+                members = [
+                    str(member.get("entity") or "")
+                    for member in _as_list(family.get("members"))
+                    if isinstance(member, dict)
+                ]
+                base = str(family.get("base_table") or "")
+            else:
+                members = [
+                    str(member)
+                    for member in _as_list(family.get("member_entities"))
+                    if member
+                ]
+                base = str(family.get("base") or "")
             lines.append(
-                f"- `{family['base']}` via `{family['anchor']}`: "
-                f"`{', '.join(family['member_entities'])}`"
+                f"- `{base}` via `{family['anchor']}`: "
+                f"`{', '.join(members)}`"
             )
     return "\n".join(lines) + "\n"
 
@@ -5563,10 +5577,33 @@ def _packet_ambiguous_physical_shard_members(packet: JsonObject) -> set[str]:
     for family in _as_list(candidates.get("ambiguous_physical_families_mentioned")):
         if not isinstance(family, dict):
             continue
-        for member in _as_list(family.get("member_entities")):
-            if member:
-                members.add(str(member))
+        family_members = _physical_family_member_entities(family)
+        if not family_members:
+            family_members = _schema_card_physical_family_members_for_base(
+                packet.get("schema_card", {}),
+                str(family.get("base_table") or family.get("base") or ""),
+            )
+        members.update(family_members)
+    if not members and str(packet.get("route_reason") or "").startswith(
+        "not_routed_ambiguous_physical"
+    ):
+        schema_card = packet.get("schema_card", {})
+        if isinstance(schema_card, dict):
+            members.update(_schema_card_physical_family_members(schema_card))
     return members
+
+
+def _schema_card_physical_family_members_for_base(
+    schema_card: Any,
+    base: str,
+) -> list[str]:
+    if not isinstance(schema_card, dict) or not base:
+        return []
+    for family in _schema_card_physical_families(schema_card):
+        family_base = str(family.get("base_table") or family.get("base") or "")
+        if family_base == base:
+            return _physical_family_member_entities(family)
+    return []
 
 
 def _proposal_limit_issue(proposal: JsonObject) -> JsonObject | None:
@@ -6268,32 +6305,88 @@ def _entity_is_sensitive(entity: JsonObject, fields: list[JsonObject]) -> bool:
     return any(_tokens(f"{field['field']} {field['db_column']}") & SENSITIVE_FIELD_TOKENS for field in fields)
 
 
-def _detect_shard_families(entities: list[JsonObject]) -> list[JsonObject]:
-    canonical_by_table = {
-        str(entity["db_table"]).lower(): str(entity["canonical_name"])
+def _detect_physical_table_families(entities: list[JsonObject]) -> list[JsonObject]:
+    entity_by_canonical = {
+        str(entity["canonical_name"]).lower(): entity
         for entity in entities
     }
+    canonical_by_table = {
+        str(entity["db_table"]).lower(): str(entity["canonical_name"]).lower()
+        for entity in entities
+    }
+    canonical_names = {str(entity["canonical_name"]).lower() for entity in entities}
     by_family: dict[tuple[str, str], list[str]] = defaultdict(list)
     for entity in entities:
         parsed = _parse_shard_table(str(entity["db_table"]))
         if parsed is None:
             continue
         base, anchor = parsed
-        by_family[(base, anchor)].append(str(entity["canonical_name"]))
+        by_family[(base, anchor)].append(str(entity["canonical_name"]).lower())
     families = []
     for (base, anchor), members in sorted(by_family.items()):
         base_entity = canonical_by_table.get(base)
+        if base_entity is None and base in canonical_names:
+            base_entity = base
         if base_entity is not None and base_entity not in members:
             members.append(base_entity)
+        if len(set(members)) < 2:
+            continue
+        member_cards = []
+        for member_name in sorted(set(members)):
+            graph_entity = entity_by_canonical.get(member_name)
+            if graph_entity is None:
+                continue
+            role = (
+                "base_table"
+                if str(graph_entity["db_table"]).lower() == base
+                else "physical_partition"
+            )
+            member_cards.append(
+                {
+                    "entity": str(graph_entity["canonical_name"]),
+                    "db_table": str(graph_entity["db_table"]),
+                    "role": role,
+                }
+            )
+        member_cards.sort(
+            key=lambda member: (
+                0 if member["role"] == "base_table" else 1,
+                str(member["db_table"]),
+            )
+        )
         families.append(
             {
-                "base": base,
+                "base_table": base,
                 "anchor": anchor,
-                "member_entities": sorted(members),
-                "ambiguous_without_anchor": len(members) > 1,
+                "member_count": len(member_cards),
+                "members": member_cards,
+                "requires_clarification": True,
+                "resolution_hint": (
+                    "multiple physical tables look like one logical table family; "
+                    "choose only with app metadata, user clarification, or an explicit metric/table catalog"
+                ),
             }
         )
     return families
+
+
+def _legacy_shard_family_cards(physical_families: list[JsonObject]) -> list[JsonObject]:
+    out = []
+    for family in physical_families:
+        members = [
+            str(member.get("entity") or "")
+            for member in _as_list(family.get("members"))
+            if isinstance(member, dict) and member.get("entity")
+        ]
+        out.append(
+            {
+                "base": str(family.get("base_table") or ""),
+                "anchor": str(family.get("anchor") or ""),
+                "member_entities": members,
+                "ambiguous_without_anchor": len(members) > 1,
+            }
+        )
+    return out
 
 
 def _parse_shard_table(table: str) -> tuple[str, str] | None:
@@ -6364,11 +6457,7 @@ def _local_candidates(
                     "confidence": value_entry["confidence"],
                 }
             )
-    ambiguous_families = []
-    for family in schema_card["shard_families"]:
-        base_tokens = _tokens(str(family["base"]))
-        if question_tokens & base_tokens and family["ambiguous_without_anchor"]:
-            ambiguous_families.append(family)
+    ambiguous_families = _mentioned_physical_table_families(schema_card, question_tokens)
     seed_entities: set[str] = set()
     if graph_rows is not None:
         seed_entities, _seed_fields = _question_schema_seed_refs(question, graph_rows)
@@ -6411,6 +6500,76 @@ def _local_candidates(
         "scope_path_candidates": scope_path_candidates,
         "scope_path_ambiguous": len(scope_path_candidates) > 1,
     }
+
+
+def _mentioned_physical_table_families(
+    schema_card: JsonObject,
+    question_tokens: set[str],
+) -> list[JsonObject]:
+    hits = []
+    for family in _schema_card_physical_families(schema_card):
+        base = str(family.get("base_table") or family.get("base") or "")
+        base_tokens = _tokens(base)
+        if not (question_tokens & base_tokens):
+            continue
+        member_entities = _physical_family_member_entities(family)
+        if len(member_entities) <= 1:
+            continue
+        hit = {
+            "base_table": base,
+            "base": base,
+            "anchor": str(family.get("anchor") or ""),
+            "member_count": len(member_entities),
+            "member_entities": member_entities,
+            "matched_tokens": sorted(question_tokens & base_tokens),
+            "requires_clarification": True,
+            "resolution_hint": (
+                "do not pick a physical partition from the base word alone; "
+                "use app metadata, a table catalog, or ask which partition/scope is intended"
+            ),
+        }
+        members = _as_list(family.get("members"))
+        if members:
+            hit["members"] = members
+        hits.append(hit)
+    return hits
+
+
+def _schema_card_physical_families(schema_card: JsonObject) -> list[JsonObject]:
+    physical = [
+        family
+        for family in _as_list(schema_card.get("physical_table_families"))
+        if isinstance(family, dict)
+    ]
+    if physical:
+        return physical
+    return [
+        family
+        for family in _as_list(schema_card.get("shard_families"))
+        if isinstance(family, dict)
+    ]
+
+
+def _physical_family_member_entities(family: JsonObject) -> list[str]:
+    members = [
+        str(member.get("entity") or "")
+        for member in _as_list(family.get("members"))
+        if isinstance(member, dict) and member.get("entity")
+    ]
+    if not members:
+        members = [
+            str(member)
+            for member in _as_list(family.get("member_entities"))
+            if member
+        ]
+    return sorted({member for member in members if member})
+
+
+def _schema_card_physical_family_members(schema_card: JsonObject) -> set[str]:
+    members: set[str] = set()
+    for family in _schema_card_physical_families(schema_card):
+        members.update(_physical_family_member_entities(family))
+    return members
 
 
 def _source_vocabulary_hits(
