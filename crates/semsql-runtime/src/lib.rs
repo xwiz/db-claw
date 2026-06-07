@@ -224,6 +224,45 @@ pub struct SemanticAtlasEntityTrace {
     pub db_table: String,
     /// Human-facing aliases known for this entity.
     pub aliases: Vec<String>,
+    /// Graph-derived table activity/usefulness evidence, never live row counts.
+    pub activity_hint: SemanticAtlasTableActivityHintTrace,
+}
+
+/// Graph-derived table activity/usefulness evidence for diagnostics and fallback.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SemanticAtlasTableActivityHintTrace {
+    /// Evidence source. Currently graph metadata only, not a live DB row-count probe.
+    pub evidence_source: String,
+    /// Weighted activity/usefulness score from graph evidence counts.
+    pub evidence_score: u32,
+    /// Coarse level derived from `evidence_score`.
+    pub evidence_level: String,
+    /// Number of fields on this entity with non-PII sample values.
+    pub sample_value_field_count: usize,
+    /// Total number of non-PII sample values on this entity.
+    pub sample_value_count: usize,
+    /// Number of fields with field-scoped value dictionary/scope predicate entries.
+    pub value_dictionary_field_count: usize,
+    /// Total field-scoped value dictionary/scope predicate terms.
+    pub value_dictionary_term_count: usize,
+    /// Relationship edges incident to this entity.
+    pub relationship_count: usize,
+    /// Count of display-like fields.
+    pub display_field_count: usize,
+    /// Count of date-like fields.
+    pub date_field_count: usize,
+    /// Count of status/state-like fields.
+    pub status_field_count: usize,
+    /// Count of numeric fields.
+    pub numeric_field_count: usize,
+    /// Role inside a detected physical table family, when present.
+    pub physical_family_role: Option<String>,
+    /// Human-readable evidence components.
+    pub evidence: Vec<String>,
+    /// Optional live row estimate. Always absent for graph-only atlas traces.
+    pub approx_rows: Option<u64>,
+    /// Source of `approx_rows`. Always absent for graph-only atlas traces.
+    pub row_count_source: Option<String>,
 }
 
 /// One field in the query-time SemanticAtlas trace.
@@ -1628,6 +1667,7 @@ impl RuntimeSemanticAtlas {
     fn trace(&self) -> SemanticAtlasTrace {
         let mut entity_rows: Vec<&EntityRow> = self.entities.values().collect();
         entity_rows.sort_by(|left, right| left.canonical_name.cmp(&right.canonical_name));
+        let physical_roles = semantic_physical_family_roles(self.entities.values());
         let mut field_rows: Vec<&FieldRow> = self.fields.values().collect();
         field_rows.sort_by_key(|field| field.canonical());
         let mut relationships = self.relationships.clone();
@@ -1652,6 +1692,16 @@ impl RuntimeSemanticAtlas {
                     entity: entity.canonical_name.clone(),
                     db_table: entity.db_table.clone(),
                     aliases: semantic_entity_aliases(entity, &self.vocabulary),
+                    activity_hint: semantic_table_activity_hint(
+                        entity,
+                        &self.fields,
+                        &self.relationships,
+                        &self.sample_values,
+                        &self.vocabulary,
+                        physical_roles
+                            .get(&entity.canonical_name.to_ascii_lowercase())
+                            .map(String::as_str),
+                    ),
                 })
                 .collect(),
             fields: field_rows
@@ -1804,6 +1854,224 @@ fn semantic_field_sensitive(field: &FieldRow) -> bool {
     ]
     .iter()
     .any(|needle| name.contains(needle))
+}
+
+#[derive(Clone, Debug, Default)]
+struct SemanticTableActivityCounts {
+    sample_value_field_count: usize,
+    sample_value_count: usize,
+    value_dictionary_field_count: usize,
+    value_dictionary_term_count: usize,
+    relationship_count: usize,
+    display_field_count: usize,
+    date_field_count: usize,
+    status_field_count: usize,
+    numeric_field_count: usize,
+    physical_family_role: Option<String>,
+}
+
+fn semantic_table_activity_hint(
+    entity: &EntityRow,
+    fields: &HashMap<String, FieldRow>,
+    relationships: &[RelationshipRow],
+    sample_values: &HashMap<String, SampleValueRow>,
+    vocabulary: &[VocabularyEntry],
+    physical_family_role: Option<&str>,
+) -> SemanticAtlasTableActivityHintTrace {
+    let entity_key = entity.canonical_name.to_ascii_lowercase();
+    let entity_fields: Vec<&FieldRow> = fields
+        .values()
+        .filter(|field| field.entity.eq_ignore_ascii_case(&entity.canonical_name))
+        .collect();
+
+    let sample_rows: Vec<&SampleValueRow> = sample_values
+        .iter()
+        .filter_map(|(field_ref, row)| {
+            semantic_field_ref_entity(field_ref)
+                .filter(|field_entity| field_entity.eq_ignore_ascii_case(&entity_key))
+                .map(|_| row)
+        })
+        .collect();
+    let sample_value_field_count = sample_rows.len();
+    let sample_value_count = sample_rows
+        .iter()
+        .map(|row| row.examples.len())
+        .sum::<usize>();
+
+    let mut value_dictionary_fields = HashSet::new();
+    let mut value_dictionary_term_count = 0usize;
+    for entry in vocabulary {
+        let Some(field_ref) = semantic_scope_predicate_field(entry) else {
+            continue;
+        };
+        let Some(field_entity) = semantic_field_ref_entity(&field_ref) else {
+            continue;
+        };
+        if field_entity.eq_ignore_ascii_case(&entity_key) {
+            value_dictionary_fields.insert(field_ref.to_ascii_lowercase());
+            value_dictionary_term_count += 1;
+        }
+    }
+    let value_dictionary_field_count = value_dictionary_fields.len();
+
+    let relationship_count = relationships
+        .iter()
+        .filter(|relationship| {
+            relationship
+                .from_entity
+                .eq_ignore_ascii_case(&entity.canonical_name)
+                || relationship
+                    .to_entity
+                    .eq_ignore_ascii_case(&entity.canonical_name)
+        })
+        .count();
+
+    let mut display_field_count = 0usize;
+    let mut date_field_count = 0usize;
+    let mut status_field_count = 0usize;
+    let mut numeric_field_count = 0usize;
+    for field in entity_fields {
+        let roles = semantic_field_roles(field);
+        if roles.iter().any(|role| role == "display") {
+            display_field_count += 1;
+        }
+        if roles.iter().any(|role| role == "date") {
+            date_field_count += 1;
+        }
+        if roles.iter().any(|role| role == "status") {
+            status_field_count += 1;
+        }
+        if roles.iter().any(|role| role == "numeric") {
+            numeric_field_count += 1;
+        }
+    }
+
+    let counts = SemanticTableActivityCounts {
+        sample_value_field_count,
+        sample_value_count,
+        value_dictionary_field_count,
+        value_dictionary_term_count,
+        relationship_count,
+        display_field_count,
+        date_field_count,
+        status_field_count,
+        numeric_field_count,
+        physical_family_role: physical_family_role.map(str::to_string),
+    };
+    let evidence_score = semantic_table_activity_score(&counts);
+    let evidence = semantic_table_activity_evidence(&counts);
+
+    SemanticAtlasTableActivityHintTrace {
+        evidence_source: "graph_metadata_only".to_string(),
+        evidence_score,
+        evidence_level: semantic_table_activity_evidence_level(evidence_score).to_string(),
+        sample_value_field_count: counts.sample_value_field_count,
+        sample_value_count: counts.sample_value_count,
+        value_dictionary_field_count: counts.value_dictionary_field_count,
+        value_dictionary_term_count: counts.value_dictionary_term_count,
+        relationship_count: counts.relationship_count,
+        display_field_count: counts.display_field_count,
+        date_field_count: counts.date_field_count,
+        status_field_count: counts.status_field_count,
+        numeric_field_count: counts.numeric_field_count,
+        physical_family_role: counts.physical_family_role,
+        evidence,
+        approx_rows: None,
+        row_count_source: None,
+    }
+}
+
+fn semantic_field_ref_entity(field_ref: &str) -> Option<&str> {
+    field_ref.split_once('.').map(|(entity, _)| entity)
+}
+
+fn semantic_scope_predicate_field(entry: &VocabularyEntry) -> Option<String> {
+    if entry.canonical_kind != "scope_predicate" {
+        return None;
+    }
+    serde_json::from_str::<GraphScopePredicateValue>(&entry.canonical_value)
+        .ok()
+        .map(|value| value.field)
+}
+
+fn semantic_table_activity_score(counts: &SemanticTableActivityCounts) -> u32 {
+    (counts.sample_value_field_count * 4
+        + counts.sample_value_count.min(12)
+        + counts.value_dictionary_field_count * 3
+        + counts.value_dictionary_term_count.min(12)
+        + counts.relationship_count * 2
+        + counts.display_field_count
+        + counts.date_field_count
+        + counts.status_field_count
+        + counts.numeric_field_count
+        + usize::from(counts.physical_family_role.as_deref() == Some("base_table"))) as u32
+}
+
+fn semantic_table_activity_evidence(counts: &SemanticTableActivityCounts) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if counts.sample_value_field_count > 0 || counts.sample_value_count > 0 {
+        evidence.push(format!(
+            "sample_values:{} fields/{} values",
+            counts.sample_value_field_count, counts.sample_value_count
+        ));
+    }
+    if counts.value_dictionary_field_count > 0 || counts.value_dictionary_term_count > 0 {
+        evidence.push(format!(
+            "value_dictionary:{} fields/{} terms",
+            counts.value_dictionary_field_count, counts.value_dictionary_term_count
+        ));
+    }
+    if counts.relationship_count > 0 {
+        evidence.push(format!("relationships:{}", counts.relationship_count));
+    }
+    let mut roles = Vec::new();
+    if counts.display_field_count > 0 {
+        roles.push(format!("display={}", counts.display_field_count));
+    }
+    if counts.date_field_count > 0 {
+        roles.push(format!("date={}", counts.date_field_count));
+    }
+    if counts.status_field_count > 0 {
+        roles.push(format!("status={}", counts.status_field_count));
+    }
+    if counts.numeric_field_count > 0 {
+        roles.push(format!("numeric={}", counts.numeric_field_count));
+    }
+    if !roles.is_empty() {
+        evidence.push(format!("roles:{}", roles.join(",")));
+    }
+    if let Some(role) = &counts.physical_family_role {
+        evidence.push(format!("physical_family:{role}"));
+    }
+    evidence
+}
+
+fn semantic_table_activity_evidence_level(score: u32) -> &'static str {
+    match score {
+        0 => "none",
+        1..=4 => "weak",
+        5..=12 => "moderate",
+        _ => "strong",
+    }
+}
+
+fn semantic_physical_family_roles<'a, I>(entities: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = &'a EntityRow>,
+{
+    let rows: Vec<EntityRow> = entities.into_iter().cloned().collect();
+    let mut roles = HashMap::new();
+    for family in semsql_graph::read::physical_table_families_from_entities(&rows) {
+        for member in family.members {
+            let role = if member.db_table.eq_ignore_ascii_case(&family.base_table) {
+                "base_table"
+            } else {
+                "physical_partition"
+            };
+            roles.insert(member.entity.to_ascii_lowercase(), role.to_string());
+        }
+    }
+    roles
 }
 
 fn semantic_runtime_atlas(
@@ -23445,6 +23713,26 @@ mod graph_schema_atlas_tests {
         let trace = atlas.trace();
         assert_eq!(trace.entity_count, entities.len());
         assert_eq!(trace.relationship_count, relationships.len());
+        let accounts = trace
+            .entities
+            .iter()
+            .find(|entity| entity.entity == "accounts")
+            .unwrap();
+        assert_eq!(
+            accounts.activity_hint.evidence_source,
+            "graph_metadata_only"
+        );
+        assert_eq!(accounts.activity_hint.sample_value_field_count, 3);
+        assert_eq!(accounts.activity_hint.relationship_count, 6);
+        assert_eq!(accounts.activity_hint.evidence_level, "strong");
+        assert!(
+            accounts
+                .activity_hint
+                .evidence
+                .iter()
+                .any(|item| item.starts_with("sample_values:")),
+            "{accounts:?}"
+        );
         let company = trace
             .fields
             .iter()
@@ -23466,6 +23754,50 @@ mod graph_schema_atlas_tests {
             .unwrap();
         assert!(amount.roles.contains(&"measure".to_string()), "{amount:?}");
         assert!(amount.roles.contains(&"numeric".to_string()), "{amount:?}");
+    }
+
+    #[test]
+    fn semantic_atlas_trace_marks_physical_family_activity_roles() {
+        let entities = vec![
+            entity_row("mails"),
+            entity_row("mails_organizations_1"),
+            entity_row("mails_organizations_2"),
+        ];
+        let fields = vec![
+            typed_field_row("mails", "id", "INTEGER"),
+            field_row("mails", "subject"),
+            typed_field_row("mails_organizations_1", "id", "INTEGER"),
+            typed_field_row("mails_organizations_2", "id", "INTEGER"),
+        ];
+        let samples = vec![sample_row("mails.subject", &["Welcome", "Reminder"])];
+        let atlas = semantic_runtime_atlas(&entities, &fields, &[], &samples, &[]);
+        let trace = atlas.trace();
+
+        let base = trace
+            .entities
+            .iter()
+            .find(|entity| entity.entity == "mails")
+            .unwrap();
+        let partition = trace
+            .entities
+            .iter()
+            .find(|entity| entity.entity == "mails_organizations_1")
+            .unwrap();
+
+        assert_eq!(
+            base.activity_hint.physical_family_role.as_deref(),
+            Some("base_table")
+        );
+        assert_eq!(
+            partition.activity_hint.physical_family_role.as_deref(),
+            Some("physical_partition")
+        );
+        assert!(
+            base.activity_hint.evidence_score > partition.activity_hint.evidence_score,
+            "{base:?} {partition:?}"
+        );
+        assert!(base.activity_hint.approx_rows.is_none());
+        assert!(base.activity_hint.row_count_source.is_none());
     }
 
     #[test]

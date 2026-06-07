@@ -442,6 +442,7 @@ def test_schema_card_summarizes_graph_and_shard_family(tmp_path: Path) -> None:
     assert card["summary"]["entity_count"] == 4
     assert card["summary"]["physical_table_family_count"] == 1
     assert card["summary"]["ambiguous_physical_family_count"] == 1
+    assert card["summary"]["table_activity_hint_count"] == 4
     assert card["summary"]["value_dictionary_count"] == 2
     mails = next(entity for entity in card["entities"] if entity["name"] == "mails")
     assert "subject" in mails["display_fields"]
@@ -449,15 +450,32 @@ def test_schema_card_summarizes_graph_and_shard_family(tmp_path: Path) -> None:
     assert "ordered_on" in mails["date_fields"]
     assert "joined_on" in mails["date_fields"]
     assert mails["fields"][0]["samples"] == []
+    assert mails["table_activity_hint"]["evidence_source"] == "graph_metadata_only"
+    assert mails["table_activity_hint"]["evidence_level"] == "strong"
+    assert mails["table_activity_hint"]["sample_value_field_count"] == 1
+    assert mails["table_activity_hint"]["value_dictionary_term_count"] == 2
+    assert mails["table_activity_hint"]["relationship_count"] == 1
+    shard = next(entity for entity in card["entities"] if entity["name"] == "mails_organizations_1")
+    assert (
+        mails["table_activity_hint"]["evidence_score"]
+        > shard["table_activity_hint"]["evidence_score"]
+    )
     assert card["physical_table_families"][0]["base_table"] == "mails"
     assert card["physical_table_families"][0]["requires_clarification"] is True
     assert card["physical_table_families"][0]["members"][0]["entity"] == "mails"
     assert card["physical_table_families"][0]["members"][0]["role"] == "base_table"
+    assert (
+        card["physical_table_families"][0]["members"][0]["table_activity_hint"][
+            "evidence_level"
+        ]
+        == "strong"
+    )
     assert card["shard_families"][0]["base"] == "mails"
     assert card["shard_families"][0]["ambiguous_without_anchor"] is True
 
     rendered = render_schema_card_markdown(card)
     assert "ambiguous physical families: `1`" in rendered
+    assert "table activity hints: `4`" in rendered
     assert "value dictionary terms: `2`" in rendered
     assert "`mails` via `organizations`" in rendered
 

@@ -194,7 +194,8 @@ def build_schema_card(
     fields = rows["fields"]
     relationships = rows["relationships"]
     metric_definitions = _metric_definition_summaries(rows.get("metric_definitions", []))
-    sample_values = rows["sample_values"] if include_samples else {}
+    sample_value_counts = rows["sample_values"]
+    sample_values = sample_value_counts if include_samples else {}
     value_dictionary_by_field = _scope_predicates_by_field(
         rows["vocabulary"],
         {f"{field['entity']}.{field['field']}" for field in fields},
@@ -205,6 +206,18 @@ def build_schema_card(
         fields_by_entity[str(field["entity"])].append(field)
 
     physical_table_families = _detect_physical_table_families(entities)
+    table_activity_hints = _table_activity_hints(
+        entities,
+        fields,
+        relationships,
+        sample_value_counts,
+        value_dictionary_by_field,
+        physical_table_families,
+    )
+    _attach_table_activity_hints_to_physical_families(
+        physical_table_families,
+        table_activity_hints,
+    )
     shard_families = _legacy_shard_family_cards(physical_table_families)
     shard_entity_names = {
         member
@@ -228,6 +241,7 @@ def build_schema_card(
                 max_value_dictionary_terms=max_value_dictionary_terms,
                 shard_entity_names=shard_entity_names,
                 priority_field_refs=set(),
+                table_activity_hints=table_activity_hints,
             )
         )
 
@@ -251,6 +265,7 @@ def build_schema_card(
             "metric_definition_count": len(metric_definitions),
             "sample_values_included": include_samples,
             "physical_table_family_count": len(physical_table_families),
+            "table_activity_hint_count": len(table_activity_hints),
             "shard_family_count": len(shard_families),
             "ambiguous_physical_family_count": len(ambiguous_families),
             "value_dictionary_count": sum(
@@ -278,6 +293,9 @@ def build_schema_card(
             "llm_may_not_execute_sql": True,
             "llm_sql_must_be_revalidated": True,
             "ambiguous_physical_tables_fail_closed": True,
+            "table_activity_hint_policy": (
+                "graph_metadata_counts_only_not_row_counts"
+            ),
             "value_dictionary_policy": (
                 "field_scoped_scope_predicate_vocabulary_only"
             ),
@@ -403,7 +421,29 @@ def _enrich_schema_card_with_seed_fields(
         set(graph_fields),
         max_value_dictionary_terms,
     )
-    sample_values = graph_rows.get("sample_values", {}) if include_samples else {}
+    sample_value_counts = graph_rows.get("sample_values", {})
+    sample_values = sample_value_counts if include_samples else {}
+    physical_table_families = _schema_card_physical_families(schema_card)
+    table_activity_hints = _table_activity_hints(
+        [
+            entity
+            for entity in graph_rows.get("entities", [])
+            if isinstance(entity, dict)
+        ],
+        [
+            field
+            for field in graph_rows.get("fields", [])
+            if isinstance(field, dict)
+        ],
+        [
+            relationship
+            for relationship in graph_rows.get("relationships", [])
+            if isinstance(relationship, dict)
+        ],
+        sample_value_counts if isinstance(sample_value_counts, dict) else {},
+        value_dictionary_by_field,
+        physical_table_families,
+    )
 
     relationship_cards = schema_card.setdefault("relationships", [])
     relationship_added = 0
@@ -437,6 +477,7 @@ def _enrich_schema_card_with_seed_fields(
             max_value_dictionary_terms=max_value_dictionary_terms,
             shard_entity_names=shard_entity_names,
             priority_field_refs=requested_fields,
+            table_activity_hints=table_activity_hints,
         )
         entities.append(entity_card)
         entity_cards[entity_name] = entity_card
@@ -670,17 +711,24 @@ def render_schema_card_markdown(card: JsonObject) -> str:
         f"- relationships: `{summary['relationship_count']}`",
         f"- physical table families: `{summary.get('physical_table_family_count', summary['shard_family_count'])}`",
         f"- ambiguous physical families: `{summary['ambiguous_physical_family_count']}`",
+        f"- table activity hints: `{summary.get('table_activity_hint_count', 0)}`",
         f"- value dictionary terms: `{summary.get('value_dictionary_count', 0)}`",
         f"- sample values: `{card['safety']['samples_policy']}`",
         "",
         "## Entities",
         "",
-        "| Entity | Table | Fields | Display | Date | Status | Sensitive |",
-        "|---|---|---:|---|---|---|---|",
+        "| Entity | Table | Fields | Activity | Display | Date | Status | Sensitive |",
+        "|---|---|---:|---|---|---|---|---|",
     ]
     for entity in card["entities"]:
+        activity_hint = entity.get("table_activity_hint", {})
+        activity = (
+            f"{activity_hint.get('evidence_level', 'none')}:"
+            f"{activity_hint.get('evidence_score', 0)}"
+        )
         lines.append(
             f"| `{entity['name']}` | `{entity['db_table']}` | `{entity['field_count']}` | "
+            f"`{activity}` | "
             f"`{', '.join(entity['display_fields']) or '-'}` | "
             f"`{', '.join(entity['date_fields']) or '-'}` | "
             f"`{', '.join(entity['status_fields']) or '-'}` | "
@@ -6062,6 +6110,7 @@ def _schema_card_entity_summary(
     max_value_dictionary_terms: int,
     shard_entity_names: set[str],
     priority_field_refs: set[str],
+    table_activity_hints: dict[str, JsonObject],
 ) -> JsonObject:
     name = str(entity["canonical_name"])
     selected_fields = _schema_card_selected_fields(
@@ -6111,6 +6160,10 @@ def _schema_card_entity_summary(
         "numeric_fields": numeric_fields,
         "sensitive": _entity_is_sensitive(entity, entity_fields),
         "physical_shard_member": name in shard_entity_names,
+        "table_activity_hint": table_activity_hints.get(
+            name,
+            _empty_table_activity_hint(),
+        ),
     }
 
 
@@ -6303,6 +6356,212 @@ def _entity_is_sensitive(entity: JsonObject, fields: list[JsonObject]) -> bool:
     if table_tokens & SENSITIVE_TABLE_TOKENS:
         return True
     return any(_tokens(f"{field['field']} {field['db_column']}") & SENSITIVE_FIELD_TOKENS for field in fields)
+
+
+def _empty_table_activity_hint() -> JsonObject:
+    return {
+        "evidence_source": "graph_metadata_only",
+        "evidence_score": 0,
+        "evidence_level": "none",
+        "sample_value_field_count": 0,
+        "sample_value_count": 0,
+        "value_dictionary_field_count": 0,
+        "value_dictionary_term_count": 0,
+        "relationship_count": 0,
+        "display_field_count": 0,
+        "date_field_count": 0,
+        "status_field_count": 0,
+        "numeric_field_count": 0,
+        "physical_family_role": None,
+        "evidence": [],
+        "approx_rows": None,
+        "row_count_source": None,
+    }
+
+
+def _table_activity_hints(
+    entities: list[JsonObject],
+    fields: list[JsonObject],
+    relationships: list[JsonObject],
+    sample_values: dict[str, list[Any]],
+    value_dictionary_by_field: dict[str, list[JsonObject]],
+    physical_table_families: list[JsonObject],
+) -> dict[str, JsonObject]:
+    fields_by_entity: dict[str, list[JsonObject]] = defaultdict(list)
+    for field in fields:
+        fields_by_entity[str(field.get("entity") or "")].append(field)
+
+    sample_fields_by_entity: dict[str, int] = defaultdict(int)
+    sample_values_by_entity: dict[str, int] = defaultdict(int)
+    for field_ref, examples in sample_values.items():
+        sample_entity = _field_ref_entity(str(field_ref))
+        if not sample_entity:
+            continue
+        sample_fields_by_entity[sample_entity] += 1
+        sample_values_by_entity[sample_entity] += len(_as_list(examples))
+
+    dictionary_fields_by_entity: dict[str, int] = defaultdict(int)
+    dictionary_terms_by_entity: dict[str, int] = defaultdict(int)
+    for field_ref, entries in value_dictionary_by_field.items():
+        dictionary_entity = _field_ref_entity(str(field_ref))
+        if not dictionary_entity:
+            continue
+        dictionary_fields_by_entity[dictionary_entity] += 1
+        dictionary_terms_by_entity[dictionary_entity] += len(entries)
+
+    relationship_count_by_entity: dict[str, int] = defaultdict(int)
+    for relationship in relationships:
+        from_entity = str(relationship.get("from_entity") or "")
+        to_entity = str(relationship.get("to_entity") or "")
+        if from_entity:
+            relationship_count_by_entity[from_entity] += 1
+        if to_entity and to_entity != from_entity:
+            relationship_count_by_entity[to_entity] += 1
+
+    physical_roles = _physical_family_roles(physical_table_families)
+    out: dict[str, JsonObject] = {}
+    for graph_entity in entities:
+        entity_name = str(graph_entity.get("canonical_name") or "")
+        if not entity_name:
+            continue
+        role_counts = _table_activity_role_counts(fields_by_entity.get(entity_name, []))
+        sample_field_count = sample_fields_by_entity[entity_name]
+        sample_value_count = sample_values_by_entity[entity_name]
+        dictionary_field_count = dictionary_fields_by_entity[entity_name]
+        dictionary_term_count = dictionary_terms_by_entity[entity_name]
+        relationship_count = relationship_count_by_entity[entity_name]
+        physical_role = physical_roles.get(entity_name)
+        score = (
+            sample_field_count * 4
+            + min(sample_value_count, 12)
+            + dictionary_field_count * 3
+            + min(dictionary_term_count, 12)
+            + relationship_count * 2
+            + role_counts["display"]
+            + role_counts["date"]
+            + role_counts["status"]
+            + role_counts["numeric"]
+            + (1 if physical_role == "base_table" else 0)
+        )
+        evidence = _table_activity_evidence(
+            sample_field_count,
+            sample_value_count,
+            dictionary_field_count,
+            dictionary_term_count,
+            relationship_count,
+            role_counts,
+            physical_role,
+        )
+        out[entity_name] = {
+            "evidence_source": "graph_metadata_only",
+            "evidence_score": score,
+            "evidence_level": _table_activity_evidence_level(score),
+            "sample_value_field_count": sample_field_count,
+            "sample_value_count": sample_value_count,
+            "value_dictionary_field_count": dictionary_field_count,
+            "value_dictionary_term_count": dictionary_term_count,
+            "relationship_count": relationship_count,
+            "display_field_count": role_counts["display"],
+            "date_field_count": role_counts["date"],
+            "status_field_count": role_counts["status"],
+            "numeric_field_count": role_counts["numeric"],
+            "physical_family_role": physical_role,
+            "evidence": evidence,
+            "approx_rows": None,
+            "row_count_source": None,
+        }
+    return out
+
+
+def _table_activity_role_counts(fields: list[JsonObject]) -> dict[str, int]:
+    counts = {"display": 0, "date": 0, "status": 0, "numeric": 0}
+    for field in fields:
+        role = _field_role(field)
+        if role in counts:
+            counts[role] += 1
+    return counts
+
+
+def _table_activity_evidence(
+    sample_field_count: int,
+    sample_value_count: int,
+    dictionary_field_count: int,
+    dictionary_term_count: int,
+    relationship_count: int,
+    role_counts: dict[str, int],
+    physical_role: str | None,
+) -> list[str]:
+    evidence = []
+    if sample_field_count or sample_value_count:
+        evidence.append(
+            f"sample_values:{sample_field_count} fields/{sample_value_count} values"
+        )
+    if dictionary_field_count or dictionary_term_count:
+        evidence.append(
+            "value_dictionary:"
+            f"{dictionary_field_count} fields/{dictionary_term_count} terms"
+        )
+    if relationship_count:
+        evidence.append(f"relationships:{relationship_count}")
+    role_bits = [
+        f"{role}={count}"
+        for role, count in role_counts.items()
+        if count
+    ]
+    if role_bits:
+        evidence.append(f"roles:{','.join(role_bits)}")
+    if physical_role:
+        evidence.append(f"physical_family:{physical_role}")
+    return evidence
+
+
+def _table_activity_evidence_level(score: int) -> str:
+    if score <= 0:
+        return "none"
+    if score <= 4:
+        return "weak"
+    if score <= 12:
+        return "moderate"
+    return "strong"
+
+
+def _physical_family_roles(
+    physical_table_families: list[JsonObject],
+) -> dict[str, str]:
+    roles = {}
+    for family in physical_table_families:
+        for member in _as_list(family.get("members")):
+            if not isinstance(member, dict):
+                continue
+            entity = str(member.get("entity") or "")
+            role = str(member.get("role") or "")
+            if entity and role:
+                roles[entity] = role
+    return roles
+
+
+def _attach_table_activity_hints_to_physical_families(
+    physical_table_families: list[JsonObject],
+    table_activity_hints: dict[str, JsonObject],
+) -> None:
+    for family in physical_table_families:
+        for member in _as_list(family.get("members")):
+            if not isinstance(member, dict):
+                continue
+            entity = str(member.get("entity") or "")
+            hint = table_activity_hints.get(entity)
+            if hint is None:
+                continue
+            member["table_activity_hint"] = {
+                "evidence_source": hint["evidence_source"],
+                "evidence_score": hint["evidence_score"],
+                "evidence_level": hint["evidence_level"],
+                "sample_value_field_count": hint["sample_value_field_count"],
+                "value_dictionary_field_count": hint["value_dictionary_field_count"],
+                "relationship_count": hint["relationship_count"],
+                "approx_rows": None,
+                "row_count_source": None,
+            }
 
 
 def _detect_physical_table_families(entities: list[JsonObject]) -> list[JsonObject]:
