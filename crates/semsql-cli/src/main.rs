@@ -793,6 +793,8 @@ const REJECTION_MAX_PHYSICAL_FAMILY_MEMBERS: usize = 24;
 const QUERY_FRAME_MAX_ATLAS_ENTITIES: usize = 40;
 const QUERY_FRAME_MAX_ATLAS_FIELDS: usize = 160;
 const QUERY_FRAME_MAX_ATLAS_RELATIONSHIPS: usize = 120;
+const QUERY_FRAME_MAX_ATLAS_VALUE_ALIASES: usize = 160;
+const QUERY_FRAME_MAX_ATLAS_METRIC_CANDIDATES: usize = 120;
 
 fn rejected_query_packet_payload(
     graph: &std::path::Path,
@@ -1852,7 +1854,18 @@ fn cap_query_frame_diagnostic_payload(payload: &mut serde_json::Value) {
     let fields_truncated = truncate_json_array(atlas, "fields", QUERY_FRAME_MAX_ATLAS_FIELDS);
     let relationships_truncated =
         truncate_json_array(atlas, "relationships", QUERY_FRAME_MAX_ATLAS_RELATIONSHIPS);
-    let truncated = entities_truncated > 0 || fields_truncated > 0 || relationships_truncated > 0;
+    let value_aliases_truncated =
+        truncate_json_array(atlas, "value_aliases", QUERY_FRAME_MAX_ATLAS_VALUE_ALIASES);
+    let metric_candidates_truncated = truncate_json_array(
+        atlas,
+        "metric_candidates",
+        QUERY_FRAME_MAX_ATLAS_METRIC_CANDIDATES,
+    );
+    let truncated = entities_truncated > 0
+        || fields_truncated > 0
+        || relationships_truncated > 0
+        || value_aliases_truncated > 0
+        || metric_candidates_truncated > 0;
     atlas.insert(
         "diagnostic_truncated".to_string(),
         serde_json::json!(truncated),
@@ -1863,6 +1876,8 @@ fn cap_query_frame_diagnostic_payload(payload: &mut serde_json::Value) {
             "entities": QUERY_FRAME_MAX_ATLAS_ENTITIES,
             "fields": QUERY_FRAME_MAX_ATLAS_FIELDS,
             "relationships": QUERY_FRAME_MAX_ATLAS_RELATIONSHIPS,
+            "value_aliases": QUERY_FRAME_MAX_ATLAS_VALUE_ALIASES,
+            "metric_candidates": QUERY_FRAME_MAX_ATLAS_METRIC_CANDIDATES,
         }),
     );
     atlas.insert(
@@ -1871,6 +1886,8 @@ fn cap_query_frame_diagnostic_payload(payload: &mut serde_json::Value) {
             "entities": entities_truncated,
             "fields": fields_truncated,
             "relationships": relationships_truncated,
+            "value_aliases": value_aliases_truncated,
+            "metric_candidates": metric_candidates_truncated,
         }),
     );
 }
@@ -4137,6 +4154,12 @@ mod tests {
                 "relationships": (0..(QUERY_FRAME_MAX_ATLAS_RELATIONSHIPS + 3))
                     .map(|idx| serde_json::json!({"from": format!("e{idx}.id")}))
                     .collect::<Vec<_>>(),
+                "value_aliases": (0..(QUERY_FRAME_MAX_ATLAS_VALUE_ALIASES + 4))
+                    .map(|idx| serde_json::json!({"field": "e.f", "value": format!("v{idx}")}))
+                    .collect::<Vec<_>>(),
+                "metric_candidates": (0..(QUERY_FRAME_MAX_ATLAS_METRIC_CANDIDATES + 5))
+                    .map(|idx| serde_json::json!({"name": format!("m{idx}")}))
+                    .collect::<Vec<_>>(),
             },
         });
 
@@ -4157,8 +4180,24 @@ mod tests {
             QUERY_FRAME_MAX_ATLAS_RELATIONSHIPS
         );
         assert_eq!(
+            atlas["value_aliases"].as_array().unwrap().len(),
+            QUERY_FRAME_MAX_ATLAS_VALUE_ALIASES
+        );
+        assert_eq!(
+            atlas["metric_candidates"].as_array().unwrap().len(),
+            QUERY_FRAME_MAX_ATLAS_METRIC_CANDIDATES
+        );
+        assert_eq!(
             atlas["diagnostic_truncated_counts"]["entities"],
             serde_json::json!(1)
+        );
+        assert_eq!(
+            atlas["diagnostic_truncated_counts"]["value_aliases"],
+            serde_json::json!(4)
+        );
+        assert_eq!(
+            atlas["diagnostic_truncated_counts"]["metric_candidates"],
+            serde_json::json!(5)
         );
     }
 

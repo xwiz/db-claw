@@ -7,8 +7,8 @@ LLMs may propose typed plans over bounded evidence; direct provider SQL is never
 
 ## Next Loop
 1. Gate broad evals on accepted-wrong-SQL diagnostics before interpreting accuracy.
-2. Build virtual SemanticAtlas tables: metric views, value/alias dictionaries,
-   field roles, and entity summaries derived from DB metadata/samples/comments.
+2. Apply virtual SemanticAtlas tables to route promotion and typed fallback:
+   metric candidates, value aliases, field roles, and entity summaries.
 3. Probe the next real app/schema with the alpha package path for source vocab,
    metrics, dates, live table-selection evidence, and fail-closed rejects.
 4. Capture unresolved cases as typed fallback packets, not static runtime routes.

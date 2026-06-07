@@ -37,8 +37,9 @@ pub mod tokenizer_bridge;
 
 use semsql_core::{Result, SemsqlError};
 use semsql_graph::read::{
-    entities, field_db_column_map, fields, relationships, sample_values, vocabulary, EntityRow,
-    FieldRow, RelationshipRow, SampleValueRow, VocabularyEntry,
+    entities, field_db_column_map, fields, metric_definitions, relationships, sample_values,
+    vocabulary, EntityRow, FieldRow, MetricDefinitionRow, RelationshipRow, SampleValueRow,
+    VocabularyEntry,
 };
 use semsql_intent::{IntentHint, IntentLibrary};
 use semsql_natsql::{parse as parse_natsql, transpile::to_sql_text};
@@ -213,6 +214,10 @@ pub struct SemanticAtlasTrace {
     pub fields: Vec<SemanticAtlasFieldTrace>,
     /// Relationship summaries used by join planning.
     pub relationships: Vec<SemanticAtlasRelationshipTrace>,
+    /// Field-scoped value aliases derived from non-sensitive samples and vocabulary.
+    pub value_aliases: Vec<SemanticAtlasValueAliasTrace>,
+    /// Governed and derived metric candidates visible to typed fallback.
+    pub metric_candidates: Vec<SemanticAtlasMetricCandidateTrace>,
 }
 
 /// One entity in the query-time SemanticAtlas trace.
@@ -299,6 +304,38 @@ pub struct SemanticAtlasRelationshipTrace {
     pub to_field: String,
     /// Extracted relationship kind.
     pub kind: String,
+}
+
+/// One field-scoped value alias in the query-time SemanticAtlas.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SemanticAtlasValueAliasTrace {
+    /// Canonical field that owns this value.
+    pub field: String,
+    /// Storage/display value as found in graph evidence.
+    pub value: String,
+    /// Query phrases that can refer to this value.
+    pub aliases: Vec<String>,
+    /// Evidence source, such as `sample_values` or `vocabulary_scope_predicate`.
+    pub source: String,
+    /// Semantic roles inferred for the owning field.
+    pub field_roles: Vec<String>,
+}
+
+/// One governed or derived metric candidate in the query-time SemanticAtlas.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SemanticAtlasMetricCandidateTrace {
+    /// Stable metric name or derived field expression name.
+    pub name: String,
+    /// Metric kind, such as `governed`, `measure`, `count`, or `ratio_candidate`.
+    pub kind: String,
+    /// Subject entity the metric is about, when known.
+    pub subject_entity: Option<String>,
+    /// Canonical fields needed to compute or bind the metric.
+    pub fields: Vec<String>,
+    /// User-facing aliases for this metric.
+    pub aliases: Vec<String>,
+    /// Human-readable evidence components.
+    pub evidence: Vec<String>,
 }
 
 /// Typed intent frame produced before SQL rendering.
@@ -661,6 +698,10 @@ pub struct Cascade {
     /// labels. QueryFrame uses these as graph evidence, not as executable SQL.
     #[allow(dead_code)]
     graph_vocabulary: Vec<VocabularyEntry>,
+    /// Governed metric definitions from the graph. The runtime SemanticAtlas
+    /// exposes these as typed metric candidates rather than ad-hoc SQL.
+    #[allow(dead_code)]
+    graph_metric_definitions: Vec<MetricDefinitionRow>,
     /// Stage 1 + Stage 3 model bundle, populated when the caller passes
     /// a manifest path AND the build was compiled with `--features onnx`.
     /// Stage 2 (skeleton generator) lands once distilled weights ship —
@@ -723,6 +764,7 @@ impl Cascade {
         let graph_entities = entities(&graph_path).unwrap_or_default();
         let graph_fields = fields(&graph_path).unwrap_or_default();
         let graph_vocabulary = vocabulary(&graph_path).unwrap_or_default();
+        let graph_metric_definitions = metric_definitions(&graph_path).unwrap_or_default();
         #[cfg(feature = "onnx")]
         let models = match manifest_path {
             Some(p) => Some(load_models(p, &graph_path)?),
@@ -740,6 +782,7 @@ impl Cascade {
             graph_entities,
             graph_fields,
             graph_vocabulary,
+            graph_metric_definitions,
             #[cfg(feature = "onnx")]
             models,
         })
@@ -769,12 +812,13 @@ impl Cascade {
         nl: &str,
         trace: &RuntimeQueryFrameTrace,
     ) -> (SemanticAtlasTrace, IntentFrameTrace, BoundQueryPlanTrace) {
-        let atlas = semantic_runtime_atlas(
+        let atlas = semantic_runtime_atlas_with_metrics(
             &self.graph_entities,
             &self.graph_fields,
             &self.relationships,
             &self.sample_values,
             &self.graph_vocabulary,
+            &self.graph_metric_definitions,
         );
         let atlas_trace = atlas.trace();
         let intent_frame = runtime_intent_frame_from_trace(nl, trace, &atlas);
@@ -1624,15 +1668,35 @@ struct RuntimeSemanticAtlas {
     relationships: Vec<RelationshipRow>,
     sample_values: HashMap<String, SampleValueRow>,
     vocabulary: Vec<VocabularyEntry>,
+    metric_definitions: Vec<MetricDefinitionRow>,
 }
 
 impl RuntimeSemanticAtlas {
+    #[cfg(test)]
     fn from_rows(
         entities: &[EntityRow],
         fields: &[FieldRow],
         relationships: &[RelationshipRow],
         sample_values: &[SampleValueRow],
         vocabulary: &[VocabularyEntry],
+    ) -> Self {
+        Self::from_rows_with_metrics(
+            entities,
+            fields,
+            relationships,
+            sample_values,
+            vocabulary,
+            &[],
+        )
+    }
+
+    fn from_rows_with_metrics(
+        entities: &[EntityRow],
+        fields: &[FieldRow],
+        relationships: &[RelationshipRow],
+        sample_values: &[SampleValueRow],
+        vocabulary: &[VocabularyEntry],
+        metric_definitions: &[MetricDefinitionRow],
     ) -> Self {
         Self {
             entities: entities
@@ -1649,6 +1713,7 @@ impl RuntimeSemanticAtlas {
                 .map(|row| (row.field_canonical.to_ascii_lowercase(), row.clone()))
                 .collect(),
             vocabulary: vocabulary.to_vec(),
+            metric_definitions: metric_definitions.to_vec(),
         }
     }
 
@@ -1679,7 +1744,7 @@ impl RuntimeSemanticAtlas {
                 .then_with(|| left.to_field.cmp(&right.to_field))
         });
         SemanticAtlasTrace {
-            schema_version: 1,
+            schema_version: 2,
             source: "runtime_semantic_atlas".to_string(),
             entity_count: self.entities.len(),
             field_count: self.fields.len(),
@@ -1735,6 +1800,16 @@ impl RuntimeSemanticAtlas {
                     kind: relationship.kind,
                 })
                 .collect(),
+            value_aliases: semantic_value_aliases(
+                &self.fields,
+                &self.sample_values,
+                &self.vocabulary,
+            ),
+            metric_candidates: semantic_metric_candidates(
+                &self.fields,
+                &self.vocabulary,
+                &self.metric_definitions,
+            ),
         }
     }
 }
@@ -1854,6 +1929,228 @@ fn semantic_field_sensitive(field: &FieldRow) -> bool {
     ]
     .iter()
     .any(|needle| name.contains(needle))
+}
+
+const SEMANTIC_VALUE_ALIAS_FIELD_LIMIT: usize = 80;
+const SEMANTIC_VALUE_ALIAS_VALUES_PER_FIELD: usize = 20;
+const SEMANTIC_VALUE_ALIAS_ALIAS_LIMIT: usize = 8;
+const SEMANTIC_METRIC_CANDIDATE_LIMIT: usize = 120;
+
+fn semantic_value_aliases(
+    fields: &HashMap<String, FieldRow>,
+    sample_values: &HashMap<String, SampleValueRow>,
+    vocabulary: &[VocabularyEntry],
+) -> Vec<SemanticAtlasValueAliasTrace> {
+    let mut out = Vec::new();
+    let mut sample_rows: Vec<(&String, &SampleValueRow)> = sample_values.iter().collect();
+    sample_rows.sort_by(|left, right| left.0.cmp(right.0));
+    for (field_key, row) in sample_rows
+        .into_iter()
+        .take(SEMANTIC_VALUE_ALIAS_FIELD_LIMIT)
+    {
+        let Some(field) = fields.get(field_key) else {
+            continue;
+        };
+        if semantic_field_sensitive(field) {
+            continue;
+        }
+        let roles = semantic_field_roles(field);
+        for value in row
+            .examples
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .take(SEMANTIC_VALUE_ALIAS_VALUES_PER_FIELD)
+        {
+            let aliases = semantic_value_alias_phrases(value, field);
+            if aliases.is_empty() {
+                continue;
+            }
+            out.push(SemanticAtlasValueAliasTrace {
+                field: field.canonical(),
+                value: value.clone(),
+                aliases,
+                source: "sample_values".to_string(),
+                field_roles: roles.clone(),
+            });
+        }
+    }
+
+    for entry in vocabulary {
+        let Some(scope) = semantic_scope_predicate_value(entry) else {
+            continue;
+        };
+        let Some(field) = fields.get(&scope.field.to_ascii_lowercase()) else {
+            continue;
+        };
+        if semantic_field_sensitive(field) {
+            continue;
+        }
+        let mut aliases = Vec::new();
+        push_unique_nonempty(&mut aliases, &entry.term);
+        for alias in semantic_value_alias_phrases(&scope.raw_value, field) {
+            push_unique_nonempty(&mut aliases, &alias);
+        }
+        if aliases.is_empty() {
+            continue;
+        }
+        out.push(SemanticAtlasValueAliasTrace {
+            field: field.canonical(),
+            value: scope.raw_value,
+            aliases,
+            source: "vocabulary_scope_predicate".to_string(),
+            field_roles: semantic_field_roles(field),
+        });
+    }
+
+    out.sort_by(|left, right| {
+        left.field
+            .cmp(&right.field)
+            .then_with(|| left.value.cmp(&right.value))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    out.dedup_by(|left, right| {
+        left.field == right.field && left.value == right.value && left.source == right.source
+    });
+    out
+}
+
+fn semantic_value_alias_phrases(value: &str, field: &FieldRow) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return aliases;
+    }
+    push_unique_nonempty(&mut aliases, trimmed);
+    let normalized = normalize_human_phrase(trimmed);
+    push_unique_nonempty(&mut aliases, &normalized);
+    let squashed = normalized.replace(['-', '_', '/'], " ");
+    push_unique_nonempty(&mut aliases, &squashed);
+    if is_boolean_field_type(&field.field_type) {
+        for alias in semantic_boolean_value_aliases(trimmed) {
+            push_unique_nonempty(&mut aliases, alias);
+        }
+    }
+    aliases.truncate(SEMANTIC_VALUE_ALIAS_ALIAS_LIMIT);
+    aliases
+}
+
+fn normalize_human_phrase(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '/' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn semantic_boolean_value_aliases(value: &str) -> &'static [&'static str] {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "y" | "yes" | "true" | "t" => &["yes", "true"],
+        "0" | "n" | "no" | "false" | "f" => &["no", "false"],
+        _ => &[],
+    }
+}
+
+fn semantic_metric_candidates(
+    fields: &HashMap<String, FieldRow>,
+    vocabulary: &[VocabularyEntry],
+    metric_definitions: &[MetricDefinitionRow],
+) -> Vec<SemanticAtlasMetricCandidateTrace> {
+    let mut out = Vec::new();
+    for metric in metric_definitions {
+        let mut fields_used = Vec::new();
+        push_unique_nonempty(&mut fields_used, &metric.numerator_field);
+        push_unique_nonempty(&mut fields_used, &metric.denominator_field);
+        if let Some(measure_field) = &metric.measure_field {
+            push_unique_nonempty(&mut fields_used, measure_field);
+        }
+        let mut aliases = Vec::new();
+        push_unique_nonempty(&mut aliases, &metric.name);
+        if let Some(display_label) = &metric.display_label {
+            push_unique_nonempty(&mut aliases, display_label);
+        }
+        for alias in &metric.aliases {
+            push_unique_nonempty(&mut aliases, alias);
+        }
+        out.push(SemanticAtlasMetricCandidateTrace {
+            name: metric.name.clone(),
+            kind: format!("governed_{}", metric.metric_kind),
+            subject_entity: Some(metric.subject_entity.clone()),
+            fields: fields_used,
+            aliases,
+            evidence: vec!["metric_definitions".to_string()],
+        });
+    }
+
+    let mut field_rows: Vec<&FieldRow> = fields.values().collect();
+    field_rows.sort_by_key(|field| field.canonical());
+    for field in field_rows {
+        if out.len() >= SEMANTIC_METRIC_CANDIDATE_LIMIT {
+            break;
+        }
+        if !semantic_field_is_metric_candidate(field) {
+            continue;
+        }
+        let aliases = semantic_metric_aliases_for_field(field, vocabulary);
+        if aliases.is_empty() {
+            continue;
+        }
+        let field_key = field.canonical();
+        out.push(SemanticAtlasMetricCandidateTrace {
+            name: format!("{}_measure", graph_safe_sql_alias(&field_key)),
+            kind: "measure".to_string(),
+            subject_entity: Some(field.entity.clone()),
+            fields: vec![field_key],
+            aliases,
+            evidence: vec!["numeric_field_role".to_string()],
+        });
+    }
+
+    out.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    out.dedup_by(|left, right| left.name == right.name && left.kind == right.kind);
+    out.truncate(SEMANTIC_METRIC_CANDIDATE_LIMIT);
+    out
+}
+
+fn semantic_field_is_metric_candidate(field: &FieldRow) -> bool {
+    graph_field_looks_numeric(field)
+        && !graph_field_looks_unsafe_id(field)
+        && !semantic_field_sensitive(field)
+}
+
+fn semantic_metric_aliases_for_field(
+    field: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for alias in semantic_field_aliases(field, vocabulary) {
+        push_unique_nonempty(&mut aliases, &alias);
+        push_unique_nonempty(&mut aliases, &format!("average {alias}"));
+        push_unique_nonempty(&mut aliases, &format!("total {alias}"));
+        push_unique_nonempty(&mut aliases, &format!("sum {alias}"));
+    }
+    aliases.truncate(12);
+    aliases
+}
+
+fn semantic_scope_predicate_value(entry: &VocabularyEntry) -> Option<GraphScopePredicateValue> {
+    if entry.canonical_kind != "scope_predicate" {
+        return None;
+    }
+    serde_json::from_str::<GraphScopePredicateValue>(&entry.canonical_value).ok()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2074,6 +2371,7 @@ where
     roles
 }
 
+#[cfg(test)]
 fn semantic_runtime_atlas(
     entities: &[EntityRow],
     fields: &[FieldRow],
@@ -2082,6 +2380,24 @@ fn semantic_runtime_atlas(
     vocabulary: &[VocabularyEntry],
 ) -> RuntimeSemanticAtlas {
     RuntimeSemanticAtlas::from_rows(entities, fields, relationships, sample_values, vocabulary)
+}
+
+fn semantic_runtime_atlas_with_metrics(
+    entities: &[EntityRow],
+    fields: &[FieldRow],
+    relationships: &[RelationshipRow],
+    sample_values: &[SampleValueRow],
+    vocabulary: &[VocabularyEntry],
+    metric_definitions: &[MetricDefinitionRow],
+) -> RuntimeSemanticAtlas {
+    RuntimeSemanticAtlas::from_rows_with_metrics(
+        entities,
+        fields,
+        relationships,
+        sample_values,
+        vocabulary,
+        metric_definitions,
+    )
 }
 
 fn runtime_intent_frame_from_trace(
@@ -23509,12 +23825,12 @@ mod graph_schema_atlas_tests {
         graph_subject_entity_with_vocab, graph_topk_group_dimension_phrase,
         runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
-        semantic_runtime_atlas, Cascade, CascadeRunOptions, GraphQueryPredicate,
-        RuntimeQueryFrameJoinTrace, RuntimeQueryFramePredicateTrace,
+        semantic_runtime_atlas, semantic_runtime_atlas_with_metrics, Cascade, CascadeRunOptions,
+        GraphQueryPredicate, RuntimeQueryFrameJoinTrace, RuntimeQueryFramePredicateTrace,
         RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace, RuntimeSemanticAtlas,
     };
     use semsql_graph::read::{
-        EntityRow, FieldRow, RelationshipRow, SampleValueRow, VocabularyEntry,
+        EntityRow, FieldRow, MetricDefinitionRow, RelationshipRow, SampleValueRow, VocabularyEntry,
     };
     use semsql_graph::write::{
         insert_entity, insert_field, insert_relationship, insert_sample_values, insert_vocab,
@@ -23754,6 +24070,93 @@ mod graph_schema_atlas_tests {
             .unwrap();
         assert!(amount.roles.contains(&"measure".to_string()), "{amount:?}");
         assert!(amount.roles.contains(&"numeric".to_string()), "{amount:?}");
+    }
+
+    #[test]
+    fn semantic_atlas_trace_exposes_virtual_value_and_metric_tables() {
+        let (entities, fields, relationships, samples) = growth_ops_fixture();
+        let vocabulary = vec![
+            scope_vocab_entry("paying customers", "accounts.status", "active"),
+            vocab_entry("field", "invoice amount", "invoices.amount"),
+        ];
+        let metrics = vec![MetricDefinitionRow {
+            name: "paid_invoice_rate".to_string(),
+            display_label: Some("Paid invoice rate".to_string()),
+            metric_kind: "conditional_rate".to_string(),
+            subject_entity: "invoices".to_string(),
+            numerator_field: "invoices.status".to_string(),
+            numerator_operator: "=".to_string(),
+            numerator_value: "paid".to_string(),
+            numerator_value_kind: "sample_values".to_string(),
+            denominator_field: "invoices.id".to_string(),
+            scale: 100.0,
+            measure_field: None,
+            aggregate: None,
+            distinct_measure: false,
+            required_entities: vec!["invoices".to_string()],
+            aliases: vec!["paid rate".to_string()],
+        }];
+        let atlas = semantic_runtime_atlas_with_metrics(
+            &entities,
+            &fields,
+            &relationships,
+            &samples,
+            &vocabulary,
+            &metrics,
+        );
+        let trace = atlas.trace();
+
+        assert_eq!(trace.schema_version, 2);
+        let active_alias = trace
+            .value_aliases
+            .iter()
+            .find(|alias| {
+                alias.field == "accounts.status"
+                    && alias.value == "active"
+                    && alias.source == "sample_values"
+            })
+            .expect("sample-derived active status alias");
+        assert!(
+            active_alias.aliases.contains(&"active".to_string()),
+            "{active_alias:?}"
+        );
+        let scoped_alias = trace
+            .value_aliases
+            .iter()
+            .find(|alias| {
+                alias.field == "accounts.status"
+                    && alias.source == "vocabulary_scope_predicate"
+                    && alias.aliases.contains(&"paying customers".to_string())
+            })
+            .expect("scope vocabulary value alias");
+        assert!(
+            scoped_alias.field_roles.contains(&"status".to_string()),
+            "{scoped_alias:?}"
+        );
+
+        let governed = trace
+            .metric_candidates
+            .iter()
+            .find(|metric| metric.name == "paid_invoice_rate")
+            .expect("governed metric");
+        assert_eq!(governed.kind, "governed_conditional_rate");
+        assert!(governed.aliases.contains(&"Paid invoice rate".to_string()));
+        assert!(governed.fields.contains(&"invoices.status".to_string()));
+
+        let derived_amount = trace
+            .metric_candidates
+            .iter()
+            .find(|metric| {
+                metric.kind == "measure" && metric.fields == vec!["invoices.amount".to_string()]
+            })
+            .expect("derived numeric measure metric");
+        assert!(
+            derived_amount
+                .aliases
+                .iter()
+                .any(|alias| alias.contains("average")),
+            "{derived_amount:?}"
+        );
     }
 
     #[test]
