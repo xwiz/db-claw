@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,7 +7,6 @@ const packageDir = resolve(scriptDir, "..");
 const repoRoot = resolve(packageDir, "../..");
 const outDir = resolve(repoRoot, "target/sheets-demo-pages");
 
-await rm(outDir, { recursive: true, force: true });
 await mkdir(resolve(outDir, "vendor"), { recursive: true });
 
 const sourceHtml = await readFile(resolve(packageDir, "index.html"), "utf8");
@@ -26,6 +25,7 @@ await cp(
 	resolve(repoRoot, "packages/sheets/dist"),
 	resolve(outDir, "vendor/sheets"),
 	{
+		force: true,
 		recursive: true,
 	},
 );
