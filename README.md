@@ -104,7 +104,8 @@ Current proof points:
   is available;
 - direct LLM SQL, static example routers, and ambiguous sharded routes fail
   closed;
-- broad BIRD remains poor after shortcut removal and is a research signal.
+- broad BIRD remains poor after shortcut removal and is a DB-only atlas signal,
+  not a reason to add static examples.
 
 Detailed status lives in [docs/results/v02-current-status.md](docs/results/v02-current-status.md).
 
@@ -116,5 +117,4 @@ Detailed status lives in [docs/results/v02-current-status.md](docs/results/v02-c
 - [Contributing](docs/CONTRIBUTING.md)
 - [Go-live packaging](docs/GO_LIVE.md)
 - [Results index](docs/results/README.md)
-
 License: dual **Apache-2.0** and **MIT**, at your option.

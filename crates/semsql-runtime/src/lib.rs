@@ -2628,7 +2628,12 @@ fn runtime_bound_query_plan_from_trace(
             plan.reject_reason = Some("unsupported_predicate_operator".to_string());
             return plan;
         }
-        let evidence = runtime_predicate_value_evidence(nl, predicate, atlas);
+        let mut evidence = runtime_predicate_value_evidence(nl, predicate, atlas);
+        if evidence.is_empty()
+            && runtime_predicate_has_route_measure_threshold_evidence(predicate, trace, atlas)
+        {
+            evidence.push("route_measure_threshold".to_string());
+        }
         if evidence.is_empty() {
             plan.diagnostics.push(BoundPlanDiagnosticTrace {
                 code: "missing_value_evidence".to_string(),
@@ -3933,6 +3938,7 @@ fn runtime_predicate_value_evidence(
             .value
             .split(['|', '.'])
             .any(|part| part.chars().any(|ch| ch.is_ascii_digit()))
+        && graph_literal_compatible_with_field(nl, &predicate.value, field)
     {
         evidence.push("structured_number".to_string());
     }
@@ -3951,6 +3957,54 @@ fn runtime_predicate_value_evidence(
     evidence.sort();
     evidence.dedup();
     evidence
+}
+
+fn runtime_predicate_has_route_measure_threshold_evidence(
+    predicate: &RuntimeQueryFramePredicateTrace,
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    if !matches!(
+        predicate.operator.as_str(),
+        ">" | ">=" | "<" | "<=" | "range"
+    ) || !predicate
+        .value
+        .split(['|', '.'])
+        .any(|part| part.chars().any(|ch| ch.is_ascii_digit()))
+    {
+        return false;
+    }
+    let Some(field) = atlas.field(&predicate.field) else {
+        return false;
+    };
+    let lower_name = field.db_column.to_ascii_lowercase();
+    if !graph_field_looks_numeric(field)
+        || lower_name == "id"
+        || lower_name.ends_with("_id")
+        || lower_name.ends_with("id")
+    {
+        return false;
+    }
+    let projection_mentions_measure = trace.projection.as_ref().is_some_and(|projection| {
+        let expression = projection.expression.to_ascii_lowercase();
+        graph_expr_contains_field_ref(&expression, field)
+            && (runtime_expression_is_measure(&expression)
+                || projection
+                    .field
+                    .as_deref()
+                    .is_some_and(|projected| projected.eq_ignore_ascii_case(&field.canonical()))
+                || projection
+                    .fields
+                    .iter()
+                    .any(|projected| projected.eq_ignore_ascii_case(&field.canonical())))
+    });
+    let order_mentions_measure = trace.order_by.as_ref().is_some_and(|order| {
+        let expression = order.expression.to_ascii_lowercase();
+        graph_expr_contains_field_ref(&expression, field)
+            && (runtime_expression_is_measure(&expression)
+                || order.field.eq_ignore_ascii_case(&field.canonical()))
+    });
+    projection_mentions_measure || order_mentions_measure
 }
 
 #[derive(Clone, Debug)]
@@ -17598,13 +17652,15 @@ fn graph_literal_compatible_with_field(question: &str, literal: &str, field: &Fi
     let context_tokens = graph_tokens(&context);
     let field_tokens = graph_field_tokens(field);
     let lower_context = context.to_ascii_lowercase();
-    if graph_asks_for_id(&context) {
+    let id_like_field =
+        lower_name == "id" || lower_name.ends_with("_id") || lower_name.ends_with("id");
+    if id_like_field {
         return graph_id_literal_targets_field(question, literal, field);
     }
     if graph_numeric_context_targets_score(&lower_context) {
         return graph_field_looks_score_like(field);
     }
-    if lower_name == "id" || lower_name.ends_with("_id") || lower_name.ends_with("id") {
+    if graph_asks_for_id(&context) {
         return false;
     }
     if !field_tokens.is_disjoint(&context_tokens) {
@@ -17694,8 +17750,7 @@ fn graph_id_literal_targets_field(question: &str, literal: &str, field: &FieldRo
     if field_lower == "id" {
         for token in graph_name_tokens(&field.entity) {
             if token.len() >= 3
-                && lower.contains(&token)
-                && lower.contains("id")
+                && graph_context_mentions_id_role(&lower, &token)
                 && lower.contains(&literal)
             {
                 return true;
@@ -17705,12 +17760,19 @@ fn graph_id_literal_targets_field(question: &str, literal: &str, field: &FieldRo
     let role_tokens = graph_fk_role_tokens(&field.db_column);
     role_tokens.iter().any(|token| {
         token.len() >= 3
-            && (lower.contains(&format!("{token} id"))
-                || lower.contains(&format!("{token} with"))
-                || lower.contains(&format!("{token} identifier")))
-            && lower.contains("id")
+            && graph_context_mentions_id_role(&lower, token)
             && lower.contains(&literal)
     })
+}
+
+fn graph_context_mentions_id_role(lower_context: &str, token: &str) -> bool {
+    lower_context.contains(&format!("{token} id"))
+        || lower_context.contains(&format!("{token} with"))
+        || lower_context.contains(&format!("{token} identifier"))
+        || lower_context.contains(&format!("{token} no."))
+        || lower_context.contains(&format!("{token} no "))
+        || lower_context.contains(&format!("{token} number"))
+        || lower_context.contains(&format!("{token} #"))
 }
 
 fn graph_person_name_phrases(question: &str) -> Vec<String> {
@@ -26972,6 +27034,84 @@ mod graph_schema_atlas_tests {
                 .iter()
                 .any(|predicate| predicate.evidence.contains(&"structured_date".to_string())),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn bound_query_plan_rejects_numeric_value_bound_to_wrong_field_context() {
+        let entities = vec![entity_row("schools")];
+        let fields = vec![
+            field_row("schools", "school_name"),
+            typed_field_row("schools", "low_grade", "INTEGER"),
+            typed_field_row("schools", "avg_math_score", "REAL"),
+        ];
+        let trace = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "how many schools have low grade 9".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT COUNT(*) FROM \"schools\" WHERE \"schools\".\"avg_math_score\" = 9"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "schools".to_string(),
+                field: None,
+                fields: Vec::new(),
+                expression: "COUNT(*)".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "schools.avg_math_score".to_string(),
+                value: "9".to_string(),
+                operator: "=".to_string(),
+            }],
+            required_entities: vec!["schools".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        let atlas = semantic_runtime_atlas(&entities, &fields, &[], &[], &[]);
+        let intent =
+            runtime_intent_frame_from_trace("how many schools have low grade 9", &trace, &atlas);
+        let plan = runtime_bound_query_plan_from_trace(
+            "how many schools have low grade 9",
+            &trace,
+            &atlas,
+            &intent,
+        );
+
+        assert!(!plan.valid, "{plan:?}");
+        assert_eq!(
+            plan.reject_reason.as_deref(),
+            Some("missing_value_evidence")
+        );
+
+        let mut corrected_trace = trace.clone();
+        corrected_trace.sql = Some(
+            "SELECT COUNT(*) FROM \"schools\" WHERE \"schools\".\"low_grade\" = 9".to_string(),
+        );
+        corrected_trace.predicates = vec![RuntimeQueryFramePredicateTrace {
+            field: "schools.low_grade".to_string(),
+            value: "9".to_string(),
+            operator: "=".to_string(),
+        }];
+        let corrected_intent = runtime_intent_frame_from_trace(
+            "how many schools have low grade 9",
+            &corrected_trace,
+            &atlas,
+        );
+        let corrected_plan = runtime_bound_query_plan_from_trace(
+            "how many schools have low grade 9",
+            &corrected_trace,
+            &atlas,
+            &corrected_intent,
+        );
+
+        assert!(corrected_plan.valid, "{corrected_plan:?}");
+        assert_eq!(
+            corrected_plan.predicates[0].evidence,
+            vec!["structured_number".to_string()]
         );
     }
 

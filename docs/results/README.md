@@ -9,6 +9,7 @@ Only Start Here docs are live; other Markdown is retained one-run history.
 | [v02-evidence-ledger.md](v02-evidence-ledger.md) | regression anchors |
 | [v02-quality-gate.md](v02-quality-gate.md) | release stop rules |
 | [v02-semantic-atlas-completion-plan.md](v02-semantic-atlas-completion-plan.md) | active loop |
+| [v02-bird-semantic-atlas-direction-v1.md](v02-bird-semantic-atlas-direction-v1.md) | benchmark direction |
 
 ## Hygiene Contract
 ```bash

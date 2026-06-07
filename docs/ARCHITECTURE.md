@@ -88,7 +88,7 @@ The short version:
 - real-schema probes check extraction, read-only execution, and fail-closed
   behavior;
 - semantic-alias pressure tests show whether the atlas is rich enough;
-- BIRD is a research/benchmark diagnostic until the cleaned runtime is broader;
+- BIRD is a DB-only SemanticAtlas diagnostic until the cleaned runtime is broader;
 - sampled smokes are useful for triage, not release claims.
 
 Raw JSON reports are generated artifacts and should stay out of Git. Keep

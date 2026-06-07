@@ -4586,6 +4586,7 @@ def test_openai_request_uses_strict_structured_resolution_schema(tmp_path: Path)
     assert "by <entity>" in request["instructions"]
     assert "category/status/type/tier/segment field" in request["instructions"]
     assert "value_kind=value_dictionary" in request["instructions"]
+    assert "packet.resolution_task.kind is resolve_value_binding" in request["instructions"]
     assert "Metric catalog hits and metric formula hits" in request["instructions"]
     assert "Do not infer a hidden lifecycle/status filter" in request["instructions"]
     assert "Omit order_by unless" in request["instructions"]

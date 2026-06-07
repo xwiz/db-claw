@@ -805,11 +805,14 @@ fn rejected_query_packet_payload(
 ) -> Result<serde_json::Value> {
     let schema_card = schema_card_payload(graph, include_samples, Some(question))?;
     let local_candidates = local_candidate_payload(question, &schema_card);
+    let resolution_task =
+        resolution_task_payload(question, route_reason, &query_frame, &local_candidates);
     Ok(serde_json::json!({
         "schema_version": 1,
         "source": "semsql_rejected_query_packet",
         "question": question,
         "route_reason": route_reason,
+        "resolution_task": resolution_task,
         "schema_card": schema_card,
         "local_candidates": local_candidates,
         "query_frame": query_frame,
@@ -1368,6 +1371,7 @@ fn local_candidate_payload(question: &str, schema_card: &serde_json::Value) -> s
     let mut entity_hits = Vec::new();
     let mut field_hits = Vec::new();
     let mut value_hits = Vec::new();
+    let mut sample_hits = Vec::new();
     let metric_catalog_hits = metric_catalog_hits_payload(&question_tokens, schema_card);
     let metric_catalog_ambiguous = metric_catalog_hits.len() > 1;
     let physical_family_mentions =
@@ -1377,6 +1381,7 @@ fn local_candidate_payload(question: &str, schema_card: &serde_json::Value) -> s
             "entity_hits": entity_hits,
             "field_hits": field_hits,
             "value_dictionary_hits": value_hits,
+            "sample_value_hits": sample_hits,
             "metric_catalog_hits": metric_catalog_hits,
             "metric_catalog_ambiguous": metric_catalog_ambiguous,
             "ambiguous_physical_families_mentioned": physical_family_mentions,
@@ -1443,19 +1448,149 @@ fn local_candidate_payload(question: &str, schema_card: &serde_json::Value) -> s
                     "confidence": value["confidence"].as_f64().unwrap_or(0.0),
                 }));
             }
+            let Some(samples) = field["samples"].as_array() else {
+                continue;
+            };
+            for sample in samples {
+                let sample_value = sample.as_str().unwrap_or("");
+                let sample_tokens = text_tokens(sample_value);
+                if sample_tokens.is_empty() || !sample_tokens.is_subset(&question_tokens) {
+                    continue;
+                }
+                sample_hits.push(serde_json::json!({
+                    "field": field_ref,
+                    "value": sample_value,
+                    "matched_tokens": sample_tokens.into_iter().collect::<Vec<_>>(),
+                }));
+            }
         }
     }
     entity_hits.truncate(REJECTION_MAX_LOCAL_HITS);
     field_hits.truncate(REJECTION_MAX_LOCAL_HITS);
     value_hits.truncate(REJECTION_MAX_LOCAL_HITS);
+    sample_hits.truncate(REJECTION_MAX_LOCAL_HITS);
     serde_json::json!({
         "entity_hits": entity_hits,
         "field_hits": field_hits,
         "value_dictionary_hits": value_hits,
+        "sample_value_hits": sample_hits,
         "metric_catalog_hits": metric_catalog_hits,
         "metric_catalog_ambiguous": metric_catalog_ambiguous,
         "ambiguous_physical_families_mentioned": physical_family_mentions,
     })
+}
+
+fn resolution_task_payload(
+    question: &str,
+    route_reason: &str,
+    query_frame: &serde_json::Value,
+    local_candidates: &serde_json::Value,
+) -> serde_json::Value {
+    let bound_plan = query_frame.get("bound_query_plan");
+    let reject_reason = bound_plan
+        .and_then(|plan| plan.get("reject_reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(route_reason);
+    let unresolved_bindings = unresolved_value_bindings_payload(bound_plan, local_candidates);
+    if reject_reason == "missing_value_evidence" && !unresolved_bindings.is_empty() {
+        return serde_json::json!({
+            "kind": "resolve_value_binding",
+            "reject_reason": reject_reason,
+            "question": question,
+            "unresolved_value_bindings": unresolved_bindings,
+            "allowed_actions": [
+                "choose a field-scoped value from local_candidates",
+                "ask a clarifying question when no field-compatible value evidence exists",
+                "return a typed proposal for local validation only"
+            ],
+            "forbidden_actions": [
+                "emit direct SQL",
+                "reuse values across unrelated fields",
+                "invent text values that are absent from samples, enum vocabulary, or scope predicates"
+            ],
+        });
+    }
+    serde_json::json!({
+        "kind": "classify_or_plan_rejection",
+        "reject_reason": reject_reason,
+        "question": question,
+        "allowed_actions": [
+            "return a typed proposal over schema_card and local_candidates",
+            "ask a clarifying question when evidence is ambiguous or incomplete"
+        ],
+        "forbidden_actions": [
+            "emit direct SQL",
+            "ignore schema_card safety flags"
+        ],
+    })
+}
+
+fn unresolved_value_bindings_payload(
+    bound_plan: Option<&serde_json::Value>,
+    local_candidates: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let Some(predicates) = bound_plan
+        .and_then(|plan| plan.get("predicates"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    predicates
+        .iter()
+        .filter(|predicate| {
+            predicate
+                .get("evidence")
+                .and_then(serde_json::Value::as_array)
+                .map_or(true, Vec::is_empty)
+        })
+        .map(|predicate| {
+            let field = predicate
+                .get("field")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            serde_json::json!({
+                "field": field,
+                "operator": predicate
+                    .get("operator")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("="),
+                "value": predicate
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                "field_scoped_candidates": field_scoped_value_candidates(local_candidates, field),
+            })
+        })
+        .collect()
+}
+
+fn field_scoped_value_candidates(
+    local_candidates: &serde_json::Value,
+    field: &str,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for key in ["value_dictionary_hits", "sample_value_hits"] {
+        let Some(candidates) = local_candidates
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for candidate in candidates {
+            if candidate
+                .get("field")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|candidate_field| candidate_field.eq_ignore_ascii_case(field))
+            {
+                let mut candidate = candidate.clone();
+                if let Some(object) = candidate.as_object_mut() {
+                    object.insert("source".to_string(), serde_json::json!(key));
+                }
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
 
 fn metric_catalog_hits_payload(
@@ -3985,6 +4120,14 @@ mod tests {
             serde_json::json!("orders.status")
         );
         assert_eq!(
+            packet["local_candidates"]["sample_value_hits"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            packet["resolution_task"]["kind"],
+            serde_json::json!("classify_or_plan_rejection")
+        );
+        assert_eq!(
             packet["schema_card"]["summary"]["metric_definition_count"],
             serde_json::json!(2)
         );
@@ -4060,6 +4203,64 @@ mod tests {
             .find(|field| field["name"] == serde_json::json!("status"))
             .unwrap();
         assert_eq!(status["samples"], serde_json::json!(["shipped", "draft"]));
+        assert_eq!(
+            packet_with_samples["local_candidates"]["sample_value_hits"][0]["field"],
+            serde_json::json!("orders.status")
+        );
+        assert_eq!(
+            packet_with_samples["local_candidates"]["sample_value_hits"][0]["value"],
+            serde_json::json!("shipped")
+        );
+    }
+
+    #[test]
+    fn rejection_packet_payload_focuses_missing_value_evidence_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.semsql");
+        write_rejection_packet_test_graph(&graph);
+
+        let packet = rejected_query_packet_payload(
+            &graph,
+            "show shipped orders",
+            "needs_model",
+            serde_json::json!({
+                "source": "query_frame_error",
+                "bound_query_plan": {
+                    "valid": false,
+                    "reject_reason": "missing_value_evidence",
+                    "predicates": [{
+                        "field": "orders.status",
+                        "operator": "=",
+                        "value": "shipped",
+                        "backed_by_atlas": true,
+                        "evidence": []
+                    }]
+                }
+            }),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            packet["resolution_task"]["kind"],
+            serde_json::json!("resolve_value_binding")
+        );
+        assert_eq!(
+            packet["resolution_task"]["reject_reason"],
+            serde_json::json!("missing_value_evidence")
+        );
+        let binding = &packet["resolution_task"]["unresolved_value_bindings"][0];
+        assert_eq!(binding["field"], serde_json::json!("orders.status"));
+        assert_eq!(binding["value"], serde_json::json!("shipped"));
+        let candidates = binding["field_scoped_candidates"].as_array().unwrap();
+        assert!(candidates.iter().any(|candidate| {
+            candidate["source"] == serde_json::json!("value_dictionary_hits")
+                && candidate["raw_value"] == serde_json::json!("shipped")
+        }));
+        assert!(candidates.iter().any(|candidate| {
+            candidate["source"] == serde_json::json!("sample_value_hits")
+                && candidate["value"] == serde_json::json!("shipped")
+        }));
     }
 
     #[test]
