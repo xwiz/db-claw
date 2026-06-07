@@ -165,6 +165,14 @@ def test_pathway_product_gate_allows_fail_closed_route_gaps() -> None:
         frame_route_wrong=0,
         bound_route_wrong=0,
         bound_nonroute_unexpected=0,
+        signals={
+            "frame_promoted_route_wrong_sql": 0,
+            "stage3_route_wrong_sql": 0,
+            "stage3_nonroute_unexpected_sql": 0,
+            "stage3_sql_with_escalation": 0,
+            "bound_plan_route_wrong_sql": 0,
+            "bound_plan_nonroute_unexpected_sql": 0,
+        },
     )
 
     assert pathway_product_gate_failures(report) == []
@@ -177,6 +185,14 @@ def test_pathway_product_gate_blocks_wrong_sql_and_missing_coverage() -> None:
         frame_route_wrong=1,
         bound_route_wrong=2,
         bound_nonroute_unexpected=1,
+        signals={
+            "frame_promoted_route_wrong_sql": 1,
+            "stage3_route_wrong_sql": 1,
+            "stage3_nonroute_unexpected_sql": 1,
+            "stage3_sql_with_escalation": 1,
+            "bound_plan_route_wrong_sql": 2,
+            "bound_plan_nonroute_unexpected_sql": 1,
+        },
     )
 
     assert pathway_product_gate_failures(report) == [
@@ -185,6 +201,10 @@ def test_pathway_product_gate_blocks_wrong_sql_and_missing_coverage() -> None:
         "frame_only_route_wrong_sql",
         "bound_plan_route_wrong_sql",
         "bound_plan_nonroute_unexpected_sql",
+        "frame_promoted_route_wrong_sql",
+        "stage3_route_wrong_sql",
+        "stage3_nonroute_unexpected_sql",
+        "stage3_sql_with_escalation",
     ]
 
 
@@ -195,6 +215,7 @@ def _gate_report(
     frame_route_wrong: int,
     bound_route_wrong: int,
     bound_nonroute_unexpected: int,
+    signals: dict[str, int] | None = None,
 ) -> dict[str, object]:
     return {
         "summary": {
@@ -210,5 +231,6 @@ def _gate_report(
                     "nonroute_unexpected_sql": bound_nonroute_unexpected,
                 },
             },
+            "signals": signals or {},
         }
     }

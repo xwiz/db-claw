@@ -29,6 +29,14 @@ SuiteChoice = Literal["platform", "business"]
 
 POLICIES = ("current_permissive", "frame_only", "bounded_stage3", "bound_plan")
 PRODUCT_GATE_POLICIES = ("frame_only", "bound_plan")
+PRODUCT_GATE_ZERO_SIGNALS = (
+    "frame_promoted_route_wrong_sql",
+    "stage3_route_wrong_sql",
+    "stage3_nonroute_unexpected_sql",
+    "stage3_sql_with_escalation",
+    "bound_plan_route_wrong_sql",
+    "bound_plan_nonroute_unexpected_sql",
+)
 
 
 def run_pathway_benchmark(
@@ -253,6 +261,8 @@ def pathway_product_gate_failures(report: dict[str, Any]) -> list[str]:
     nonroute_total = int(summary.get("nonroute_total") or 0)
     policies = summary.get("policies")
     policies = policies if isinstance(policies, dict) else {}
+    signals = summary.get("signals")
+    signals = signals if isinstance(signals, dict) else {}
 
     failures: list[str] = []
     if route_total <= 0:
@@ -271,6 +281,10 @@ def pathway_product_gate_failures(report: dict[str, Any]) -> list[str]:
             failures.append(f"{policy_name}_route_wrong_sql")
         if nonroute_unexpected_sql > 0:
             failures.append(f"{policy_name}_nonroute_unexpected_sql")
+
+    for signal_name in PRODUCT_GATE_ZERO_SIGNALS:
+        if int(signals.get(signal_name) or 0) > 0 and signal_name not in failures:
+            failures.append(signal_name)
 
     return failures
 
