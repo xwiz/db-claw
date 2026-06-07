@@ -2791,6 +2791,35 @@ fn runtime_bound_plan_semantic_reject_reason(
     {
         return Some("missing_numeric_threshold".to_string());
     }
+    if runtime_prompt_contains_numeric_range(nl)
+        && !runtime_plan_has_numeric_range_predicate(plan, atlas)
+    {
+        return Some("missing_numeric_range_predicate".to_string());
+    }
+    if runtime_prompt_requests_row_projection_but_plan_counts(&lower, trace) {
+        return Some("missing_requested_row_projection".to_string());
+    }
+    if runtime_prompt_requested_date_projection_missing(&lower, trace, atlas) {
+        return Some("missing_requested_date_projection".to_string());
+    }
+    if runtime_prompt_date_role_mismatch(&lower, plan, atlas) {
+        return Some("date_role_mismatch".to_string());
+    }
+    if runtime_prompt_actor_filter_missing(&lower, plan, atlas) {
+        return Some("missing_actor_filter".to_string());
+    }
+    if runtime_plan_has_role_word_value_misbound(nl, plan, atlas) {
+        return Some("role_word_value_misbound".to_string());
+    }
+    if runtime_prompt_superlative_order_field_mismatch(nl, trace, atlas) {
+        return Some("order_field_mismatch".to_string());
+    }
+    if runtime_prompt_ratio_of_groups_mismatch(&lower, trace) {
+        return Some("ratio_shape_mismatch".to_string());
+    }
+    if runtime_prompt_explicit_numeric_predicate_field_missing(nl, plan, atlas) {
+        return Some("missing_explicit_predicate_field".to_string());
+    }
     if runtime_prompt_subject_entity_mismatch(nl, trace, atlas) {
         return Some("subject_entity_mismatch".to_string());
     }
@@ -2807,6 +2836,510 @@ fn runtime_bound_plan_semantic_reject_reason(
         return Some("missing_lifecycle_event_table".to_string());
     }
     None
+}
+
+fn runtime_prompt_contains_numeric_range(nl: &str) -> bool {
+    let lower = format!(" {} ", nl.to_ascii_lowercase().replace('\n', " "));
+    if lower.contains(" between ")
+        && (lower.contains(" and ") || lower.contains(" to "))
+        && graph_literal_tokens(nl)
+            .iter()
+            .filter(|literal| graph_is_plain_number(literal))
+            .count()
+            >= 2
+    {
+        return true;
+    }
+    let compact = nl
+        .chars()
+        .filter(|ch| !matches!(ch, ',' | '_' | ' '))
+        .collect::<String>();
+    let chars = compact.chars().collect::<Vec<_>>();
+    chars.windows(3).any(|window| {
+        window[0].is_ascii_digit()
+            && matches!(window[1], '-' | '–' | '—')
+            && window[2].is_ascii_digit()
+    })
+}
+
+fn runtime_plan_has_numeric_range_predicate(
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    if plan.predicates.iter().any(|predicate| {
+        predicate.operator == "range"
+            && atlas
+                .field(&predicate.field)
+                .is_some_and(graph_field_looks_numeric)
+    }) {
+        return true;
+    }
+    let mut comparison_fields = HashSet::new();
+    for predicate in &plan.predicates {
+        if !matches!(predicate.operator.as_str(), ">" | ">=" | "<" | "<=") {
+            continue;
+        }
+        if atlas
+            .field(&predicate.field)
+            .is_some_and(graph_field_looks_numeric)
+            && !comparison_fields.insert(predicate.field.to_ascii_lowercase())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn runtime_prompt_requests_row_projection_but_plan_counts(
+    lower: &str,
+    trace: &RuntimeQueryFrameTrace,
+) -> bool {
+    let Some(projection) = &trace.projection else {
+        return false;
+    };
+    if !projection.expression.eq_ignore_ascii_case("COUNT(*)") {
+        return false;
+    }
+    if lower.contains(" how many ") || lower.contains(" count ") || lower.contains(" number of ") {
+        return false;
+    }
+    lower.contains(" what are ")
+        || lower.contains(" which ")
+        || lower.contains(" list ")
+        || lower.contains(" show ")
+        || lower.contains(" give ")
+        || lower.contains(" state ")
+        || lower.contains(" include ")
+}
+
+fn runtime_prompt_requested_date_projection_missing(
+    lower: &str,
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let Some(role) = runtime_prompt_requested_date_role(lower) else {
+        return false;
+    };
+    if !(lower.contains(" when ") || lower.starts_with(" when ")) {
+        return false;
+    }
+    let Some(projection) = &trace.projection else {
+        return true;
+    };
+    let projected_date_matches = projection
+        .field
+        .as_deref()
+        .into_iter()
+        .chain(projection.fields.iter().map(String::as_str))
+        .filter_map(|field| atlas.field(field))
+        .any(|field| {
+            graph_field_looks_date_like(field) && runtime_field_matches_date_role(field, role)
+        });
+    !projected_date_matches
+}
+
+fn runtime_prompt_date_role_mismatch(
+    lower: &str,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let Some(role) = runtime_prompt_requested_date_role(lower) else {
+        return false;
+    };
+    let mut saw_date = false;
+    let mut saw_matching = false;
+    for predicate in &plan.predicates {
+        let Some(field) = atlas.field(&predicate.field) else {
+            continue;
+        };
+        if !graph_field_looks_date_like(field) {
+            continue;
+        }
+        saw_date = true;
+        if runtime_field_matches_date_role(field, role) {
+            saw_matching = true;
+        }
+    }
+    saw_date && !saw_matching
+}
+
+fn runtime_prompt_requested_date_role(lower: &str) -> Option<&'static str> {
+    if lower.contains(" when did ") && lower.contains(" open") {
+        return Some("start");
+    }
+    if [
+        " opened ",
+        " created ",
+        " started ",
+        " began ",
+        " launched ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Some("start");
+    }
+    if lower.contains(" when did ") && lower.contains(" close") {
+        return Some("end");
+    }
+    if [
+        " closed ",
+        " ended ",
+        " finished ",
+        " cancelled ",
+        " canceled ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return Some("end");
+    }
+    None
+}
+
+fn runtime_field_matches_date_role(field: &FieldRow, role: &str) -> bool {
+    let haystack = graph_norm(&format!(
+        "{} {} {}",
+        field.db_column,
+        field.field,
+        field.display_label.as_deref().unwrap_or_default()
+    ));
+    match role {
+        "start" => [
+            "open", "opened", "start", "started", "create", "created", "begin", "launch",
+        ]
+        .iter()
+        .any(|token| graph_norm_contains(&haystack, token)),
+        "end" => [
+            "close",
+            "closed",
+            "end",
+            "ended",
+            "finish",
+            "cancel",
+            "cancelled",
+            "canceled",
+        ]
+        .iter()
+        .any(|token| graph_norm_contains(&haystack, token)),
+        _ => false,
+    }
+}
+
+fn runtime_prompt_actor_filter_missing(
+    lower: &str,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let actor_markers = [
+        " managed by ",
+        " owned by ",
+        " assigned to ",
+        " assigned by ",
+        " handled by ",
+        " created by ",
+    ];
+    if !actor_markers.iter().any(|marker| lower.contains(marker)) {
+        return false;
+    }
+    plan.predicates.iter().all(|predicate| {
+        atlas.field(&predicate.field).map_or(true, |field| {
+            !(graph_field_looks_display_field(field)
+                || graph_person_first_name_field(field)
+                || graph_person_last_name_field(field)
+                || graph_field_looks_status_like(field))
+        })
+    })
+}
+
+fn runtime_plan_has_role_word_value_misbound(
+    nl: &str,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    plan.predicates.iter().any(|predicate| {
+        if predicate.operator != "="
+            || graph_value_appears_quoted(nl, &graph_norm(&predicate.value))
+        {
+            return false;
+        }
+        let Some(field) = atlas.field(&predicate.field) else {
+            return false;
+        };
+        if graph_field_looks_status_like(field) || is_boolean_field_type(&field.field_type) {
+            return false;
+        }
+        let value_norm = graph_norm(graph_unquote_predicate_value(&predicate.value));
+        if !runtime_role_word_values().contains(value_norm.as_str()) {
+            return false;
+        }
+        let context = graph_norm(&graph_mention_context(nl, &predicate.value));
+        if runtime_context_explicitly_targets_field(&context, field, atlas) {
+            return false;
+        }
+        graph_field_looks_display_field(field)
+            || graph_person_first_name_field(field)
+            || graph_person_last_name_field(field)
+    })
+}
+
+fn runtime_role_word_values() -> HashSet<&'static str> {
+    [
+        "administrator",
+        "admin",
+        "manager",
+        "owner",
+        "agent",
+        "assignee",
+        "handler",
+        "free",
+        "paid",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn runtime_context_explicitly_targets_field(
+    context_norm: &str,
+    field: &FieldRow,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let context_tokens = graph_tokens(context_norm);
+    let field_tokens = graph_field_tokens_with_vocab(field, &atlas.vocabulary);
+    !context_tokens.is_disjoint(&field_tokens)
+        || semantic_field_aliases(field, &atlas.vocabulary)
+            .iter()
+            .any(|alias| graph_norm_contains(context_norm, &graph_norm(alias)))
+        || [" named ", " name is ", " last name ", " first name "]
+            .iter()
+            .any(|marker| format!(" {context_norm} ").contains(marker))
+}
+
+fn runtime_prompt_superlative_order_field_mismatch(
+    nl: &str,
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    if trace.source == "runtime_graph_query_frame_attribute" {
+        return false;
+    }
+    let Some(order) = &trace.order_by else {
+        return false;
+    };
+    let Some(phrase) = runtime_superlative_order_phrase(nl) else {
+        return false;
+    };
+    let Some(order_field) = atlas.field(&order.field) else {
+        return false;
+    };
+    if runtime_phrase_matches_field(&phrase, order_field, atlas) {
+        return false;
+    }
+    let required_entities = trace
+        .required_entities
+        .iter()
+        .map(|entity| entity.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    atlas.fields.values().any(|field| {
+        (required_entities.is_empty()
+            || required_entities.contains(&field.entity.to_ascii_lowercase()))
+            && runtime_phrase_matches_field(&phrase, field, atlas)
+    })
+}
+
+fn runtime_superlative_order_phrase(nl: &str) -> Option<String> {
+    let tokens = graph_ordered_tokens(nl);
+    let marker_idx = tokens.iter().position(|token| {
+        matches!(
+            token.as_str(),
+            "most"
+                | "least"
+                | "highest"
+                | "lowest"
+                | "largest"
+                | "smallest"
+                | "biggest"
+                | "fewest"
+                | "greatest"
+                | "first"
+                | "last"
+        )
+    })?;
+    let mut phrase = Vec::new();
+    for token in tokens.iter().skip(marker_idx + 1) {
+        if matches!(
+            token.as_str(),
+            "open"
+                | "opened"
+                | "closed"
+                | "close"
+                | "created"
+                | "start"
+                | "started"
+                | "in"
+                | "where"
+                | "with"
+                | "whose"
+                | "which"
+                | "what"
+                | "list"
+                | "show"
+        ) {
+            break;
+        }
+        if !matches!(
+            token.as_str(),
+            "the" | "a" | "an" | "of" | "by" | "for" | "to" | "from"
+        ) && token.parse::<u32>().is_err()
+        {
+            phrase.push(token.clone());
+        }
+    }
+    (!phrase.is_empty()).then(|| phrase.join(" "))
+}
+
+fn runtime_phrase_matches_field(
+    phrase: &str,
+    field: &FieldRow,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let phrase_tokens = graph_name_tokens(phrase);
+    runtime_term_matches_field(phrase, &phrase_tokens, field, atlas)
+}
+
+fn runtime_prompt_ratio_of_groups_mismatch(lower: &str, trace: &RuntimeQueryFrameTrace) -> bool {
+    if !lower.contains(" ratio of ") || !lower.contains(" to ") {
+        return false;
+    }
+    if trace.source != "runtime_graph_query_frame_metric" {
+        return false;
+    }
+    let expression = trace
+        .projection
+        .as_ref()
+        .map(|projection| projection.expression.to_ascii_lowercase())
+        .unwrap_or_default();
+    trace.order_by.is_some() || (!expression.contains("case when") && trace.predicates.len() >= 2)
+}
+
+fn runtime_prompt_explicit_numeric_predicate_field_missing(
+    nl: &str,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    for term in runtime_explicit_numeric_field_terms(nl) {
+        let term_tokens = graph_name_tokens(&term);
+        if term_tokens.is_empty() {
+            continue;
+        }
+        let candidates = atlas
+            .fields
+            .values()
+            .filter(|field| {
+                graph_field_looks_numeric(field)
+                    && runtime_term_matches_field(&term, &term_tokens, field, atlas)
+            })
+            .map(|field| field.canonical().to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if candidates.is_empty() {
+            continue;
+        }
+        let has_predicate = plan
+            .predicates
+            .iter()
+            .any(|predicate| candidates.contains(&predicate.field.to_ascii_lowercase()));
+        if !has_predicate {
+            return true;
+        }
+    }
+    false
+}
+
+fn runtime_explicit_numeric_field_terms(nl: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for literal in graph_literal_tokens(nl) {
+        if !graph_is_plain_number(&literal) || graph_is_year_literal(&literal) {
+            continue;
+        }
+        let context = graph_mention_context(nl, &literal);
+        let tokens = graph_ordered_tokens(&context);
+        let literal_digits = literal
+            .chars()
+            .filter(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        let Some(index) = tokens.iter().position(|token| {
+            token
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                == literal_digits
+        }) else {
+            continue;
+        };
+        let mut prefix = tokens[..index].to_vec();
+        while prefix.last().is_some_and(|token| {
+            matches!(
+                token.as_str(),
+                "is" | "are"
+                    | "was"
+                    | "were"
+                    | "equals"
+                    | "equal"
+                    | "greater"
+                    | "less"
+                    | "than"
+                    | "over"
+                    | "under"
+                    | "above"
+                    | "below"
+                    | "at"
+                    | "least"
+                    | "more"
+                    | "not"
+                    | "no"
+            )
+        }) {
+            prefix.pop();
+        }
+        let start = prefix
+            .iter()
+            .rposition(|token| {
+                matches!(
+                    token.as_str(),
+                    "which"
+                        | "where"
+                        | "with"
+                        | "whose"
+                        | "and"
+                        | "or"
+                        | "the"
+                        | "a"
+                        | "an"
+                        | "of"
+                        | "for"
+                        | "in"
+                )
+            })
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let term_tokens = prefix[start..]
+            .iter()
+            .filter(|token| {
+                !matches!(
+                    token.as_str(),
+                    "the" | "a" | "an" | "of" | "for" | "in" | "to" | "from"
+                )
+            })
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !term_tokens.is_empty() {
+            out.push(term_tokens.join(" "));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn runtime_bound_plan_grouped_aggregate_semantic_reject_reason(
@@ -23905,8 +24438,9 @@ mod graph_schema_atlas_tests {
         runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
         semantic_runtime_atlas, semantic_runtime_atlas_with_metrics, Cascade, CascadeRunOptions,
-        GraphQueryPredicate, RuntimeQueryFrameJoinTrace, RuntimeQueryFramePredicateTrace,
-        RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace, RuntimeSemanticAtlas,
+        GraphQueryPredicate, RuntimeQueryFrameJoinTrace, RuntimeQueryFrameOrderTrace,
+        RuntimeQueryFramePredicateTrace, RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace,
+        RuntimeSemanticAtlas,
     };
     use semsql_graph::read::{
         EntityRow, FieldRow, MetricDefinitionRow, RelationshipRow, SampleValueRow, VocabularyEntry,
@@ -27112,6 +27646,327 @@ mod graph_schema_atlas_tests {
         assert_eq!(
             corrected_plan.predicates[0].evidence,
             vec!["structured_number".to_string()]
+        );
+    }
+
+    #[test]
+    fn bound_query_plan_rejects_cross_slot_intent_mismatches() {
+        let entities = vec![entity_row("accounts"), entity_row("users")];
+        let fields = vec![
+            field_row("accounts", "name"),
+            typed_field_row("accounts", "revenue", "REAL"),
+            typed_field_row("accounts", "amount", "REAL"),
+            typed_field_row("accounts", "opened_at", "DATE"),
+            typed_field_row("accounts", "closed_at", "DATE"),
+            field_row("accounts", "website"),
+            field_row("accounts", "segment"),
+            field_row("accounts", "status"),
+            field_row("accounts", "owner_id"),
+            field_row("users", "id"),
+            field_row("users", "first_name"),
+            field_row("users", "last_name"),
+            field_row("users", "email"),
+        ];
+        let relationships = vec![relationship_row("accounts", "owner_id", "users")];
+        let samples = vec![
+            sample_row("accounts.status", &["active", "closed"]),
+            sample_row("accounts.segment", &["enterprise", "self serve"]),
+            sample_row("users.last_name", &["Administrator", "Lovelace"]),
+            sample_row("users.first_name", &["Ada"]),
+        ];
+        let atlas = semantic_runtime_atlas(&entities, &fields, &relationships, &samples, &[]);
+        let plan_for = |question: &str, trace: RuntimeQueryFrameTrace| {
+            let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+            runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent)
+        };
+
+        let count_instead_of_rows = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "what are the websites for active accounts".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT COUNT(*) FROM \"accounts\" WHERE \"accounts\".\"status\" = 'active'"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: None,
+                fields: Vec::new(),
+                expression: "COUNT(*)".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "accounts.status".to_string(),
+                value: "active".to_string(),
+                operator: "=".to_string(),
+            }],
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        assert_eq!(
+            plan_for(
+                "what are the websites for active accounts",
+                count_instead_of_rows
+            )
+            .reject_reason
+            .as_deref(),
+            Some("missing_requested_row_projection")
+        );
+
+        let missing_when_projection = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "when did the account open".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some("SELECT \"accounts\".\"name\" FROM \"accounts\"".to_string()),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: Some("accounts.name".to_string()),
+                fields: vec!["accounts.name".to_string()],
+                expression: "\"accounts\".\"name\"".to_string(),
+            }),
+            predicates: Vec::new(),
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        assert_eq!(
+            plan_for("when did the account open", missing_when_projection)
+                .reject_reason
+                .as_deref(),
+            Some("missing_requested_date_projection")
+        );
+
+        let wrong_date_role = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "how many accounts opened in 2024".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT COUNT(*) FROM \"accounts\" WHERE STRFTIME('%Y', \"accounts\".\"closed_at\") = '2024'"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: None,
+                fields: Vec::new(),
+                expression: "COUNT(*)".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "accounts.closed_at".to_string(),
+                value: "2024".to_string(),
+                operator: "=".to_string(),
+            }],
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        assert_eq!(
+            plan_for("how many accounts opened in 2024", wrong_date_role)
+                .reject_reason
+                .as_deref(),
+            Some("date_role_mismatch")
+        );
+
+        let split_range = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "show accounts with amount 100-200".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT \"accounts\".\"name\" FROM \"accounts\" WHERE \"accounts\".\"amount\" = 100"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: Some("accounts.name".to_string()),
+                fields: vec!["accounts.name".to_string()],
+                expression: "\"accounts\".\"name\"".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "accounts.amount".to_string(),
+                value: "100".to_string(),
+                operator: "=".to_string(),
+            }],
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        assert_eq!(
+            plan_for("show accounts with amount 100-200", split_range)
+                .reject_reason
+                .as_deref(),
+            Some("missing_numeric_range_predicate")
+        );
+
+        let wrong_order_field = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "show the account with the largest revenue".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT \"accounts\".\"name\" FROM \"accounts\" ORDER BY \"accounts\".\"opened_at\" DESC LIMIT 1"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: Some("accounts.name".to_string()),
+                fields: vec!["accounts.name".to_string()],
+                expression: "\"accounts\".\"name\"".to_string(),
+            }),
+            predicates: Vec::new(),
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: Some(RuntimeQueryFrameOrderTrace {
+                field: "accounts.opened_at".to_string(),
+                expression: "\"accounts\".\"opened_at\"".to_string(),
+                direction: "DESC".to_string(),
+                limit: 1,
+            }),
+        };
+        assert_eq!(
+            plan_for(
+                "show the account with the largest revenue",
+                wrong_order_field
+            )
+            .reject_reason
+            .as_deref(),
+            Some("order_field_mismatch")
+        );
+
+        let role_word_value = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: "what is the administrator email for active accounts".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT \"users\".\"email\" FROM \"accounts\" INNER JOIN \"users\" ON \"accounts\".\"owner_id\" = \"users\".\"id\" WHERE \"users\".\"last_name\" = 'Administrator'"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "users".to_string(),
+                field: Some("users.email".to_string()),
+                fields: vec!["users.email".to_string()],
+                expression: "\"users\".\"email\"".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "users.last_name".to_string(),
+                value: "Administrator".to_string(),
+                operator: "=".to_string(),
+            }],
+            required_entities: vec!["accounts".to_string(), "users".to_string()],
+            joins: vec![RuntimeQueryFrameJoinTrace {
+                from_entity: "accounts".to_string(),
+                from_field: "owner_id".to_string(),
+                to_entity: "users".to_string(),
+                to_field: "id".to_string(),
+            }],
+            order_by: None,
+        };
+        assert_eq!(
+            plan_for(
+                "what is the administrator email for active accounts",
+                role_word_value
+            )
+            .reject_reason
+            .as_deref(),
+            Some("role_word_value_misbound")
+        );
+
+        let missing_actor = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame_grouped_aggregate".to_string(),
+            question: "average revenue by account managed by Ada Lovelace".to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed_grouped_aggregate".to_string(),
+            sql: Some(
+                "SELECT \"accounts\".\"segment\", AVG(\"accounts\".\"revenue\") FROM \"accounts\" GROUP BY \"accounts\".\"segment\""
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: Some("accounts.segment".to_string()),
+                fields: vec!["accounts.segment".to_string()],
+                expression: "AVG(\"accounts\".\"revenue\")".to_string(),
+            }),
+            predicates: Vec::new(),
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        assert_eq!(
+            plan_for(
+                "average revenue by account managed by Ada Lovelace",
+                missing_actor
+            )
+            .reject_reason
+            .as_deref(),
+            Some("missing_actor_filter")
+        );
+
+        let wrong_ratio_shape = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame_metric".to_string(),
+            question: "what is the ratio of active enterprise accounts to active self serve accounts"
+                .to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed_metric_ratio".to_string(),
+            sql: Some(
+                "SELECT CAST(\"accounts\".\"revenue\" AS REAL) / \"accounts\".\"amount\" FROM \"accounts\" WHERE \"accounts\".\"status\" = 'active' AND \"accounts\".\"segment\" = 'enterprise' ORDER BY CAST(\"accounts\".\"revenue\" AS REAL) / \"accounts\".\"amount\" DESC LIMIT 1"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "accounts".to_string(),
+                field: Some("accounts.revenue".to_string()),
+                fields: vec!["accounts.revenue".to_string(), "accounts.amount".to_string()],
+                expression: "CAST(\"accounts\".\"revenue\" AS REAL) / \"accounts\".\"amount\""
+                    .to_string(),
+            }),
+            predicates: vec![
+                RuntimeQueryFramePredicateTrace {
+                    field: "accounts.status".to_string(),
+                    value: "active".to_string(),
+                    operator: "=".to_string(),
+                },
+                RuntimeQueryFramePredicateTrace {
+                    field: "accounts.segment".to_string(),
+                    value: "enterprise".to_string(),
+                    operator: "=".to_string(),
+                },
+            ],
+            required_entities: vec!["accounts".to_string()],
+            joins: Vec::new(),
+            order_by: Some(RuntimeQueryFrameOrderTrace {
+                field: "accounts.revenue".to_string(),
+                expression: "CAST(\"accounts\".\"revenue\" AS REAL) / \"accounts\".\"amount\""
+                    .to_string(),
+                direction: "DESC".to_string(),
+                limit: 1,
+            }),
+        };
+        assert_eq!(
+            plan_for(
+                "what is the ratio of active enterprise accounts to active self serve accounts",
+                wrong_ratio_shape
+            )
+            .reject_reason
+            .as_deref(),
+            Some("ratio_shape_mismatch")
         );
     }
 

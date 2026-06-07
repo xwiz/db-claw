@@ -1,5 +1,5 @@
 # v0.2 SemanticAtlas Completion Plan
-Date: 2026-06-06. Active loop only; numbers live in [v02-evidence-ledger.md](v02-evidence-ledger.md).
+Date: 2026-06-07. Active loop only; numbers live in [v02-evidence-ledger.md](v02-evidence-ledger.md).
 
 ## Spine
 `SemanticGraph -> SemanticAtlas -> IntentFrame -> BoundQueryPlan -> local SQL renderer -> validator -> optional read-only execution`.
@@ -9,7 +9,7 @@ LLMs may propose typed plans over bounded evidence; direct provider SQL is never
 1. Gate broad evals on accepted-wrong-SQL diagnostics before interpreting accuracy.
 2. Treat BIRD misses as DB-only atlas/codebook gaps: enrich relationships, active tables, display fields, values, metrics, dates, and similarity lookup without dev gold SQL or benchmark maps.
 3. Route `missing_value_evidence` rejects to lookup/typed LLM proposals, not direct SQL.
-4. Continue generic evidence gates for metric, rank, grade-span, and selected measure-threshold routes.
+4. Convert fail-closed BIRD/real-schema cases into grounded plans with DB-only atlas/codebook enrichment and typed fallback.
 5. Probe the next real app/schema with the alpha package path for source vocab, metrics, dates, live table-selection evidence, and fail-closed rejects.
 6. Capture unresolved cases as typed fallback packets, not static runtime routes.
 7. Tighten metric catalogs, active-table ranking, and date/value normalization from private alpha and BIRD stress evidence.
