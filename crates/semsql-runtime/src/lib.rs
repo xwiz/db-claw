@@ -10230,18 +10230,6 @@ struct GraphPhysicalTableFamily {
     members: HashSet<String>,
 }
 
-const GRAPH_SHARD_ANCHOR_NAMES: &[&str] = &[
-    "accounts",
-    "clients",
-    "customers",
-    "employees",
-    "members",
-    "organizations",
-    "organisations",
-    "tenants",
-    "users",
-];
-
 fn graph_query_mentions_ambiguous_physical_table_family(nl: &str, entities: &[EntityRow]) -> bool {
     let tokens = graph_tokens(nl);
     let nl_norm = graph_norm(nl);
@@ -10313,54 +10301,17 @@ fn graph_ambiguous_physical_table_family_for_required_entities(
 fn graph_ambiguous_physical_table_families(
     entities: &[EntityRow],
 ) -> Vec<GraphPhysicalTableFamily> {
-    let mut canonical_by_db_table: HashMap<String, String> = HashMap::new();
-    let mut canonical_names = HashSet::new();
-    for entity in entities {
-        canonical_by_db_table.insert(
-            entity.db_table.to_ascii_lowercase(),
-            entity.canonical_name.to_ascii_lowercase(),
-        );
-        canonical_names.insert(entity.canonical_name.to_ascii_lowercase());
-    }
-
-    let mut shards_by_family: HashMap<(String, String), HashSet<String>> = HashMap::new();
-    for entity in entities {
-        if let Some((base, anchor)) = graph_parse_physical_shard_table(&entity.db_table) {
-            shards_by_family
-                .entry((base, anchor))
-                .or_default()
-                .insert(entity.canonical_name.to_ascii_lowercase());
-        }
-    }
-
-    let mut out = Vec::new();
-    for ((base, _anchor), mut members) in shards_by_family {
-        let base_entity = canonical_by_db_table
-            .get(&base)
-            .cloned()
-            .or_else(|| canonical_names.get(&base).cloned());
-        if let Some(entity) = base_entity {
-            members.insert(entity);
-        }
-        if members.len() > 1 {
-            out.push(GraphPhysicalTableFamily { base, members });
-        }
-    }
-    out
-}
-
-fn graph_parse_physical_shard_table(table: &str) -> Option<(String, String)> {
-    let lower = table.to_ascii_lowercase();
-    for anchor in GRAPH_SHARD_ANCHOR_NAMES {
-        let marker = format!("_{anchor}_");
-        let Some((base, shard_id)) = lower.rsplit_once(&marker) else {
-            continue;
-        };
-        if !base.is_empty() && shard_id.chars().all(|ch| ch.is_ascii_digit()) {
-            return Some((base.to_string(), (*anchor).to_string()));
-        }
-    }
-    None
+    semsql_graph::read::physical_table_families_from_entities(entities)
+        .into_iter()
+        .map(|family| GraphPhysicalTableFamily {
+            base: family.base_table,
+            members: family
+                .members
+                .into_iter()
+                .map(|member| member.entity.to_ascii_lowercase())
+                .collect(),
+        })
+        .collect()
 }
 
 fn graph_query_looks_complex(nl: &str) -> bool {
@@ -23275,8 +23226,7 @@ mod graph_schema_atlas_tests {
         graph_grouped_measure_field_scoped, graph_grouped_metric_subject_entity,
         graph_inferred_month_date_window_predicates,
         graph_large_schema_grouped_metric_should_fail_fast,
-        graph_model_fallback_should_fail_closed, graph_parse_physical_shard_table,
-        graph_predicate_value_is_grounded_with_vocab,
+        graph_model_fallback_should_fail_closed, graph_predicate_value_is_grounded_with_vocab,
         graph_projection_fields_with_relation_display, graph_projection_is_generic_safe,
         graph_prompt_should_never_model_fallback, graph_query_frame_trace,
         graph_query_frame_trace_with_vocab, graph_query_mentions_ambiguous_physical_table_family,
@@ -29921,7 +29871,7 @@ mod graph_schema_atlas_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(
-            graph_parse_physical_shard_table("mails_organizations_2"),
+            semsql_graph::read::parse_physical_partition_table("mails_organizations_2"),
             Some(("mails".to_string(), "organizations".to_string()))
         );
         assert!(graph_query_mentions_ambiguous_physical_table_family(

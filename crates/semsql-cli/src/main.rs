@@ -788,6 +788,8 @@ const REJECTION_MAX_RELATIONSHIPS: usize = 120;
 const REJECTION_MAX_SAMPLE_VALUES: usize = 5;
 const REJECTION_MAX_VALUE_TERMS: usize = 12;
 const REJECTION_MAX_LOCAL_HITS: usize = 40;
+const REJECTION_MAX_PHYSICAL_FAMILIES: usize = 24;
+const REJECTION_MAX_PHYSICAL_FAMILY_MEMBERS: usize = 24;
 const QUERY_FRAME_MAX_ATLAS_ENTITIES: usize = 40;
 const QUERY_FRAME_MAX_ATLAS_FIELDS: usize = 160;
 const QUERY_FRAME_MAX_ATLAS_RELATIONSHIPS: usize = 120;
@@ -857,6 +859,8 @@ fn schema_card_payload(
     let value_dictionary = scope_predicates_by_field(&vocabulary_rows);
     let question_tokens = question.map(text_tokens).unwrap_or_default();
     let relationship_endpoint_fields = relationship_endpoint_fields(&relationship_rows);
+    let physical_family_cards =
+        physical_table_family_cards(&entity_rows, &fields_by_entity, &question_tokens);
 
     let mut selected_entities: Vec<&semsql_graph::read::EntityRow> = entity_rows.iter().collect();
     if !question_tokens.is_empty() {
@@ -971,6 +975,7 @@ fn schema_card_payload(
             "metric_definition_count": metric_rows.len(),
             "sample_values_included": include_samples,
             "value_dictionary_count": value_dictionary.values().map(Vec::len).sum::<usize>(),
+            "ambiguous_physical_family_count": physical_family_cards.len(),
             "sensitive_entity_count": entity_cards
                 .iter()
                 .filter(|entity| entity["sensitive"].as_bool().unwrap_or(false))
@@ -982,6 +987,7 @@ fn schema_card_payload(
         },
         "entities": entity_cards,
         "relationships": relationship_cards,
+        "physical_table_families": physical_family_cards,
         "metric_definitions": metric_cards,
         "safety": {
             "samples_policy": if include_samples {
@@ -991,6 +997,7 @@ fn schema_card_payload(
             },
             "llm_may_not_execute_sql": true,
             "llm_sql_must_be_revalidated": true,
+            "ambiguous_physical_tables_fail_closed": true,
             "value_dictionary_policy": "field_scoped_scope_predicate_vocabulary_only",
         },
     }))
@@ -1119,6 +1126,73 @@ fn schema_field_question_score(
         score += 1;
     }
     score
+}
+
+fn physical_table_family_cards(
+    entities: &[semsql_graph::read::EntityRow],
+    fields_by_entity: &BTreeMap<String, Vec<&semsql_graph::read::FieldRow>>,
+    question_tokens: &BTreeSet<String>,
+) -> Vec<serde_json::Value> {
+    semsql_graph::read::physical_table_families_from_entities(entities)
+        .into_iter()
+        .take(REJECTION_MAX_PHYSICAL_FAMILIES)
+        .map(|family| {
+            let member_count = family.members.len();
+            let members = family
+                .members
+                .iter()
+                .take(REJECTION_MAX_PHYSICAL_FAMILY_MEMBERS)
+                .map(|member| {
+                    let role = if member.db_table.eq_ignore_ascii_case(&family.base_table) {
+                        "base_table"
+                    } else {
+                        "physical_partition"
+                    };
+                    serde_json::json!({
+                        "entity": member.entity,
+                        "db_table": member.db_table,
+                        "role": role,
+                        "field_count": fields_by_entity
+                            .get(&member.entity)
+                            .map(Vec::len)
+                            .unwrap_or(0),
+                        "matched_tokens": name_matched_tokens(
+                            &format!("{} {}", member.entity, member.db_table),
+                            question_tokens,
+                        ),
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "base_table": family.base_table,
+                "anchor": family.anchor,
+                "member_count": member_count,
+                "members": members,
+                "truncated_members": member_count.saturating_sub(REJECTION_MAX_PHYSICAL_FAMILY_MEMBERS),
+                "matched_tokens": name_matched_tokens(&family.base_table, question_tokens),
+                "requires_clarification": true,
+                "resolution_hint": "multiple physical tables look like one logical table family; choose only with app metadata, user clarification, or an explicit metric/table catalog",
+            })
+        })
+        .collect()
+}
+
+fn name_matched_tokens(name: &str, question_tokens: &BTreeSet<String>) -> Vec<String> {
+    let mut matched = BTreeSet::new();
+    for raw in name
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 2)
+    {
+        let variants = text_tokens(raw);
+        if let Some(hit) = variants
+            .iter()
+            .find(|variant| question_tokens.contains(*variant))
+        {
+            matched.insert(hit.clone());
+        }
+    }
+    matched.into_iter().collect()
 }
 
 fn scope_predicates_by_field(
@@ -1294,6 +1368,8 @@ fn local_candidate_payload(question: &str, schema_card: &serde_json::Value) -> s
     let mut value_hits = Vec::new();
     let metric_catalog_hits = metric_catalog_hits_payload(&question_tokens, schema_card);
     let metric_catalog_ambiguous = metric_catalog_hits.len() > 1;
+    let physical_family_mentions =
+        physical_table_family_mentions_payload(&question_tokens, schema_card);
     let Some(entities) = schema_card["entities"].as_array() else {
         return serde_json::json!({
             "entity_hits": entity_hits,
@@ -1301,7 +1377,7 @@ fn local_candidate_payload(question: &str, schema_card: &serde_json::Value) -> s
             "value_dictionary_hits": value_hits,
             "metric_catalog_hits": metric_catalog_hits,
             "metric_catalog_ambiguous": metric_catalog_ambiguous,
-            "ambiguous_physical_families_mentioned": [],
+            "ambiguous_physical_families_mentioned": physical_family_mentions,
         });
     };
     for entity in entities {
@@ -1376,7 +1452,7 @@ fn local_candidate_payload(question: &str, schema_card: &serde_json::Value) -> s
         "value_dictionary_hits": value_hits,
         "metric_catalog_hits": metric_catalog_hits,
         "metric_catalog_ambiguous": metric_catalog_ambiguous,
-        "ambiguous_physical_families_mentioned": [],
+        "ambiguous_physical_families_mentioned": physical_family_mentions,
     })
 }
 
@@ -1475,6 +1551,67 @@ fn metric_catalog_hits_payload(
                 "source": "metric_definition",
             }));
         }
+        if hits.len() == REJECTION_MAX_LOCAL_HITS {
+            break;
+        }
+    }
+    hits
+}
+
+fn physical_table_family_mentions_payload(
+    question_tokens: &BTreeSet<String>,
+    schema_card: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let Some(families) = schema_card["physical_table_families"].as_array() else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for family in families {
+        let base_table = family["base_table"].as_str().unwrap_or("");
+        let matched_tokens = if let Some(tokens) = family["matched_tokens"].as_array() {
+            tokens
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            name_matched_tokens(base_table, question_tokens)
+        };
+        if matched_tokens.is_empty() {
+            continue;
+        }
+        let member_mentions = family["members"]
+            .as_array()
+            .map(|members| {
+                members
+                    .iter()
+                    .filter_map(|member| {
+                        let member_tokens = member["matched_tokens"].as_array()?;
+                        if member_tokens.is_empty() {
+                            return None;
+                        }
+                        Some(serde_json::json!({
+                            "entity": member["entity"].as_str().unwrap_or(""),
+                            "db_table": member["db_table"].as_str().unwrap_or(""),
+                            "role": member["role"].as_str().unwrap_or("physical_partition"),
+                            "matched_tokens": member_tokens,
+                        }))
+                    })
+                    .take(REJECTION_MAX_PHYSICAL_FAMILY_MEMBERS)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let exactly_one_specific_partition = member_mentions.len() == 1
+            && member_mentions[0]["role"] == serde_json::json!("physical_partition");
+        hits.push(serde_json::json!({
+            "base_table": base_table,
+            "anchor": family["anchor"].as_str().unwrap_or(""),
+            "member_count": family["member_count"].as_u64().unwrap_or(0),
+            "matched_tokens": matched_tokens,
+            "member_mentions": member_mentions,
+            "requires_clarification": !exactly_one_specific_partition,
+            "resolution_hint": "do not pick a physical partition from the base word alone; use app metadata, a table catalog, or ask which partition/scope is intended",
+        }));
         if hits.len() == REJECTION_MAX_LOCAL_HITS {
             break;
         }
@@ -3756,6 +3893,30 @@ mod tests {
         .unwrap();
     }
 
+    fn write_sharded_rejection_packet_test_graph(path: &std::path::Path) {
+        let conn = semsql_graph::open(path).unwrap();
+        for entity in ["mails", "mails_organizations_1", "mails_organizations_2"] {
+            conn.execute(
+                "INSERT INTO entities(canonical_name, db_table, singular_label, plural_label, proto_blob) \
+                 VALUES (?1, ?1, ?1, ?1, X'')",
+                [entity],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fields(entity, field, db_column, type, display_label, proto_blob) \
+                 VALUES (?1, 'id', 'id', 'integer', 'ID', X'')",
+                [entity],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fields(entity, field, db_column, type, display_label, proto_blob) \
+                 VALUES (?1, 'status', 'status', 'text', 'Status', X'')",
+                [entity],
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn rejection_packet_payload_omits_samples_by_default_and_keeps_contract() {
         let dir = tempfile::tempdir().unwrap();
@@ -3882,6 +4043,48 @@ mod tests {
             .find(|field| field["name"] == serde_json::json!("status"))
             .unwrap();
         assert_eq!(status["samples"], serde_json::json!(["shipped", "draft"]));
+    }
+
+    #[test]
+    fn rejection_packet_payload_surfaces_physical_table_family_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("sharded.semsql");
+        write_sharded_rejection_packet_test_graph(&graph);
+
+        let packet = rejected_query_packet_payload(
+            &graph,
+            "how many mails have status sent",
+            "not_routed_ambiguous_physical_table_family",
+            serde_json::json!({"source": "query_frame_error"}),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            packet["schema_card"]["summary"]["ambiguous_physical_family_count"],
+            serde_json::json!(1)
+        );
+        let family = &packet["schema_card"]["physical_table_families"][0];
+        assert_eq!(family["base_table"], serde_json::json!("mails"));
+        assert_eq!(family["anchor"], serde_json::json!("organizations"));
+        assert_eq!(family["member_count"], serde_json::json!(3));
+        assert_eq!(family["requires_clarification"], serde_json::json!(true));
+        assert!(family["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["entity"] == serde_json::json!("mails")
+                && member["role"] == serde_json::json!("base_table")));
+
+        let mention = &packet["local_candidates"]["ambiguous_physical_families_mentioned"][0];
+        assert_eq!(mention["base_table"], serde_json::json!("mails"));
+        assert_eq!(mention["requires_clarification"], serde_json::json!(true));
+        assert_eq!(
+            mention["resolution_hint"],
+            serde_json::json!(
+                "do not pick a physical partition from the base word alone; use app metadata, a table catalog, or ask which partition/scope is intended"
+            )
+        );
     }
 
     #[test]

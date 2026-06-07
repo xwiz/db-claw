@@ -8,6 +8,7 @@
 use crate::open;
 use rusqlite::OptionalExtension;
 use semsql_core::{Result, SemsqlError};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// One vocabulary row, normalised for runtime lookup.
@@ -75,6 +76,119 @@ pub struct EntityRow {
     pub singular_label: Option<String>,
     /// Optional plural display label.
     pub plural_label: Option<String>,
+}
+
+/// A detected family of physical tables that appear to represent one logical
+/// base table plus partition/shard tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalTableFamilyRow {
+    /// Base DB table name, e.g. `mails` for `mails_organizations_1`.
+    pub base_table: String,
+    /// Partition anchor token, e.g. `organizations`.
+    pub anchor: String,
+    /// Base and partition member entities in stable order.
+    pub members: Vec<PhysicalTableFamilyMemberRow>,
+}
+
+/// One member of a detected physical table family.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalTableFamilyMemberRow {
+    /// Canonical graph entity.
+    pub entity: String,
+    /// Backing DB table.
+    pub db_table: String,
+}
+
+const PHYSICAL_FAMILY_ANCHOR_NAMES: &[&str] = &[
+    "accounts",
+    "clients",
+    "customers",
+    "employees",
+    "members",
+    "organizations",
+    "organisations",
+    "tenants",
+    "users",
+];
+
+/// Detect ambiguous physical table families from graph entities.
+///
+/// This is intentionally conservative. It only groups tables with explicit
+/// partition-like suffixes such as `base_organizations_1`, optionally including
+/// the base table if it exists in the graph.
+pub fn physical_table_families_from_entities(
+    entities: &[EntityRow],
+) -> Vec<PhysicalTableFamilyRow> {
+    let mut entity_by_canonical: BTreeMap<String, &EntityRow> = BTreeMap::new();
+    let mut canonical_by_db_table: BTreeMap<String, String> = BTreeMap::new();
+    let mut canonical_names = BTreeSet::new();
+    for entity in entities {
+        let canonical = entity.canonical_name.to_ascii_lowercase();
+        entity_by_canonical.insert(canonical.clone(), entity);
+        canonical_by_db_table.insert(entity.db_table.to_ascii_lowercase(), canonical.clone());
+        canonical_names.insert(canonical);
+    }
+
+    let mut members_by_family: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for entity in entities {
+        let Some((base_table, anchor)) = parse_physical_partition_table(&entity.db_table) else {
+            continue;
+        };
+        members_by_family
+            .entry((base_table, anchor))
+            .or_default()
+            .insert(entity.canonical_name.to_ascii_lowercase());
+    }
+
+    let mut out = Vec::new();
+    for ((base_table, anchor), mut member_names) in members_by_family {
+        if let Some(base_entity) = canonical_by_db_table
+            .get(&base_table)
+            .cloned()
+            .or_else(|| canonical_names.get(&base_table).cloned())
+        {
+            member_names.insert(base_entity);
+        }
+        if member_names.len() < 2 {
+            continue;
+        }
+        let mut members = member_names
+            .into_iter()
+            .filter_map(|name| entity_by_canonical.get(&name).copied())
+            .map(|entity| PhysicalTableFamilyMemberRow {
+                entity: entity.canonical_name.clone(),
+                db_table: entity.db_table.clone(),
+            })
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| {
+            let left_is_base = left.db_table.eq_ignore_ascii_case(&base_table);
+            let right_is_base = right.db_table.eq_ignore_ascii_case(&base_table);
+            right_is_base
+                .cmp(&left_is_base)
+                .then_with(|| left.db_table.cmp(&right.db_table))
+        });
+        out.push(PhysicalTableFamilyRow {
+            base_table,
+            anchor,
+            members,
+        });
+    }
+    out
+}
+
+/// Parse a physical partition table name into `(base_table, anchor)`.
+pub fn parse_physical_partition_table(table: &str) -> Option<(String, String)> {
+    let lower = table.to_ascii_lowercase();
+    for anchor in PHYSICAL_FAMILY_ANCHOR_NAMES {
+        let marker = format!("_{anchor}_");
+        let Some((base, suffix)) = lower.rsplit_once(&marker) else {
+            continue;
+        };
+        if !base.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return Some((base.to_string(), (*anchor).to_string()));
+        }
+    }
+    None
 }
 
 /// Read every entity row from the graph.
@@ -626,6 +740,59 @@ mod tests {
         insert_entity, insert_scope, insert_vocab, EntityInsert, ScopeInsert, VocabInsert,
     };
     use tempfile::tempdir;
+
+    fn entity(canonical_name: &str, db_table: &str) -> EntityRow {
+        EntityRow {
+            canonical_name: canonical_name.to_string(),
+            db_table: db_table.to_string(),
+            singular_label: None,
+            plural_label: None,
+        }
+    }
+
+    #[test]
+    fn parses_physical_partition_table_names() {
+        assert_eq!(
+            parse_physical_partition_table("mails_organizations_2"),
+            Some(("mails".to_string(), "organizations".to_string()))
+        );
+        assert_eq!(parse_physical_partition_table("mail_headers"), None);
+        assert_eq!(
+            parse_physical_partition_table("mails_organizations_x"),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_physical_table_families_with_base_members_first() {
+        let entities = vec![
+            entity("mails", "mails"),
+            entity("mails_organizations_2", "mails_organizations_2"),
+            entity("mails_organizations_1", "mails_organizations_1"),
+            entity("mail_headers", "mail_headers"),
+        ];
+
+        let families = physical_table_families_from_entities(&entities);
+
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].base_table, "mails");
+        assert_eq!(families[0].anchor, "organizations");
+        assert_eq!(
+            families[0]
+                .members
+                .iter()
+                .map(|member| member.entity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mails", "mails_organizations_1", "mails_organizations_2"]
+        );
+    }
+
+    #[test]
+    fn physical_table_family_requires_more_than_one_member() {
+        let entities = vec![entity("mails_organizations_1", "mails_organizations_1")];
+
+        assert!(physical_table_families_from_entities(&entities).is_empty());
+    }
 
     #[test]
     fn coverage_flags_entities_lacking_ui_vocab() {
