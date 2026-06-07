@@ -6,11 +6,15 @@ Date: 2026-06-06. Active loop only; numbers live in [v02-evidence-ledger.md](v02
 LLMs may propose typed plans over bounded evidence; direct provider SQL is never accepted.
 
 ## Next Loop
-1. Probe the next real app/schema with the alpha package path for source vocab, metrics, dates, live table-selection
-   evidence, and fail-closed rejects.
-2. Capture unresolved cases as typed fallback packets, not static runtime routes.
-3. Tighten metric catalogs, active-table ranking, and date/value normalization from private alpha evidence.
-4. Keep strict production-readiness aggregation green before any wider release.
+1. Gate broad evals on accepted-wrong-SQL diagnostics before interpreting accuracy.
+2. Build virtual SemanticAtlas tables: metric views, value/alias dictionaries,
+   field roles, and entity summaries derived from DB metadata/samples/comments.
+3. Probe the next real app/schema with the alpha package path for source vocab,
+   metrics, dates, live table-selection evidence, and fail-closed rejects.
+4. Capture unresolved cases as typed fallback packets, not static runtime routes.
+5. Tighten metric catalogs, active-table ranking, and date/value normalization
+   from private alpha and BIRD stress evidence.
+6. Keep strict production-readiness aggregation green before any wider release.
 
 ## Backlog
 Metric catalogs; live row-count/table-selection enrichment; shard/date/PII/tenant hints; BI/customer analytics frames;

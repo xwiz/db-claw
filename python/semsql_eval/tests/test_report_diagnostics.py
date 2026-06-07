@@ -37,6 +37,12 @@ def _write_report(path: Path) -> None:
                         ),
                         "failure_bucket": "exec_mismatch",
                         "exec_equal": False,
+                        "stage_pinned": "stage_0a",
+                        "runtime_query_frame": {
+                            "routed": True,
+                            "route_reason": "routed",
+                            "used_for_final_sql": True,
+                        },
                     },
                     {
                         "db_id": "california_schools",
@@ -50,6 +56,12 @@ def _write_report(path: Path) -> None:
                         "pred_sql": "SELECT COUNT(*) FROM frpm",
                         "failure_bucket": "exec_mismatch",
                         "exec_equal": False,
+                        "stage_pinned": "stage_3",
+                        "runtime_query_frame": {
+                            "routed": False,
+                            "route_reason": "not_routed_complex_shape",
+                            "used_for_final_sql": False,
+                        },
                     },
                     {
                         "db_id": "financial",
@@ -84,6 +96,10 @@ def test_diagnose_report_classifies_stage_lanes(tmp_path: Path) -> None:
     assert report.pred_feature_counts["join"] == 0
     assert report.by_db["california_schools"]["wrong"] == 2
     assert report.by_db["financial"]["failure_buckets"]["pred_exec_error"] == 1
+    assert report.product_safety.final_sql_wrong == 3
+    assert report.product_safety.route_used_wrong == 1
+    assert report.product_safety.model_sql_after_route_reject_wrong == 1
+    assert report.product_safety.by_db["california_schools"]["route_used_wrong"] == 1
 
 
 def test_render_diagnosis_markdown_surfaces_recommendations(tmp_path: Path) -> None:
@@ -93,6 +109,8 @@ def test_render_diagnosis_markdown_surfaces_recommendations(tmp_path: Path) -> N
     rendered = render_diagnosis_markdown(diagnose_report(report_path))
 
     assert "## Fix Lanes" in rendered
+    assert "## Product Safety" in rendered
+    assert "route-used wrong" in rendered
     assert "## By DB" in rendered
     assert "`california_schools`" in rendered
     assert "`skeleton_planning`" in rendered
@@ -129,4 +147,23 @@ def test_diagnose_report_cli_writes_markdown_and_json(tmp_path: Path) -> None:
     data = json.loads(json_path.read_text(encoding="utf-8"))
     assert data["lane_counts"]["runtime_contract"] == 1
     assert data["by_db"]["california_schools"]["wrong"] == 2
+    assert data["product_safety"]["route_used_wrong"] == 1
     assert len(data["examples"]) == 2
+
+
+def test_diagnose_report_cli_can_fail_on_accepted_wrong_sql(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    _write_report(report_path)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "diagnose-report",
+            "--report-json",
+            str(report_path),
+            "--fail-on-accepted-wrong-sql",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "accepted wrong SQL detected" in result.output

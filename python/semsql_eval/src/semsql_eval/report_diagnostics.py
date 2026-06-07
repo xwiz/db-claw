@@ -24,8 +24,10 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "AcceptedSqlExample",
     "DiagnosisExample",
     "DiagnosisReport",
+    "ProductSafetyDiagnostics",
     "SqlFeatures",
     "diagnose_report",
     "diagnosis_report_to_json",
@@ -100,6 +102,38 @@ class DiagnosisExample:
 
 
 @dataclass(frozen=True)
+class AcceptedSqlExample:
+    """One wrong final-SQL example surfaced for product-safety triage."""
+
+    index: int
+    db_id: str
+    question: str
+    acceptance_kind: str
+    stage_pinned: str
+    route_reason: str
+    failure_bucket: str
+    pred_sql: str
+
+
+@dataclass(frozen=True)
+class ProductSafetyDiagnostics:
+    """Counts that separate bad accuracy from unsafe product acceptance."""
+
+    final_sql_total: int
+    final_sql_correct: int
+    final_sql_wrong: int
+    route_used_total: int
+    route_used_correct: int
+    route_used_wrong: int
+    model_sql_after_route_reject_total: int
+    model_sql_after_route_reject_wrong: int
+    routed_not_used_total: int
+    routed_not_used_wrong: int
+    by_db: dict[str, dict[str, int]]
+    wrong_examples: list[AcceptedSqlExample] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class DiagnosisReport:
     """Aggregate diagnostics for a per-example eval report."""
 
@@ -114,6 +148,7 @@ class DiagnosisReport:
     gold_feature_counts: dict[str, int]
     pred_feature_counts: dict[str, int]
     by_db: dict[str, dict[str, Any]]
+    product_safety: ProductSafetyDiagnostics
     examples: list[DiagnosisExample] = field(default_factory=list)
 
 
@@ -207,6 +242,10 @@ def diagnose_report(
         gold_feature_counts=gold_feature_counts,
         pred_feature_counts=pred_feature_counts,
         by_db=_sorted_db_stats(by_db),
+        product_safety=_product_safety_diagnostics(
+            records,
+            sample_examples=sample_examples,
+        ),
         examples=examples,
     )
 
@@ -225,6 +264,10 @@ def render_diagnosis_markdown(report: DiagnosisReport) -> str:
         f"- total: `{report.total}`",
         f"- correct: `{report.correct}`",
         f"- exec_acc: `{report.exec_acc:.3%}`",
+        "",
+        "## Product Safety",
+        "",
+        _render_product_safety_summary(report.product_safety),
         "",
         "## Fix Lanes",
         "",
@@ -286,6 +329,215 @@ def render_diagnosis_markdown(report: DiagnosisReport) -> str:
             )
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _product_safety_diagnostics(
+    records: list[Any],
+    *,
+    sample_examples: int,
+) -> ProductSafetyDiagnostics:
+    final_sql_total = 0
+    final_sql_correct = 0
+    final_sql_wrong = 0
+    route_used_total = 0
+    route_used_correct = 0
+    route_used_wrong = 0
+    model_sql_after_route_reject_total = 0
+    model_sql_after_route_reject_wrong = 0
+    routed_not_used_total = 0
+    routed_not_used_wrong = 0
+    by_db: dict[str, dict[str, int]] = {}
+    route_used_wrong_examples: list[AcceptedSqlExample] = []
+    other_wrong_examples: list[AcceptedSqlExample] = []
+
+    for idx, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            continue
+        pred_sql = _str_or_empty(rec.get("pred_sql")).strip()
+        if not _is_emitted_final_sql(rec, pred_sql):
+            continue
+        runtime = rec.get("runtime_query_frame")
+        runtime_frame = runtime if isinstance(runtime, dict) else {}
+        correct = bool(rec.get("exec_equal"))
+        db_id = _str_or_empty(rec.get("db_id")) or "<missing>"
+        db_stats = by_db.setdefault(db_id, _empty_product_safety_db_stats())
+        route_used = runtime_frame.get("used_for_final_sql") is True
+        routed = runtime_frame.get("routed") is True
+        route_rejected = runtime_frame.get("routed") is False
+        routed_not_used = routed and not route_used
+        model_sql_after_reject = route_rejected and not route_used
+
+        final_sql_total += 1
+        db_stats["final_sql_total"] += 1
+        if correct:
+            final_sql_correct += 1
+            db_stats["final_sql_correct"] += 1
+        else:
+            final_sql_wrong += 1
+            db_stats["final_sql_wrong"] += 1
+
+        if route_used:
+            route_used_total += 1
+            db_stats["route_used_total"] += 1
+            if correct:
+                route_used_correct += 1
+                db_stats["route_used_correct"] += 1
+            else:
+                route_used_wrong += 1
+                db_stats["route_used_wrong"] += 1
+        if model_sql_after_reject:
+            model_sql_after_route_reject_total += 1
+            db_stats["model_sql_after_route_reject_total"] += 1
+            if not correct:
+                model_sql_after_route_reject_wrong += 1
+                db_stats["model_sql_after_route_reject_wrong"] += 1
+        if routed_not_used:
+            routed_not_used_total += 1
+            db_stats["routed_not_used_total"] += 1
+            if not correct:
+                routed_not_used_wrong += 1
+                db_stats["routed_not_used_wrong"] += 1
+
+        if not correct:
+            example = AcceptedSqlExample(
+                index=idx,
+                db_id=db_id,
+                question=_str_or_empty(rec.get("question")),
+                acceptance_kind=_acceptance_kind(
+                    route_used=route_used,
+                    model_sql_after_reject=model_sql_after_reject,
+                    routed_not_used=routed_not_used,
+                ),
+                stage_pinned=_str_or_empty(rec.get("stage_pinned")),
+                route_reason=_str_or_empty(runtime_frame.get("route_reason")),
+                failure_bucket=_str_or_empty(rec.get("failure_bucket")),
+                pred_sql=pred_sql,
+            )
+            if route_used:
+                route_used_wrong_examples.append(example)
+            else:
+                other_wrong_examples.append(example)
+
+    return ProductSafetyDiagnostics(
+        final_sql_total=final_sql_total,
+        final_sql_correct=final_sql_correct,
+        final_sql_wrong=final_sql_wrong,
+        route_used_total=route_used_total,
+        route_used_correct=route_used_correct,
+        route_used_wrong=route_used_wrong,
+        model_sql_after_route_reject_total=model_sql_after_route_reject_total,
+        model_sql_after_route_reject_wrong=model_sql_after_route_reject_wrong,
+        routed_not_used_total=routed_not_used_total,
+        routed_not_used_wrong=routed_not_used_wrong,
+        by_db=_sorted_product_safety_db_stats(by_db),
+        wrong_examples=[
+            *(route_used_wrong_examples[:sample_examples]),
+            *other_wrong_examples[: max(0, sample_examples - len(route_used_wrong_examples))],
+        ],
+    )
+
+
+def _empty_product_safety_db_stats() -> dict[str, int]:
+    return {
+        "final_sql_total": 0,
+        "final_sql_correct": 0,
+        "final_sql_wrong": 0,
+        "route_used_total": 0,
+        "route_used_correct": 0,
+        "route_used_wrong": 0,
+        "model_sql_after_route_reject_total": 0,
+        "model_sql_after_route_reject_wrong": 0,
+        "routed_not_used_total": 0,
+        "routed_not_used_wrong": 0,
+    }
+
+
+def _is_emitted_final_sql(rec: dict[str, Any], pred_sql: str) -> bool:
+    if not pred_sql or bool(rec.get("bailed")):
+        return False
+    if bool(rec.get("exec_equal")):
+        return True
+    bucket = _str_or_empty(rec.get("failure_bucket"))
+    if bucket in {"exec_mismatch", "pred_exec_error"}:
+        return True
+    return bucket == "timeout" and bool(rec.get("pred_timeout"))
+
+
+def _acceptance_kind(
+    *,
+    route_used: bool,
+    model_sql_after_reject: bool,
+    routed_not_used: bool,
+) -> str:
+    if route_used:
+        return "route_used"
+    if model_sql_after_reject:
+        return "model_sql_after_route_reject"
+    if routed_not_used:
+        return "routed_not_used"
+    return "final_sql"
+
+
+def _sorted_product_safety_db_stats(
+    by_db: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    return dict(
+        sorted(
+            by_db.items(),
+            key=lambda item: (-item[1].get("final_sql_wrong", 0), item[0]),
+        )
+    )
+
+
+def _render_product_safety_summary(product: ProductSafetyDiagnostics) -> str:
+    lines = [
+        "| signal | total | correct | wrong |",
+        "|---|---:|---:|---:|",
+        (
+            f"| final SQL emitted | {product.final_sql_total} "
+            f"| {product.final_sql_correct} | {product.final_sql_wrong} |"
+        ),
+        (
+            f"| route used for final SQL | {product.route_used_total} "
+            f"| {product.route_used_correct} | {product.route_used_wrong} |"
+        ),
+        (
+            f"| model SQL after route reject | "
+            f"{product.model_sql_after_route_reject_total} | - "
+            f"| {product.model_sql_after_route_reject_wrong} |"
+        ),
+        (
+            f"| routed but not used | {product.routed_not_used_total} | - "
+            f"| {product.routed_not_used_wrong} |"
+        ),
+    ]
+    if product.by_db:
+        lines.extend(
+            [
+                "",
+                "| db_id | final wrong | route-used wrong | model-after-reject wrong |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for db_id, stats in product.by_db.items():
+            lines.append(
+                f"| `{db_id}` | {stats.get('final_sql_wrong', 0)} "
+                f"| {stats.get('route_used_wrong', 0)} "
+                f"| {stats.get('model_sql_after_route_reject_wrong', 0)} |"
+            )
+    if product.wrong_examples:
+        lines.extend(["", "### Accepted Wrong SQL Samples", ""])
+        for example in product.wrong_examples:
+            lines.extend(
+                [
+                    f"- `{example.index}` `{example.db_id}` "
+                    f"`{example.acceptance_kind}` `{example.route_reason or '-'}`: "
+                    f"{example.question}",
+                    f"  - stage: `{example.stage_pinned or '-'}`; "
+                    f"bucket: `{example.failure_bucket or '-'}`",
+                ]
+            )
+    return "\n".join(lines)
 
 
 def _classify_example(
@@ -523,6 +775,7 @@ def _sorted_counts(counts: dict[str, int]) -> list[tuple[str, int]]:
 def _recommendations(report: DiagnosisReport) -> list[str]:
     lane_counts = report.lane_counts
     tag_counts = report.tag_counts
+    product = report.product_safety
     recs: list[str] = []
     skeleton = lane_counts.get("skeleton_planning", 0)
     schema = (
@@ -551,6 +804,16 @@ def _recommendations(report: DiagnosisReport) -> list[str]:
         recs.append(
             "- Fix runtime/contract errors before interpreting semantic accuracy; execution "
             "errors hide downstream model quality."
+        )
+    if product.route_used_wrong:
+        recs.append(
+            "- Fail closed before deterministic route promotion when route evidence is "
+            "incomplete; route-used wrong SQL is a product-safety blocker."
+        )
+    if product.model_sql_after_route_reject_wrong:
+        recs.append(
+            "- Route rejected questions through typed fallback or clarification before "
+            "emitting Stage 3 SQL; rejected-route wrong SQL should not ship."
         )
     if tag_counts.get("ratio_or_metric_collapsed_to_count", 0):
         recs.append(

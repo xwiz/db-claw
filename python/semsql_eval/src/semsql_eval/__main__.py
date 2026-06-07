@@ -2122,11 +2122,17 @@ def _render_gate_summary(
     show_default=True,
     help="Number of tagged failures to include in the sample section.",
 )
+@click.option(
+    "--fail-on-accepted-wrong-sql",
+    is_flag=True,
+    help="Exit non-zero if the report contains any emitted final SQL that scored wrong.",
+)
 def diagnose_report_cmd(
     report_json: Path,
     out: Path | None,
     out_json: Path | None,
     sample_examples: int,
+    fail_on_accepted_wrong_sql: bool,
 ) -> None:
     """Classify gold-vs-pred SQL feature gaps in an eval report."""
     report = diagnose_report(report_json, sample_examples=sample_examples)
@@ -2137,6 +2143,11 @@ def diagnose_report_cmd(
         out.write_text(rendered, encoding="utf-8")
     if out_json is not None:
         _write_json_report_text(out_json, diagnosis_report_to_json(report))
+    if fail_on_accepted_wrong_sql and report.product_safety.final_sql_wrong:
+        raise click.ClickException(
+            "accepted wrong SQL detected: "
+            f"{report.product_safety.final_sql_wrong} final SQL mismatches"
+        )
 
 
 @cli.command("ablation-gap")
