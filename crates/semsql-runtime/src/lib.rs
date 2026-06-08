@@ -3981,7 +3981,53 @@ fn runtime_prompt_subject_entity_mismatch(
     if runtime_aggregate_allows_dimension_subject(trace, &first_entity) {
         return false;
     }
+    if runtime_metric_allows_related_fact_subject(trace, atlas, &first_entity) {
+        return false;
+    }
     true
+}
+
+fn runtime_metric_allows_related_fact_subject(
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &RuntimeSemanticAtlas,
+    mentioned_entity: &str,
+) -> bool {
+    let Some(projection) = &trace.projection else {
+        return false;
+    };
+    if !runtime_expression_is_measure(&projection.expression) {
+        return false;
+    }
+    if !matches!(
+        trace.source.as_str(),
+        "runtime_graph_query_frame_metric"
+            | "runtime_graph_query_frame_scalar_aggregate"
+            | "runtime_graph_query_frame_rank"
+    ) {
+        return false;
+    }
+    if !trace.joins.is_empty() {
+        return false;
+    }
+    if !runtime_entity_related_to_base(&projection.entity, mentioned_entity, atlas) {
+        return false;
+    }
+    let projected_entity = projection.entity.to_ascii_lowercase();
+    let all_predicates_on_projected_entity = trace.predicates.iter().all(|predicate| {
+        predicate
+            .field
+            .split_once('.')
+            .map(|(entity, _)| entity.eq_ignore_ascii_case(&projected_entity))
+            .unwrap_or(false)
+    });
+    let order_on_projected_entity = trace.order_by.as_ref().map_or(true, |order| {
+        order
+            .field
+            .split_once('.')
+            .map(|(entity, _)| entity.eq_ignore_ascii_case(&projected_entity))
+            .unwrap_or(false)
+    });
+    all_predicates_on_projected_entity && order_on_projected_entity
 }
 
 fn runtime_aggregate_allows_dimension_subject(
@@ -31681,6 +31727,51 @@ mod graph_schema_atlas_tests {
             &trace,
             &atlas,
         ));
+    }
+
+    #[test]
+    fn runtime_bound_plan_allows_related_fact_metric_subject_without_join() {
+        let entities = ["schools", "frpm"]
+            .into_iter()
+            .map(entity_row)
+            .collect::<Vec<_>>();
+        let fields = vec![
+            typed_field_row("schools", "cdscode", "TEXT"),
+            field_row("schools", "school_name"),
+            typed_field_row("frpm", "cdscode", "TEXT"),
+            field_row("frpm", "county_name"),
+            typed_field_row("frpm", "free_meal_count_k_12", "REAL"),
+            typed_field_row("frpm", "enrollment_k_12", "REAL"),
+        ];
+        let relationships = vec![RelationshipRow {
+            from_entity: "frpm".to_string(),
+            from_field: "cdscode".to_string(),
+            to_entity: "schools".to_string(),
+            to_field: "cdscode".to_string(),
+            kind: "many_to_one".to_string(),
+        }];
+        let samples = vec![sample_row("frpm.county_name", &["Alameda", "Fresno"])];
+        let question = "What is the highest eligible free rate for K-12 students in the schools in Alameda County?";
+
+        let trace = graph_query_frame_trace(question, &entities, &fields, &relationships, &samples);
+
+        assert!(trace.routed, "{trace:?}");
+        assert_eq!(trace.source, "runtime_graph_query_frame_metric");
+        assert_eq!(
+            trace.projection.as_ref().map(|p| p.entity.as_str()),
+            Some("frpm"),
+            "{trace:?}"
+        );
+        assert!(trace.joins.is_empty(), "{trace:?}");
+        let atlas =
+            RuntimeSemanticAtlas::from_rows(&entities, &fields, &relationships, &samples, &[]);
+        assert!(!runtime_prompt_subject_entity_mismatch(
+            question, &trace, &atlas,
+        ));
+        let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+        let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
+        assert!(plan.valid, "{plan:?}");
+        assert_eq!(plan.reject_reason, None);
     }
 
     #[test]

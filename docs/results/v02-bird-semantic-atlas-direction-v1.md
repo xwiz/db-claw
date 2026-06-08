@@ -49,9 +49,13 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
   the date only as a filter.
 - related predicate fields with stronger label/value evidence are promoted to
   the related table instead of accepting a weaker same-table shortcut.
+- related fact-table metrics are accepted when the prompt names a related
+  dimension entity but the atlas proves all grounded measure/filter evidence
+  belongs on the fact table.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
-slice after the related-field promotion is `4/4`, wrong accepted SQL `0`, bails
-`0`. The next root cause is scaling this atlas/codebook evidence across broad
-BIRD and real databases, especially value dictionaries, field roles, active
-tables, metric candidates, and fast graph loading.
+slice after related-field and related-fact promotion is `5/5`, wrong accepted
+SQL `0`, bails `0`; first20 is `5/20`, wrong `0`, bailed `15`. The next root
+cause is not another route patch; it is a reusable query-time atlas/codebook
+retrieval layer over value dictionaries, field roles, active tables, metric
+candidates, and fast graph loading.
