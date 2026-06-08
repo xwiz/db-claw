@@ -3178,6 +3178,9 @@ fn runtime_bound_plan_semantic_reject_reason(
     if runtime_prompt_related_predicate_field_ambiguity(nl, plan, atlas) {
         return Some("ambiguous_related_predicate_field".to_string());
     }
+    if runtime_prompt_ambiguous_unscoped_value_field(nl, plan, atlas) {
+        return Some("ambiguous_unscoped_value_field".to_string());
+    }
     if runtime_prompt_subject_entity_mismatch(nl, trace, atlas) {
         return Some("subject_entity_mismatch".to_string());
     }
@@ -3702,85 +3705,87 @@ fn runtime_explicit_numeric_field_terms(nl: &str) -> Vec<String> {
         if !graph_is_plain_number(&literal) || graph_is_year_literal(&literal) {
             continue;
         }
-        let context = graph_mention_context(nl, &literal);
-        let tokens = graph_ordered_tokens(&context);
-        let literal_digits = literal
-            .chars()
-            .filter(|ch| ch.is_ascii_digit())
-            .collect::<String>();
-        let Some(index) = tokens.iter().position(|token| {
-            token
-                .chars()
-                .filter(|ch| ch.is_ascii_digit())
-                .collect::<String>()
-                == literal_digits
-        }) else {
-            continue;
-        };
-        let mut prefix = tokens[..index].to_vec();
-        while prefix.last().is_some_and(|token| {
-            matches!(
-                token.as_str(),
-                "is" | "are"
-                    | "was"
-                    | "were"
-                    | "equals"
-                    | "equal"
-                    | "greater"
-                    | "less"
-                    | "than"
-                    | "over"
-                    | "under"
-                    | "above"
-                    | "below"
-                    | "at"
-                    | "least"
-                    | "more"
-                    | "not"
-                    | "no"
-            )
-        }) {
-            prefix.pop();
-        }
-        let start = prefix
-            .iter()
-            .rposition(|token| {
-                matches!(
-                    token.as_str(),
-                    "which"
-                        | "where"
-                        | "with"
-                        | "whose"
-                        | "and"
-                        | "or"
-                        | "the"
-                        | "a"
-                        | "an"
-                        | "of"
-                        | "for"
-                        | "in"
-                )
-            })
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        let term_tokens = prefix[start..]
-            .iter()
-            .filter(|token| {
-                !matches!(
-                    token.as_str(),
-                    "the" | "a" | "an" | "of" | "for" | "in" | "to" | "from"
-                )
-            })
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !term_tokens.is_empty() {
-            out.push(term_tokens.join(" "));
+        if let Some(term) = runtime_explicit_numeric_field_term_for_literal(nl, &literal) {
+            out.push(term);
         }
     }
     out.sort();
     out.dedup();
     out
+}
+
+fn runtime_explicit_numeric_field_term_for_literal(nl: &str, literal: &str) -> Option<String> {
+    let context = graph_mention_context(nl, literal);
+    let tokens = graph_ordered_tokens(&context);
+    let literal_digits = literal
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    let index = tokens.iter().position(|token| {
+        token
+            .chars()
+            .filter(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            == literal_digits
+    })?;
+    let mut prefix = tokens[..index].to_vec();
+    while prefix.last().is_some_and(|token| {
+        matches!(
+            token.as_str(),
+            "is" | "are"
+                | "was"
+                | "were"
+                | "equals"
+                | "equal"
+                | "greater"
+                | "less"
+                | "than"
+                | "over"
+                | "under"
+                | "above"
+                | "below"
+                | "at"
+                | "least"
+                | "more"
+                | "not"
+                | "no"
+        )
+    }) {
+        prefix.pop();
+    }
+    let start = prefix
+        .iter()
+        .rposition(|token| {
+            matches!(
+                token.as_str(),
+                "which"
+                    | "where"
+                    | "with"
+                    | "whose"
+                    | "and"
+                    | "or"
+                    | "the"
+                    | "a"
+                    | "an"
+                    | "of"
+                    | "for"
+                    | "in"
+            )
+        })
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let term_tokens = prefix[start..]
+        .iter()
+        .filter(|token| {
+            !matches!(
+                token.as_str(),
+                "the" | "a" | "an" | "of" | "for" | "in" | "to" | "from"
+            )
+        })
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>();
+    (!term_tokens.is_empty()).then(|| term_tokens.join(" "))
 }
 
 fn runtime_bound_plan_grouped_aggregate_semantic_reject_reason(
@@ -4326,6 +4331,114 @@ fn runtime_prompt_related_predicate_field_ambiguity(
             candidate_score >= selected_score + 2
         })
     })
+}
+
+fn runtime_prompt_ambiguous_unscoped_value_field(
+    nl: &str,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    plan.predicates.iter().any(|predicate| {
+        if !matches!(predicate.operator.as_str(), "=" | "in") {
+            return false;
+        }
+        let Some(selected) = atlas.field(&predicate.field) else {
+            return false;
+        };
+        if !runtime_field_can_have_ambiguous_unscoped_value(selected) {
+            return false;
+        }
+        let mut candidates = atlas
+            .fields
+            .values()
+            .filter(|candidate| runtime_field_can_have_ambiguous_unscoped_value(candidate))
+            .filter(|candidate| {
+                candidate.entity.eq_ignore_ascii_case(&selected.entity)
+                    || graph_entities_are_related(
+                        &selected.entity,
+                        &candidate.entity,
+                        &atlas.relationships,
+                    )
+            })
+            .filter(|candidate| {
+                !(candidate.entity.eq_ignore_ascii_case(&selected.entity)
+                    && graph_field_is_categorical_scope(selected)
+                    && graph_field_is_generic_display_name(candidate))
+            })
+            .filter(|candidate| {
+                runtime_field_has_predicate_value_evidence(candidate, predicate, atlas)
+            })
+            .map(|candidate| {
+                (
+                    candidate.canonical().to_ascii_lowercase(),
+                    runtime_predicate_field_label_score(nl, candidate, atlas),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        if candidates.len() < 2 {
+            return false;
+        }
+        let selected_key = selected.canonical().to_ascii_lowercase();
+        let selected_score = candidates
+            .iter()
+            .find_map(|(key, score)| (key == &selected_key).then_some(*score))
+            .unwrap_or_else(|| runtime_predicate_field_label_score(nl, selected, atlas));
+        let max_score = candidates
+            .iter()
+            .map(|(_, score)| *score)
+            .max()
+            .unwrap_or(selected_score);
+        let selected_metric_entity =
+            runtime_predicate_entity_colocated_with_metric_plan(selected, plan, atlas);
+        let duplicate_on_selected_entity = candidates.iter().any(|(key, _)| {
+            key != &selected_key
+                && atlas.field(key).is_some_and(|candidate| {
+                    candidate.entity.eq_ignore_ascii_case(&selected.entity)
+                })
+        });
+        let unique_top_selected = selected_score >= 2
+            && selected_score == max_score
+            && candidates
+                .iter()
+                .filter(|(_, score)| *score == max_score)
+                .all(|(key, _)| key == &selected_key);
+        let selected_disambiguated =
+            unique_top_selected || (selected_metric_entity && !duplicate_on_selected_entity);
+        !selected_disambiguated
+    })
+}
+
+fn runtime_predicate_entity_colocated_with_metric_plan(
+    selected: &FieldRow,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let selected_entity = selected.entity.to_ascii_lowercase();
+    plan.projections.iter().any(|projection| {
+        runtime_expression_is_measure(&projection.expression)
+            && projection
+                .field
+                .as_deref()
+                .and_then(|field| atlas.field(field))
+                .is_some_and(|field| field.entity.eq_ignore_ascii_case(&selected_entity))
+    }) || plan.order_by.as_ref().is_some_and(|order| {
+        runtime_expression_is_measure(&order.expression)
+            && atlas
+                .field(&order.field)
+                .is_some_and(|field| field.entity.eq_ignore_ascii_case(&selected_entity))
+    })
+}
+
+fn runtime_field_can_have_ambiguous_unscoped_value(field: &FieldRow) -> bool {
+    graph_field_looks_display_field(field)
+        && !graph_field_looks_date_like(field)
+        && !graph_field_looks_numeric(field)
+        && !graph_field_looks_unsafe_id(field)
+        && !graph_field_looks_status_like(field)
+        && !is_boolean_field_type(&field.field_type)
+        && !semantic_field_sensitive(field)
 }
 
 fn runtime_prompt_high_confidence_value_candidate_missing(
@@ -5669,6 +5782,8 @@ fn graph_query_frame_trace_with_vocab(
         vocabulary,
         predicates,
     );
+    predicates =
+        graph_bind_explicit_numeric_threshold_predicates(nl, fields, vocabulary, predicates);
     trace.predicates = predicates.iter().map(graph_predicate_trace).collect();
     let order_like = graph_order_direction_limit(nl).is_some();
     if (predicates.is_empty() && !order_like) || predicates.len() > 3 {
@@ -14089,7 +14204,18 @@ fn graph_generic_route_has_unsafe_terms(nl: &str, trace: &RuntimeQueryFrameTrace
     if unsafe_terms.iter().any(|needle| lower.contains(needle)) {
         return true;
     }
+    let comparative_not = [
+        " not more than ",
+        " not above ",
+        " not over ",
+        " not less than ",
+        " not below ",
+        " not under ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
     if (lower.contains(" not ") || lower.contains(" without "))
+        && !comparative_not
         && !trace
             .predicates
             .iter()
@@ -19691,6 +19817,12 @@ fn graph_literal_compatible_with_field(question: &str, literal: &str, field: &Fi
     if graph_numeric_context_targets_score(&lower_context) {
         return graph_field_looks_score_like(field);
     }
+    if runtime_explicit_numeric_field_term_for_literal(question, literal).is_some_and(|term| {
+        let term_tokens = graph_name_tokens(&term);
+        !term_tokens.is_empty() && !term_tokens.is_disjoint(&field_tokens)
+    }) {
+        return true;
+    }
     if graph_asks_for_id(&context) {
         return false;
     }
@@ -22731,6 +22863,118 @@ fn graph_derived_literal_predicates(
     out
 }
 
+fn graph_bind_explicit_numeric_threshold_predicates(
+    nl: &str,
+    fields: &[FieldRow],
+    vocabulary: &[VocabularyEntry],
+    mut predicates: Vec<GraphQueryPredicate>,
+) -> Vec<GraphQueryPredicate> {
+    let field_map = graph_field_map(fields);
+    for literal in runtime_prompt_numeric_threshold_literals(nl) {
+        let operator = graph_operator_for_mention(nl, &literal);
+        if !matches!(operator, "<" | "<=" | ">" | ">=" | "=") {
+            continue;
+        }
+        let Some(field_key) =
+            graph_best_explicit_numeric_threshold_field(nl, &literal, fields, vocabulary)
+        else {
+            continue;
+        };
+        let literal_norm = graph_norm(&literal);
+        if predicates.iter().any(|predicate| {
+            predicate.field.eq_ignore_ascii_case(&field_key)
+                && graph_norm(&predicate.value) == literal_norm
+        }) {
+            continue;
+        }
+        predicates.retain(|predicate| {
+            let same_literal = graph_norm(&predicate.value) == literal_norm;
+            let wrong_numeric_field = field_map
+                .get(&predicate.field)
+                .is_some_and(|field| graph_field_looks_numeric(field))
+                && !predicate.field.eq_ignore_ascii_case(&field_key);
+            !(same_literal && wrong_numeric_field)
+        });
+        if predicates.len() >= 3 {
+            continue;
+        }
+        predicates.push(GraphQueryPredicate {
+            field: field_key,
+            operator: operator.to_string(),
+            value: literal,
+        });
+    }
+    predicates
+}
+
+fn graph_best_explicit_numeric_threshold_field(
+    nl: &str,
+    literal: &str,
+    fields: &[FieldRow],
+    vocabulary: &[VocabularyEntry],
+) -> Option<String> {
+    let term = runtime_explicit_numeric_field_term_for_literal(nl, literal)?;
+    let context = graph_mention_context(nl, literal);
+    fields
+        .iter()
+        .filter(|field| graph_field_looks_numeric(field) && !graph_field_looks_unsafe_id(field))
+        .filter_map(|field| {
+            let score =
+                graph_explicit_numeric_threshold_field_score(&term, &context, field, vocabulary);
+            (score >= 18.0).then(|| (score, field.canonical()))
+        })
+        .max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.1.len().cmp(&left.1.len()))
+        })
+        .map(|(_, field)| field)
+}
+
+fn graph_explicit_numeric_threshold_field_score(
+    term: &str,
+    context: &str,
+    field: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> f32 {
+    let term_norm = graph_norm(term);
+    if term_norm.len() < 2 {
+        return 0.0;
+    }
+    let term_tokens = graph_tokens_with_aliases(&term_norm);
+    if term_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut best: f32 = 0.0;
+    for form in graph_field_display_forms_with_vocab(field, vocabulary) {
+        let form_norm = graph_norm(&form);
+        if form_norm.len() < 2 {
+            continue;
+        }
+        if form_norm == term_norm {
+            best = best.max(80.0);
+            continue;
+        }
+        let form_tokens = graph_tokens_with_aliases(&form_norm);
+        if form_tokens.is_empty() {
+            continue;
+        }
+        if graph_norm_contains(&form_norm, &term_norm) {
+            let coverage = term_tokens.len() as f32 / form_tokens.len() as f32;
+            best = best.max(34.0 * coverage.clamp(0.2, 1.0));
+            continue;
+        }
+        let overlap = form_tokens.intersection(&term_tokens).count();
+        if overlap >= 2 {
+            let term_coverage = overlap as f32 / term_tokens.len() as f32;
+            let form_coverage = overlap as f32 / form_tokens.len() as f32;
+            best = best.max((term_coverage + form_coverage) * 10.0);
+        }
+    }
+    best + graph_field_label_context_bonus(context, field)
+}
+
 fn graph_literal_is_field_modifier(nl: &str, literal: &str, fields: &[FieldRow]) -> bool {
     let raw = literal.trim_matches('\'');
     if !(2..=5).contains(&raw.len())
@@ -23713,11 +23957,35 @@ fn graph_operator_for_mention(question: &str, mention: &str) -> &'static str {
         return "=";
     }
     let context = graph_mention_context(question, mention).to_ascii_lowercase();
-    if graph_negated_value_context(&context) {
-        return "!=";
-    }
     if !(graph_is_plain_number(mention) || graph_is_date_like(mention)) {
+        if graph_negated_value_context(&context) {
+            return "!=";
+        }
         return "=";
+    }
+    if [
+        "not more than",
+        "no more than",
+        "at most",
+        "not above",
+        "not over",
+    ]
+    .iter()
+    .any(|needle| context.contains(needle))
+    {
+        return "<=";
+    }
+    if [
+        "not less than",
+        "no less than",
+        "at least",
+        "not below",
+        "not under",
+    ]
+    .iter()
+    .any(|needle| context.contains(needle))
+    {
+        return ">=";
     }
     if ["less than", "before", "under", "below", "smaller than"]
         .iter()
@@ -26027,7 +26295,7 @@ mod graph_schema_atlas_tests {
         graph_prompt_should_never_model_fallback, graph_query_frame_trace,
         graph_query_frame_trace_with_vocab, graph_query_mentions_ambiguous_physical_table_family,
         graph_query_predicates_with_vocab, graph_rate_subject_entity,
-        graph_runtime_query_frame_final_sql_allowed,
+        graph_runtime_query_frame_count_safe, graph_runtime_query_frame_final_sql_allowed,
         graph_runtime_query_frame_final_sql_allowed_with_vocab,
         graph_runtime_query_frame_generic_safe_with_vocab,
         graph_runtime_query_frame_grouped_aggregate_safe,
@@ -26035,8 +26303,8 @@ mod graph_schema_atlas_tests {
         graph_sample_value_is_temporal_subject_descriptor, graph_sample_value_query_aliases,
         graph_scope_term_is_temporal_subject_descriptor, graph_subject_entity_from_field_entities,
         graph_subject_entity_with_vocab, graph_topk_group_dimension_phrase,
-        runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
-        runtime_prompt_high_confidence_value_candidate_missing,
+        graph_trace_predicates_are_grounded, runtime_bound_query_plan_from_trace,
+        runtime_intent_frame_from_trace, runtime_prompt_high_confidence_value_candidate_missing,
         runtime_prompt_related_predicate_field_ambiguity,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
         semantic_atlas_codebook_lookup, semantic_runtime_atlas,
@@ -34631,6 +34899,221 @@ mod graph_schema_atlas_tests {
             plan.reject_reason.as_deref(),
             Some("missing_value_candidate"),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn bound_query_plan_rejects_unscoped_duplicate_text_value_fields() {
+        let entities = vec![entity_row("customers")];
+        let fields = vec![
+            typed_field_row("customers", "id", "INTEGER"),
+            field_row("customers", "city"),
+            labeled_field_row("customers", "county_name", "TEXT", "County Name"),
+        ];
+        let samples = vec![
+            sample_row("customers.city", &["Alameda"]),
+            sample_row("customers.county_name", &["Alameda"]),
+        ];
+        let atlas = semantic_runtime_atlas(&entities, &fields, &[], &samples, &[]);
+        let ambiguous_question = "How many customers are in Alameda?";
+        let ambiguous_trace = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: ambiguous_question.to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT COUNT(*) FROM customers WHERE customers.city = 'Alameda'".to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "customers".to_string(),
+                field: None,
+                fields: Vec::new(),
+                expression: "COUNT(*)".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "customers.city".to_string(),
+                operator: "=".to_string(),
+                value: "Alameda".to_string(),
+            }],
+            required_entities: vec!["customers".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        let ambiguous_intent =
+            runtime_intent_frame_from_trace(ambiguous_question, &ambiguous_trace, &atlas);
+        let ambiguous_plan = runtime_bound_query_plan_from_trace(
+            ambiguous_question,
+            &ambiguous_trace,
+            &atlas,
+            &ambiguous_intent,
+        );
+        assert_eq!(
+            ambiguous_plan.reject_reason.as_deref(),
+            Some("ambiguous_unscoped_value_field"),
+            "{ambiguous_plan:?}"
+        );
+
+        let scoped_question = "How many customers are in Alameda County?";
+        let scoped_trace = RuntimeQueryFrameTrace {
+            sql: Some(
+                "SELECT COUNT(*) FROM customers WHERE customers.county_name = 'Alameda'"
+                    .to_string(),
+            ),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "customers.county_name".to_string(),
+                operator: "=".to_string(),
+                value: "Alameda".to_string(),
+            }],
+            question: scoped_question.to_string(),
+            ..ambiguous_trace
+        };
+        let scoped_intent = runtime_intent_frame_from_trace(scoped_question, &scoped_trace, &atlas);
+        let scoped_plan = runtime_bound_query_plan_from_trace(
+            scoped_question,
+            &scoped_trace,
+            &atlas,
+            &scoped_intent,
+        );
+        assert!(scoped_plan.valid, "{scoped_plan:?}");
+    }
+
+    #[test]
+    fn bound_query_plan_rejects_unscoped_related_duplicate_text_value_field() {
+        let entities = vec![entity_row("schools"), entity_row("funding_facts")];
+        let fields = vec![
+            typed_field_row("schools", "id", "INTEGER"),
+            field_row("schools", "fundingtype"),
+            typed_field_row("funding_facts", "school_id", "INTEGER"),
+            labeled_field_row(
+                "funding_facts",
+                "charter_funding_type",
+                "TEXT",
+                "Charter Funding Type",
+            ),
+        ];
+        let relationships = vec![relationship_row("funding_facts", "school_id", "schools")];
+        let samples = vec![
+            sample_row("schools.fundingtype", &["Directly funded"]),
+            sample_row("funding_facts.charter_funding_type", &["Directly funded"]),
+        ];
+        let vocabulary = vec![scope_vocab_entry(
+            "directly funded",
+            "schools.fundingtype",
+            "directly funded",
+        )];
+        let atlas =
+            semantic_runtime_atlas(&entities, &fields, &relationships, &samples, &vocabulary);
+        let question = "How many schools are directly funded?";
+        let trace = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: question.to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed".to_string(),
+            sql: Some(
+                "SELECT COUNT(*) FROM schools WHERE schools.fundingtype = 'directly funded'"
+                    .to_string(),
+            ),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "schools".to_string(),
+                field: None,
+                fields: Vec::new(),
+                expression: "COUNT(*)".to_string(),
+            }),
+            predicates: vec![RuntimeQueryFramePredicateTrace {
+                field: "schools.fundingtype".to_string(),
+                operator: "=".to_string(),
+                value: "directly funded".to_string(),
+            }],
+            required_entities: vec!["schools".to_string()],
+            joins: Vec::new(),
+            order_by: None,
+        };
+        let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+        let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
+        assert_eq!(
+            plan.reject_reason.as_deref(),
+            Some("ambiguous_unscoped_value_field"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn graph_query_frame_binds_explicit_numeric_threshold_to_related_field_label() {
+        let entities = vec![entity_row("core_records"), entity_row("score_facts")];
+        let fields = vec![
+            typed_field_row("core_records", "id", "INTEGER"),
+            typed_field_row("core_records", "ext", "INTEGER"),
+            typed_field_row("score_facts", "core_record_id", "INTEGER"),
+            labeled_field_row(
+                "score_facts",
+                "num_test_takers",
+                "INTEGER",
+                "Number of Test Takers",
+            ),
+            labeled_field_row(
+                "score_facts",
+                "num_ge_1500",
+                "INTEGER",
+                "Number of Test Takers Whose Total Scores Are Greater or Equal to 1500",
+            ),
+        ];
+        let relationships = vec![relationship_row(
+            "score_facts",
+            "core_record_id",
+            "core_records",
+        )];
+        let query = "How many core records have number of test takers not more than 250?";
+        let trace = graph_query_frame_trace(query, &entities, &fields, &relationships, &[]);
+
+        assert!(trace.routed, "{trace:?}");
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "score_facts.num_test_takers"
+                    && predicate.operator == "<="
+                    && predicate.value == "250"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            trace
+                .predicates
+                .iter()
+                .all(|predicate| predicate.field != "core_records.ext"
+                    && predicate.field != "score_facts.num_ge_1500"),
+            "{trace:?}"
+        );
+        assert!(
+            trace.joins.iter().any(|join| {
+                join.from_entity == "core_records" && join.to_entity == "score_facts"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            !graph_generic_route_has_unsafe_terms(query, &trace),
+            "{trace:?}"
+        );
+        assert!(
+            graph_trace_predicates_are_grounded(query, &trace, &fields, &[], &[]),
+            "{trace:?}"
+        );
+        assert!(
+            graph_runtime_query_frame_count_safe(query, &trace, &fields, &[], &[]),
+            "{trace:?}"
+        );
+        assert!(
+            graph_runtime_query_frame_final_sql_allowed(
+                true,
+                &entities,
+                &fields,
+                &[],
+                query,
+                &trace
+            ),
+            "{trace:?}"
         );
     }
 

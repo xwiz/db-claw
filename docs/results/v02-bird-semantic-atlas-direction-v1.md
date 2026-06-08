@@ -61,18 +61,25 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - count queries with descriptive metric filters stay on the count route; local
   field-label context grounds numeric thresholds such as `average score in
   Math > 400` without treating `Math`/`SAT` as location values.
+- explicit related numeric thresholds such as `number of test takers not more
+  than 250` bind to the matching related numeric field instead of an unrelated
+  base-table number field.
 - high-confidence value candidates from samples/dictionaries must be selected
   or covered by a more specific/lifecycle-equivalent value; otherwise the plan
   fails closed instead of accepting a partial predicate set.
+- unscoped duplicate text values across plausible fields now fail closed unless
+  a field role or metric co-location disambiguates the selected field.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
 slice after related-field, related-fact, output-span projection, ranked
 metric-value, and metric-filter count work is `7/7`, wrong accepted SQL `0`,
-bails `0`; first20 is `7/20`, wrong `0`, bailed `13`. The next root cause is planner-side role
-binding for the remaining metric/value/group/order slots using the reusable
-query-time atlas/codebook candidates exposed on `intent_frame`. Numeric
-metric-like scope phrases are filtered out of value aliases, so phrases such as
-`eligible free rate` surface as metric evidence rather than bogus count-field
-values. A naive whole-query projection boost once regressed
-`zip code ... charter schools`; current planner use is intentionally
+bails `0`; first20 is `7/20`, wrong `0`, bailed `13`. The threshold exact
+probe for indexes `16` and `18` now bails `2/2` with
+`ambiguous_unscoped_value_field` instead of accepting wrong SQL. The next root
+cause is planner-side role binding for the remaining metric/value/group/order
+slots using the reusable query-time atlas/codebook candidates exposed on
+`intent_frame`. Numeric metric-like scope phrases are filtered out of value
+aliases, so phrases such as `eligible free rate` surface as metric evidence
+rather than bogus count-field values. A naive whole-query projection boost once
+regressed `zip code ... charter schools`; current planner use is intentionally
 slot/role-aware.
