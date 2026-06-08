@@ -29,12 +29,16 @@ Provider output may propose a bounded plan; direct provider SQL remains
 rejected.
 
 ## Current Runtime Step
-The runtime now distinguishes two generic evidence cases that BIRD exposed:
+The runtime now distinguishes these generic evidence cases that BIRD exposed:
 
 - id-like numeric literals can use entity-role phrases such as `event No. 354`;
 - numeric thresholds can be justified by a selected route measure, such as
   `SUM(amount)` with `amount > 50000`.
+- description-backed scope predicates are available in BIRD graph caches;
+- date-role scoring prefers `OpenDate`/start fields for opened/created prompts;
+- scope predicate matching handles field-scoped variants such as
+  `direct charter-funded` -> `directly funded`.
 
-Next BIRD work should measure whether DB-only atlas enrichment reduces
-`missing_value_evidence`, metric/rank mismatch, and lookup ambiguity without
-increasing accepted wrong SQL.
+The description-aware first50 checkpoint stayed at `3/50` with accepted wrong
+SQL `0`, so the next root cause is join/table selection and projection pruning
+over available atlas evidence, not missing value aliases.

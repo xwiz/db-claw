@@ -493,6 +493,41 @@ def test_make_predictor_caches_graph_per_db(
     assert first == second, "graph file should be reused across calls for the same db_id"
 
 
+def test_make_predictor_uses_adjacent_schema_description_cache_variant(
+    tmp_path: Path, semsql_bin: Path
+) -> None:
+    src = tmp_path / "demo.sqlite"
+    _build_demo_sqlite(src)
+    description_dir = tmp_path / "database_description"
+    description_dir.mkdir()
+    (description_dir / "tenants.csv").write_text(
+        "original_column_name,column_name,column_description,value_description\n"
+        "name,Tenant Name,Organization display name,\n",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "graphs"
+
+    predict = make_cascade_predictor(semsql_bin=semsql_bin, graph_cache_dir=cache)
+    ex = Example(db_id="demo", question="show tenants", gold_sql="x", db_path=src)
+
+    assert predict(ex) == "SELECT * FROM tenants"
+    assert not (cache / "demo.semsql").exists()
+    graph = cache / "demo.desc.semsql"
+    assert graph.exists()
+    conn = sqlite3.connect(graph)
+    try:
+        terms = {
+            row[0]
+            for row in conn.execute(
+                "SELECT term FROM vocabulary WHERE canonical_kind = 'field'"
+            )
+        }
+    finally:
+        conn.close()
+    assert "tenant name" in terms
+    assert "organization display name" in terms
+
+
 def test_predictor_raises_when_binary_missing(tmp_path: Path) -> None:
     with pytest.raises(CascadeRunnerError, match="semsql binary not found"):
         make_cascade_predictor(

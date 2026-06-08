@@ -83,7 +83,15 @@ def build_graph_for_db(
     Idempotent: if ``output`` already exists, returns it unchanged.
     Atomic-ish: writes to ``output.tmp`` then renames, so a SIGINT
     mid-extract doesn't leave a partial file masquerading as complete.
+
+    If no explicit ``schema_description_dir`` is supplied, adjacent
+    BIRD/Spider-style description folders such as ``database_description/``
+    are auto-discovered. They are DB-provided semantic evidence, not gold SQL,
+    and should be available to the same SemanticAtlas path used by real apps.
     """
+    schema_description_dir = schema_description_dir or _schema_description_dir_for_sqlite(
+        sqlite_db
+    )
     if _graph_cache_ready(output):
         return output
     if output.exists():
@@ -129,6 +137,26 @@ def build_graph_for_db(
         )
     tmp.replace(output)
     return output
+
+
+def _schema_description_dir_for_sqlite(sqlite_db: Path) -> Path | None:
+    """Return an adjacent schema-description directory for benchmark DBs.
+
+    BIRD ships ``database_description/*.csv`` beside each SQLite database.
+    Production apps can use the same convention through ``semsql extract``.
+    The runner treats these folders as ordinary DB metadata and keeps the
+    cache filename separate so older schema-only graphs are not silently reused.
+    """
+    for dirname in (
+        "database_description",
+        "schema_description",
+        "schema_descriptions",
+        "db_description",
+    ):
+        candidate = sqlite_db.parent / dirname
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def build_graph_for_db_url(
@@ -596,7 +624,9 @@ def make_cascade_predictor(
                 f"refusing unsafe db_id {db_id!r} — contains path separator, "
                 "drive-letter prefix, NUL byte, or escapes the cache root"
             )
-        candidate = (cache_root / f"{db_id}.semsql").resolve()
+        description_dir = _schema_description_dir_for_sqlite(example.db_path)
+        suffix = ".desc.semsql" if description_dir is not None else ".semsql"
+        candidate = (cache_root / f"{db_id}{suffix}").resolve()
         try:
             candidate.relative_to(cache_root)
         except ValueError as e:
@@ -611,6 +641,7 @@ def make_cascade_predictor(
                 example.db_path,
                 graph_path,
                 timeout_seconds=extract_timeout_seconds,
+                schema_description_dir=_schema_description_dir_for_sqlite(example.db_path),
             )
         except CascadeRunnerError:
             # If we can't even build a graph for the DB, every query

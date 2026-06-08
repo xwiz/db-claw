@@ -3004,12 +3004,15 @@ fn runtime_field_matches_date_role(field: &FieldRow, role: &str) -> bool {
         field.field,
         field.display_label.as_deref().unwrap_or_default()
     ));
+    let compact = graph_compact_field_name(field);
     match role {
         "start" => [
             "open", "opened", "start", "started", "create", "created", "begin", "launch",
         ]
         .iter()
-        .any(|token| graph_norm_contains(&haystack, token)),
+        .any(|token| {
+            graph_norm_contains(&haystack, token) || (token.len() >= 4 && compact.contains(token))
+        }),
         "end" => [
             "close",
             "closed",
@@ -3021,7 +3024,9 @@ fn runtime_field_matches_date_role(field: &FieldRow, role: &str) -> bool {
             "canceled",
         ]
         .iter()
-        .any(|token| graph_norm_contains(&haystack, token)),
+        .any(|token| {
+            graph_norm_contains(&haystack, token) || (token.len() >= 4 && compact.contains(token))
+        }),
         _ => false,
     }
 }
@@ -13711,7 +13716,7 @@ fn graph_vocab_scope_predicate_is_grounded(
             return false;
         }
         let term_norm = graph_norm(&entry.term);
-        if term_norm.len() < 2 || !graph_norm_contains(&nl_norm, &term_norm) {
+        if graph_scope_predicate_term_match(nl, &nl_norm, &term_norm).is_none() {
             return false;
         }
         let Ok(value) = serde_json::from_str::<GraphScopePredicateValue>(&entry.canonical_value)
@@ -14607,9 +14612,10 @@ fn graph_derived_scope_predicates(
             continue;
         }
         let term_norm = graph_norm(&entry.term);
-        if term_norm.len() < 2 || !graph_norm_contains(&nl_norm, &term_norm) {
+        let Some(matched_term_norm) = graph_scope_predicate_term_match(nl, &nl_norm, &term_norm)
+        else {
             continue;
-        }
+        };
         let Ok(value) = serde_json::from_str::<GraphScopePredicateValue>(&entry.canonical_value)
         else {
             continue;
@@ -14623,7 +14629,7 @@ fn graph_derived_scope_predicates(
         };
         if graph_scope_predicate_term_shadowed_by_value_context(
             nl,
-            &term_norm,
+            &matched_term_norm,
             field,
             fields,
             vocabulary,
@@ -14631,7 +14637,11 @@ fn graph_derived_scope_predicates(
         ) {
             continue;
         }
-        let context = graph_mention_context(nl, &entry.term);
+        let context = if graph_norm_contains(&nl_norm, &term_norm) {
+            graph_mention_context(nl, &entry.term)
+        } else {
+            nl.to_string()
+        };
         let context_tokens = graph_tokens(&context);
         let score = 12.0
             + entry.confidence * 4.0
@@ -14646,12 +14656,12 @@ fn graph_derived_scope_predicates(
             + graph_field_entity_subject_bonus(nl, field)
             + graph_scope_entity_qualifier_bonus(nl, &entry.term, field, fields, vocabulary, true);
         let score = score + graph_entity_phrase_match_bonus(nl, &field.entity);
-        let key = (term_norm.clone(), value.scope.to_ascii_lowercase());
+        let key = (matched_term_norm.clone(), value.scope.to_ascii_lowercase());
         let candidate = grouped
             .entry(key)
             .or_insert_with(|| GraphScopePredicateCandidate {
                 scope: value.scope.clone(),
-                term_norm: term_norm.clone(),
+                term_norm: matched_term_norm.clone(),
                 score: 0.0,
                 predicates: Vec::new(),
             });
@@ -14707,6 +14717,83 @@ fn graph_derived_scope_predicates(
         }
     }
     out
+}
+
+fn graph_scope_predicate_term_match(nl: &str, nl_norm: &str, term_norm: &str) -> Option<String> {
+    if term_norm.len() < 2 {
+        return None;
+    }
+    if graph_norm_contains(nl_norm, term_norm) {
+        return Some(term_norm.to_string());
+    }
+    for variant in graph_scope_predicate_term_variants(term_norm) {
+        if variant == term_norm {
+            continue;
+        }
+        if graph_norm_contains(nl_norm, &variant)
+            || graph_ordered_tokens_match_with_gap(nl, &variant, 2)
+        {
+            return Some(variant);
+        }
+    }
+    None
+}
+
+fn graph_scope_predicate_term_variants(term_norm: &str) -> Vec<String> {
+    let mut variants = vec![term_norm.to_string()];
+    let tokens = graph_ordered_tokens(term_norm);
+    if tokens.len() >= 2 {
+        let adjective_tokens = tokens
+            .iter()
+            .map(|token| graph_adverb_to_adjective_token(token))
+            .collect::<Vec<_>>();
+        let adjective_phrase = adjective_tokens.join(" ");
+        if adjective_phrase != term_norm {
+            variants.push(adjective_phrase);
+        }
+    }
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+fn graph_adverb_to_adjective_token(token: &str) -> String {
+    let lower = token.to_ascii_lowercase();
+    if lower.len() > 4 && lower.ends_with("ly") {
+        let stem = lower.trim_end_matches("ly");
+        if stem.ends_with('i') {
+            return format!("{}y", stem.trim_end_matches('i'));
+        }
+        return stem.to_string();
+    }
+    lower
+}
+
+fn graph_ordered_tokens_match_with_gap(nl: &str, phrase: &str, max_gap: usize) -> bool {
+    let phrase_tokens = graph_ordered_tokens(phrase);
+    if phrase_tokens.len() < 2 {
+        return false;
+    }
+    let nl_tokens = graph_ordered_tokens(nl);
+    let mut cursor = 0usize;
+    let mut previous_match: Option<usize> = None;
+    for phrase_token in phrase_tokens {
+        let Some(relative_idx) = nl_tokens[cursor..]
+            .iter()
+            .position(|nl_token| nl_token == &phrase_token)
+        else {
+            return false;
+        };
+        let matched_idx = cursor + relative_idx;
+        if let Some(previous) = previous_match {
+            if matched_idx.saturating_sub(previous + 1) > max_gap {
+                return false;
+            }
+        }
+        previous_match = Some(matched_idx);
+        cursor = matched_idx + 1;
+    }
+    true
 }
 
 fn graph_scope_predicate_term_shadowed_by_value_context(
@@ -20816,7 +20903,7 @@ fn graph_generic_date_field_bonus(nl: &str, lower_context: &str, field: &FieldRo
     }
     let lower_nl = nl.to_ascii_lowercase();
     let column = field.db_column.to_ascii_lowercase();
-    let mut score = 0.0;
+    let mut score = graph_date_role_field_bonus(nl, field);
     if (lower_context.contains("created") || lower_nl.contains("created"))
         && matches!(
             column.as_str(),
@@ -20834,6 +20921,20 @@ fn graph_generic_date_field_bonus(nl: &str, lower_context: &str, field: &FieldRo
         score += 10.0;
     }
     score
+}
+
+fn graph_date_role_field_bonus(nl: &str, field: &FieldRow) -> f32 {
+    let lower = format!(" {} ", nl.to_ascii_lowercase().replace('\n', " "));
+    let Some(role) = runtime_prompt_requested_date_role(&lower) else {
+        return 0.0;
+    };
+    match role {
+        "start" if runtime_field_matches_date_role(field, "start") => 18.0,
+        "start" if runtime_field_matches_date_role(field, "end") => -18.0,
+        "end" if runtime_field_matches_date_role(field, "end") => 18.0,
+        "end" if runtime_field_matches_date_role(field, "start") => -18.0,
+        _ => 0.0,
+    }
 }
 
 fn graph_derived_vocab_enum_predicates(
@@ -25055,6 +25156,97 @@ mod graph_schema_atlas_tests {
             ),
             "{paraphrase_trace:?}"
         );
+    }
+
+    #[test]
+    fn runtime_query_frame_prefers_requested_date_role_for_structured_date() {
+        let entities = vec![entity_row("schools")];
+        let fields = vec![
+            FieldRow {
+                entity: "schools".to_string(),
+                field: "school".to_string(),
+                db_column: "School".to_string(),
+                field_type: "TEXT".to_string(),
+                display_label: Some("School".to_string()),
+            },
+            FieldRow {
+                entity: "schools".to_string(),
+                field: "phone".to_string(),
+                db_column: "Phone".to_string(),
+                field_type: "TEXT".to_string(),
+                display_label: Some("Phone".to_string()),
+            },
+            FieldRow {
+                entity: "schools".to_string(),
+                field: "charter".to_string(),
+                db_column: "Charter".to_string(),
+                field_type: "INTEGER".to_string(),
+                display_label: Some("Charter".to_string()),
+            },
+            FieldRow {
+                entity: "schools".to_string(),
+                field: "fundingtype".to_string(),
+                db_column: "FundingType".to_string(),
+                field_type: "TEXT".to_string(),
+                display_label: Some("Charter Funding Type".to_string()),
+            },
+            FieldRow {
+                entity: "schools".to_string(),
+                field: "opendate".to_string(),
+                db_column: "OpenDate".to_string(),
+                field_type: "DATE".to_string(),
+                display_label: Some("Open Date".to_string()),
+            },
+            FieldRow {
+                entity: "schools".to_string(),
+                field: "closeddate".to_string(),
+                db_column: "ClosedDate".to_string(),
+                field_type: "DATE".to_string(),
+                display_label: Some("Closed Date".to_string()),
+            },
+        ];
+        let vocabulary = vec![
+            scope_vocab_entry("charter", "schools.charter", "1"),
+            scope_vocab_entry("directly funded", "schools.fundingtype", "directly funded"),
+        ];
+        let question = "show phone numbers of direct charter-funded schools opened after 2000/1/1";
+        let trace =
+            graph_query_frame_trace_with_vocab(question, &entities, &fields, &[], &[], &vocabulary);
+
+        assert!(trace.routed, "{trace:?}");
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "schools.opendate"
+                    && matches!(predicate.operator.as_str(), ">" | ">=")
+                    && predicate.value == "2000/1/1"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            trace
+                .predicates
+                .iter()
+                .all(|predicate| predicate.field != "schools.closeddate"),
+            "{trace:?}"
+        );
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "schools.fundingtype" && predicate.value == "directly funded"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            trace
+                .predicates
+                .iter()
+                .any(|predicate| predicate.field == "schools.charter" && predicate.value == "1"),
+            "{trace:?}"
+        );
+
+        let atlas = semantic_runtime_atlas(&entities, &fields, &[], &[], &vocabulary);
+        let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+        let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
+        assert!(plan.valid, "{plan:?}");
     }
 
     #[test]
