@@ -73,6 +73,7 @@ from .llm_resolution import (
     build_openai_resolution_request_batch,
     build_pathway_rejected_query_packets,
     build_rejected_query_packet,
+    build_runtime_frame_resolution_proposal,
     build_schema_card,
     call_openai_chat_compatible_resolution,
     call_openai_resolution,
@@ -8561,6 +8562,7 @@ def _run_llm_resolution_fallback_query(
     fallback_render_issue_count: int | None = None
     fallback_render_issues: list[dict[str, object]] | None = None
     fallback_render_error: str | None = None
+    fallback_proposal_source: str | None = None
     artifacts: dict[str, str | None] = {
         "query_frame": str(query_frame_path) if query_frame_path.exists() else None,
         "packet": None,
@@ -8610,6 +8612,15 @@ def _run_llm_resolution_fallback_query(
             if not isinstance(loaded, dict):
                 raise click.ClickException("--proposal-json must contain a JSON object")
             proposal_payload = loaded
+            fallback_proposal_source = "typed_proposal"
+        elif provider == "none":
+            local_proposal = build_runtime_frame_resolution_proposal(packet)
+            if local_proposal is not None:
+                proposal_payload = {
+                    "source": "local_runtime_frame_resolution_task",
+                    "proposal": local_proposal,
+                }
+                fallback_proposal_source = "local_runtime_frame_resolution_task"
         elif provider != "none":
             if not provider_readiness["configured"]:
                 provider_error = str(provider_readiness["skipped_reason"])
@@ -8626,6 +8637,7 @@ def _run_llm_resolution_fallback_query(
                 except RuntimeError as exc:
                     provider_error = str(exc)
             if proposal_payload is not None and provider_path is not None:
+                fallback_proposal_source = "typed_provider"
                 provider_path.write_text(
                     json.dumps(proposal_payload, indent=2) + "\n",
                     encoding="utf-8",
@@ -8730,6 +8742,7 @@ def _run_llm_resolution_fallback_query(
         "fallback_render_issue_count": fallback_render_issue_count,
         "fallback_render_issues": fallback_render_issues,
         "fallback_render_error": fallback_render_error,
+        "fallback_proposal_source": fallback_proposal_source,
         "artifacts": artifacts,
     }
     rendered = _render_llm_resolution_fallback_query_markdown(summary)
@@ -9315,6 +9328,12 @@ def _run_llm_resolution_fallback_batch(
         "typed_fallback_selected_count": sum(
             1 for case in cases if case["selected_source"] == "typed_fallback"
         ),
+        "local_runtime_frame_proposal_count": sum(
+            1
+            for case in cases
+            if case.get("fallback_proposal_source")
+            == "local_runtime_frame_resolution_task"
+        ),
         "provider_call_count": sum(
             cast(int, case["provider_call_count"]) for case in cases
         ),
@@ -9363,6 +9382,7 @@ def _llm_fallback_batch_case(
             "used_direct_llm_sql": False,
             "clarification_choice": None,
             "fallback_render_valid": None,
+            "fallback_proposal_source": None,
             "fallback_render_issue_codes": [],
             "execution_target": None,
             "execution_status": None,
@@ -9405,6 +9425,7 @@ def _llm_fallback_batch_case(
         "used_direct_llm_sql": bool(summary.get("used_direct_llm_sql")),
         "clarification_choice": summary.get("clarification_choice"),
         "fallback_render_valid": summary.get("fallback_render_valid"),
+        "fallback_proposal_source": summary.get("fallback_proposal_source"),
         "fallback_render_issue_codes": issue_codes,
         "execution_target": execution_target,
         "execution_status": execution_status,
@@ -9514,6 +9535,7 @@ def _render_llm_resolution_fallback_batch_markdown(summary: dict[str, object]) -
         f"- errors: `{summary['error_count']}`",
         f"- local selected: `{summary['local_selected_count']}`",
         f"- typed fallback selected: `{summary['typed_fallback_selected_count']}`",
+        f"- local runtime-frame proposals: `{summary.get('local_runtime_frame_proposal_count', 0)}`",
         f"- provider calls: `{summary['provider_call_count']}`",
         f"- direct LLM SQL used: `{summary['direct_llm_sql_count']}`",
         f"- fallback render valid: `{summary['fallback_render_valid_count']}`",

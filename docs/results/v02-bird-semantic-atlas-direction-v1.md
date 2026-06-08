@@ -87,10 +87,13 @@ now packetizes `directly funded` as `schools.fundingtype` versus
 `frpm.charter_funding_type`, and `Fresno` as the plausible county/name fields;
 a route-shaped proposal that kept `schools.*` is repaired to
 `frpm.charter_funding_type` plus co-located `frpm.county_name` and renders
-through local guardrails. The next root cause is planner-side role binding for
-the remaining metric/value/group/order slots using reusable query-time
-atlas/codebook candidates. Numeric metric-like scope phrases are filtered out
-of value aliases, so phrases such as `eligible free rate` surface as metric
-evidence rather than bogus count-field values. A naive whole-query projection
-boost once regressed `zip code ... charter schools`; current planner use is
-intentionally slot/role-aware.
+through local guardrails in the CLI fallback path with provider `none`. Index
+`16` remains unresolved with `value_binding_unresolved`, which is correct until
+the atlas or a provider can disambiguate `Alameda`. The next root cause is
+planner-side role binding for the remaining metric/value/group/order slots
+using reusable query-time atlas/codebook candidates. Numeric metric-like scope
+phrases are filtered out of value aliases, so phrases such as
+`eligible free rate` surface as metric evidence rather than bogus count-field
+values. A naive whole-query projection boost once regressed
+`zip code ... charter schools`; current planner use is intentionally
+slot/role-aware.

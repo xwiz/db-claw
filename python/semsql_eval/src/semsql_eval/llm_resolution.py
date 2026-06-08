@@ -384,6 +384,228 @@ def build_rejected_query_packet(
     return packet
 
 
+def build_runtime_frame_resolution_proposal(packet: JsonObject) -> JsonObject | None:
+    """Build a typed proposal from a rejected runtime frame when safe.
+
+    This is intentionally limited to packets that carry a local resolution task.
+    The proposal is still just a candidate: ``render_resolution_proposal`` must
+    validate, repair clear value bindings, and render guarded SQL.
+    """
+    if not _resolution_task_value_bindings(packet):
+        return None
+    query_frame = packet.get("query_frame")
+    if not isinstance(query_frame, dict):
+        return None
+    bound_plan = query_frame.get("bound_query_plan")
+    if not isinstance(bound_plan, dict):
+        return None
+    projections = _runtime_bound_plan_proposal_projections(bound_plan)
+    if not projections:
+        return None
+    filters = _runtime_bound_plan_proposal_filters(bound_plan)
+    joins = _runtime_bound_plan_proposal_joins(bound_plan)
+    target_entities = _runtime_bound_plan_target_entities(bound_plan, projections, filters)
+    if not target_entities:
+        return None
+    return {
+        "schema_version": 1,
+        "action": "route",
+        "confidence": 0.74,
+        "intent": "runtime frame repaired from packet-backed value bindings",
+        "target_entities": target_entities,
+        "projections": projections,
+        "filters": filters,
+        "joins": joins,
+        "group_by": _runtime_bound_plan_group_by(bound_plan),
+        "order_by": _runtime_bound_plan_order_by(bound_plan),
+        "limit": 0,
+        "ambiguity_questions": [],
+        "evidence": [
+            {
+                "claim": "proposal derived from rejected runtime frame and local resolution task",
+                "graph_refs": sorted(_runtime_bound_plan_graph_refs(bound_plan)),
+            }
+        ],
+        "safety_notes": [
+            "local runtime-frame proposal; must pass packet validation and guarded rendering"
+        ],
+    }
+
+
+def _runtime_bound_plan_proposal_projections(bound_plan: JsonObject) -> list[JsonObject]:
+    projections: list[JsonObject] = []
+    for projection in _as_list(bound_plan.get("projections")):
+        if not isinstance(projection, dict):
+            continue
+        expression = str(projection.get("expression") or "")
+        field = projection.get("field")
+        field_ref = str(field or "")
+        aggregate = _runtime_projection_aggregate(expression)
+        if aggregate == "COUNT" and not field_ref:
+            projections.append(
+                {
+                    "kind": "count",
+                    "field": "",
+                    "aggregate": "COUNT",
+                    "rationale": "runtime frame requested a count projection",
+                }
+            )
+        elif aggregate:
+            projections.append(
+                {
+                    "kind": "aggregate",
+                    "field": field_ref,
+                    "aggregate": aggregate,
+                    "rationale": "runtime frame requested an aggregate projection",
+                }
+            )
+        elif field_ref:
+            projections.append(
+                {
+                    "kind": "field",
+                    "field": field_ref,
+                    "aggregate": "",
+                    "rationale": "runtime frame requested this output field",
+                }
+            )
+    return projections
+
+
+def _runtime_projection_aggregate(expression: str) -> str:
+    match = re.match(r"\s*(COUNT|SUM|AVG|MIN|MAX)\s*\(", expression, flags=re.IGNORECASE)
+    return match.group(1).upper() if match is not None else ""
+
+
+def _runtime_bound_plan_proposal_filters(bound_plan: JsonObject) -> list[JsonObject]:
+    filters: list[JsonObject] = []
+    for predicate in _as_list(bound_plan.get("predicates")):
+        if not isinstance(predicate, dict):
+            continue
+        field = str(predicate.get("field") or "")
+        if not field:
+            continue
+        value = predicate.get("value")
+        operator = _normalize_operator(str(predicate.get("operator") or "="), value)
+        filters.append(
+            {
+                "field": field,
+                "operator": operator,
+                "value": _normalize_filter_value(operator, value),
+                "value_kind": _runtime_bound_plan_value_kind(value),
+                "rationale": "runtime frame predicate; may be repaired by resolution task",
+            }
+        )
+    return filters
+
+
+def _runtime_bound_plan_value_kind(value: Any) -> str:
+    if value is None:
+        return "null_check"
+    if isinstance(value, bool | int | float):
+        return "literal"
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return "literal"
+    return "sample_value"
+
+
+def _runtime_bound_plan_proposal_joins(bound_plan: JsonObject) -> list[JsonObject]:
+    joins: list[JsonObject] = []
+    for join in _as_list(bound_plan.get("joins")):
+        if not isinstance(join, dict):
+            continue
+        from_entity = str(join.get("from_entity") or "")
+        to_entity = str(join.get("to_entity") or "")
+        if not from_entity or not to_entity:
+            continue
+        joins.append(
+            {
+                "from_entity": from_entity,
+                "from_field": _join_field_name(from_entity, str(join.get("from_field") or "")),
+                "to_entity": to_entity,
+                "to_field": _join_field_name(to_entity, str(join.get("to_field") or "")),
+                "rationale": "runtime frame join backed by packet graph",
+            }
+        )
+    return joins
+
+
+def _runtime_bound_plan_target_entities(
+    bound_plan: JsonObject,
+    projections: list[JsonObject],
+    filters: list[JsonObject],
+) -> list[str]:
+    entities: list[str] = []
+
+    def add(entity: str | None) -> None:
+        if entity and entity not in entities:
+            entities.append(entity)
+
+    add(str(bound_plan.get("base_entity") or "") or None)
+    for join in _as_list(bound_plan.get("joins")):
+        if not isinstance(join, dict):
+            continue
+        add(str(join.get("from_entity") or "") or None)
+        add(str(join.get("to_entity") or "") or None)
+    for projection in projections:
+        if isinstance(projection, dict):
+            add(_field_ref_entity(str(projection.get("field") or "")))
+    for filter_item in filters:
+        if isinstance(filter_item, dict):
+            add(_field_ref_entity(str(filter_item.get("field") or "")))
+    return entities
+
+
+def _runtime_bound_plan_group_by(bound_plan: JsonObject) -> list[str]:
+    groups: list[str] = []
+    for group in _as_list(bound_plan.get("groups")):
+        if isinstance(group, str) and group:
+            groups.append(group)
+        elif isinstance(group, dict) and group.get("field"):
+            groups.append(str(group["field"]))
+    return groups
+
+
+def _runtime_bound_plan_order_by(bound_plan: JsonObject) -> list[JsonObject]:
+    order_by = bound_plan.get("order_by")
+    if not isinstance(order_by, dict):
+        return []
+    field = str(order_by.get("field") or "")
+    aggregate = str(order_by.get("aggregate") or "")
+    if not field and not aggregate:
+        return []
+    return [
+        {
+            "field": field,
+            "direction": str(order_by.get("direction") or "DESC").upper(),
+            "aggregate": aggregate,
+            "rationale": "runtime frame order request",
+        }
+    ]
+
+
+def _runtime_bound_plan_graph_refs(bound_plan: JsonObject) -> set[str]:
+    refs: set[str] = set()
+    for projection in _as_list(bound_plan.get("projections")):
+        if isinstance(projection, dict) and projection.get("field"):
+            refs.add(str(projection["field"]))
+    for predicate in _as_list(bound_plan.get("predicates")):
+        if isinstance(predicate, dict) and predicate.get("field"):
+            refs.add(str(predicate["field"]))
+    for join in _as_list(bound_plan.get("joins")):
+        if not isinstance(join, dict):
+            continue
+        from_entity = str(join.get("from_entity") or "")
+        to_entity = str(join.get("to_entity") or "")
+        from_field = _join_field_name(from_entity, str(join.get("from_field") or ""))
+        to_field = _join_field_name(to_entity, str(join.get("to_field") or ""))
+        if from_entity and from_field:
+            refs.add(f"{from_entity}.{from_field}")
+        if to_entity and to_field:
+            refs.add(f"{to_entity}.{to_field}")
+    return refs
+
+
 def _ambiguous_value_resolution_task(
     question: str,
     query_frame: JsonObject | None,
@@ -2886,6 +3108,20 @@ def render_resolution_proposal(
             ],
             dialect=dialect,
         )
+    unresolved_value_issues = _value_binding_unresolved_route_issues(
+        packet,
+        effective_proposal,
+        promotion_issues,
+    )
+    if unresolved_value_issues:
+        return _render_result(
+            packet,
+            effective_proposal,
+            validation,
+            sql=None,
+            issues=[*promotion_issues, *unresolved_value_issues],
+            dialect=dialect,
+        )
     if effective_proposal.get("action") != "route":
         if not promotion_issues:
             clarification_issues = _clarification_required_issues(packet, effective_proposal)
@@ -3152,6 +3388,7 @@ def _value_binding_auto_route_adjustment(
         if not candidate_field:
             continue
         replacements = 0
+        confirmations = 0
         for filter_item in filters:
             if not isinstance(filter_item, dict):
                 continue
@@ -3167,13 +3404,14 @@ def _value_binding_auto_route_adjustment(
                 if current_field not in candidate_fields:
                     continue
             if current_field == candidate_field:
+                confirmations += 1
                 continue
             filter_item["field"] = candidate_field
             if "value_kind" not in filter_item or not filter_item["value_kind"]:
                 filter_item["value_kind"] = _candidate_value_kind(candidate)
             replacements += 1
             changed = True
-        if replacements:
+        if replacements or confirmations:
             _append_resolution_candidate_relationships(adjusted, candidate)
             _append_resolution_candidate_entity(adjusted, candidate_field)
             issues.append(
@@ -3189,9 +3427,58 @@ def _value_binding_auto_route_adjustment(
                     "to_field": candidate_field,
                     "reason": reason,
                     "replacements": replacements,
+                    "confirmations": confirmations,
                 }
             )
-    return (adjusted, issues) if changed else (proposal, [])
+    if changed:
+        return adjusted, issues
+    return proposal, issues
+
+
+def _value_binding_unresolved_route_issues(
+    packet: JsonObject,
+    proposal: JsonObject,
+    prior_issues: list[JsonObject],
+) -> list[JsonObject]:
+    if proposal.get("action") != "route":
+        return []
+    resolved = {
+        (
+            _normalize_value(issue.get("value")),
+            str(issue.get("from_field") or ""),
+        )
+        for issue in prior_issues
+        if issue.get("code") == "value_binding_auto_resolved"
+    }
+    issues: list[JsonObject] = []
+    for binding in _resolution_task_value_bindings(packet):
+        if not isinstance(binding, dict):
+            continue
+        selected_field = str(binding.get("selected_field") or "")
+        value_key = _normalize_value(binding.get("value"))
+        if not selected_field or (value_key, selected_field) in resolved:
+            continue
+        for filter_item in _as_list(proposal.get("filters")):
+            if not isinstance(filter_item, dict):
+                continue
+            if str(filter_item.get("field") or "") != selected_field:
+                continue
+            if not _filter_matches_value_binding(filter_item, binding):
+                continue
+            issues.append(
+                {
+                    "level": "error",
+                    "code": "value_binding_unresolved",
+                    "message": (
+                        "route proposal kept a runtime-selected ambiguous "
+                        "value field that the packet resolver could not "
+                        "uniquely confirm or replace"
+                    ),
+                    "value": binding.get("value"),
+                    "field": selected_field,
+                }
+            )
+    return issues
 
 
 def _select_value_binding_candidate(

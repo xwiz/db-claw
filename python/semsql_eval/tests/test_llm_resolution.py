@@ -14,6 +14,7 @@ from semsql_eval.llm_resolution import (
     build_openai_resolution_request_batch,
     build_pathway_rejected_query_packets,
     build_rejected_query_packet,
+    build_runtime_frame_resolution_proposal,
     build_schema_card,
     call_openai_chat_compatible_resolution,
     compact_resolution_packet_for_provider,
@@ -5108,6 +5109,83 @@ def test_resolution_task_auto_co_locates_followup_ambiguous_filter(
         'WHERE "customers"."region" = \'North\' '
         'AND "customers"."segment" = \'Priority\' LIMIT 100'
     )
+
+
+def test_runtime_frame_resolution_proposal_uses_value_binding_repair(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_ambiguous_value_graph(graph)
+    packet = build_rejected_query_packet(
+        graph,
+        "show orders for north customers",
+        query_frame={
+            "bound_query_plan": {
+                "base_entity": "orders",
+                "reject_reason": "ambiguous_unscoped_value_field",
+                "joins": [
+                    {
+                        "from_entity": "orders",
+                        "from_field": "orders.customer_id",
+                        "to_entity": "customers",
+                        "to_field": "customers.id",
+                    }
+                ],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"}
+                ],
+                "projections": [{"field": "orders.id", "expression": "orders.id"}],
+            },
+        },
+    )
+
+    proposal = build_runtime_frame_resolution_proposal(packet)
+
+    assert proposal is not None
+    assert proposal["filters"][0]["field"] == "orders.region"
+    result = render_resolution_proposal(packet, proposal, dialect="sqlite")
+    assert result["valid"] is True
+    assert result["issues"][0]["code"] == "value_binding_auto_resolved"
+    assert result["query_frame_candidate"]["predicates"] == [
+        {"field": "customers.region", "value": "North", "operator": "="}
+    ]
+
+
+def test_runtime_frame_resolution_proposal_fails_closed_when_value_unresolved(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_ambiguous_value_graph(graph)
+    packet = build_rejected_query_packet(
+        graph,
+        "show orders for north",
+        query_frame={
+            "bound_query_plan": {
+                "base_entity": "orders",
+                "reject_reason": "ambiguous_unscoped_value_field",
+                "joins": [
+                    {
+                        "from_entity": "orders",
+                        "from_field": "orders.customer_id",
+                        "to_entity": "customers",
+                        "to_field": "customers.id",
+                    }
+                ],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"}
+                ],
+                "projections": [{"field": "orders.id", "expression": "orders.id"}],
+            },
+        },
+    )
+
+    proposal = build_runtime_frame_resolution_proposal(packet)
+    assert proposal is not None
+    result = render_resolution_proposal(packet, proposal, dialect="sqlite")
+
+    assert result["valid"] is False
+    assert result["issues"][0]["code"] == "value_binding_unresolved"
+    assert result["sql"] is None
 
 
 def test_openai_request_uses_compact_provider_packet(tmp_path: Path) -> None:
