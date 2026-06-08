@@ -166,6 +166,129 @@ def _make_graph(
     conn.close()
 
 
+def _make_ambiguous_value_graph(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE semsql_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO semsql_metadata VALUES ('schema_version', '1');
+
+        CREATE TABLE entities (
+            canonical_name TEXT PRIMARY KEY,
+            db_table TEXT NOT NULL,
+            db_schema TEXT,
+            singular_label TEXT,
+            plural_label TEXT,
+            proto_blob BLOB NOT NULL DEFAULT X''
+        );
+        CREATE TABLE fields (
+            entity TEXT NOT NULL,
+            field TEXT NOT NULL,
+            db_column TEXT NOT NULL,
+            type TEXT NOT NULL,
+            display_label TEXT,
+            enum_canonical TEXT,
+            unit_canonical TEXT,
+            proto_blob BLOB NOT NULL DEFAULT X'',
+            PRIMARY KEY (entity, field)
+        );
+        CREATE TABLE relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_entity TEXT NOT NULL,
+            from_field TEXT NOT NULL,
+            to_entity TEXT NOT NULL,
+            to_field TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            relation_name TEXT,
+            proto_blob BLOB NOT NULL DEFAULT X''
+        );
+        CREATE TABLE sample_values (
+            field_canonical TEXT PRIMARY KEY,
+            examples TEXT NOT NULL,
+            pii_redacted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE vocabulary (
+            term TEXT NOT NULL,
+            canonical_kind TEXT NOT NULL,
+            canonical_value TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            source_layer INTEGER NOT NULL,
+            source_locator TEXT,
+            PRIMARY KEY (term, canonical_kind, canonical_value)
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO entities(canonical_name, db_table, singular_label, plural_label) "
+        "VALUES (?, ?, ?, ?)",
+        [
+            ("customers", "customers", "customer", "customers"),
+            ("orders", "orders", "order", "orders"),
+            ("regions", "regions", "region", "regions"),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO fields(entity, field, db_column, type, display_label) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            ("customers", "id", "id", "integer", "ID"),
+            ("customers", "name", "name", "text", "Name"),
+            ("customers", "region", "region", "text", "Region"),
+            ("orders", "id", "id", "integer", "ID"),
+            ("orders", "customer_id", "customer_id", "integer", "Customer ID"),
+            ("orders", "region", "region", "text", "Region"),
+            ("orders", "amount", "amount", "decimal", "Amount"),
+            ("regions", "id", "id", "integer", "ID"),
+            ("regions", "name", "name", "text", "Name"),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO relationships(from_entity, from_field, to_entity, to_field, kind) "
+        "VALUES ('orders', 'customer_id', 'customers', 'id', 'many_to_one')"
+    )
+    conn.executemany(
+        "INSERT INTO sample_values(field_canonical, examples, pii_redacted) "
+        "VALUES (?, ?, 0)",
+        [
+            ("customers.region", '["North", "South"]'),
+            ("orders.region", '["North", "East"]'),
+            ("regions.name", '["North", "West"]'),
+        ],
+    )
+    conn.executemany(
+        "INSERT INTO vocabulary(term, canonical_kind, canonical_value, confidence, source_layer) "
+        "VALUES (?, 'scope_predicate', ?, ?, 2)",
+        [
+            (
+                "north",
+                json.dumps(
+                    {
+                        "scope": "orders.region.north",
+                        "field": "orders.region",
+                        "operator": "=",
+                        "rawValue": "North",
+                    }
+                ),
+                0.9,
+            ),
+            (
+                "north",
+                json.dumps(
+                    {
+                        "scope": "customers.region.north",
+                        "field": "customers.region",
+                        "operator": "=",
+                        "rawValue": "North",
+                    }
+                ),
+                0.9,
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
 def _make_sensitive_graph(path: Path) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -4633,6 +4756,172 @@ def test_provider_packet_compaction_strips_runtime_atlas_and_keeps_candidate_sch
             "kind": "many_to_one",
         }
     ]
+
+
+def test_ambiguous_value_reject_builds_typed_resolution_task(tmp_path: Path) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_ambiguous_value_graph(graph)
+    query_frame = {
+        "bound_query_plan": {
+            "base_entity": "orders",
+            "reject_reason": "ambiguous_unscoped_value_field",
+            "joins": [
+                {
+                    "from_entity": "orders",
+                    "from_field": "orders.customer_id",
+                    "to_entity": "customers",
+                    "to_field": "customers.id",
+                }
+            ],
+            "predicates": [
+                {"field": "orders.region", "operator": "=", "value": "North"}
+            ],
+            "projections": [
+                {
+                    "expression": "SUM(orders.amount)",
+                    "field": "orders.amount",
+                }
+            ],
+        },
+        "runtime_query_frame": {
+            "required_entities": ["orders", "customers"],
+            "predicates": [
+                {"field": "orders.region", "operator": "=", "value": "North"}
+            ],
+            "projection": {"fields": ["orders.amount"]},
+        },
+        "semantic_atlas": {"large": ["x" * 1000]},
+    }
+
+    packet = build_rejected_query_packet(
+        graph,
+        "total order amount for north customers",
+        query_frame=query_frame,
+    )
+
+    task = packet["resolution_task"]
+    assert task["kind"] == "resolve_value_binding"
+    assert task["reason"] == "ambiguous_unscoped_value_field"
+    binding = task["unresolved_value_bindings"][0]
+    assert binding["value"] == "North"
+    assert binding["selected_field"] == "orders.region"
+    fields = {candidate["field"] for candidate in binding["candidate_fields"]}
+    assert {"orders.region", "customers.region"} <= fields
+    assert "regions.name" not in fields
+    assert {
+        "from": "orders.customer_id",
+        "to": "customers.id",
+        "kind": "many_to_one",
+    } in packet["schema_card"]["relationships"]
+
+    compact = compact_resolution_packet_for_provider(
+        packet,
+        max_entities=3,
+        max_fields_per_entity=3,
+        max_relationships=3,
+    )
+
+    assert "semantic_atlas" not in compact["query_frame"]
+    compact_entities = {
+        entity["name"]: entity for entity in compact["schema_card"]["entities"]
+    }
+    assert {
+        field["name"] for field in compact_entities["orders"]["fields"]
+    } >= {"region", "amount"}
+    assert {
+        field["name"] for field in compact_entities["customers"]["fields"]
+    } >= {"region"}
+
+
+def test_resolution_task_candidates_are_allowed_as_field_scoped_filters(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_ambiguous_value_graph(graph)
+    packet = build_rejected_query_packet(
+        graph,
+        "show orders for north customers",
+        query_frame={
+            "bound_query_plan": {
+                "base_entity": "orders",
+                "reject_reason": "ambiguous_unscoped_value_field",
+                "joins": [
+                    {
+                        "from_entity": "orders",
+                        "from_field": "orders.customer_id",
+                        "to_entity": "customers",
+                        "to_field": "customers.id",
+                    }
+                ],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"}
+                ],
+                "projections": [{"field": "orders.id", "expression": "orders.id"}],
+            },
+            "runtime_query_frame": {
+                "required_entities": ["orders", "customers"],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"}
+                ],
+                "projection": {"fields": ["orders.id"]},
+            },
+        },
+    )
+    proposal = {
+        "schema_version": 1,
+        "action": "route",
+        "confidence": 0.88,
+        "intent": "list orders for north customers",
+        "target_entities": ["orders", "customers"],
+        "projections": [
+            {
+                "kind": "field",
+                "field": "orders.id",
+                "aggregate": "",
+                "rationale": "orders are the requested rows",
+            }
+        ],
+        "filters": [
+            {
+                "field": "customers.region",
+                "operator": "=",
+                "value": "North",
+                "value_kind": "sample_value",
+                "rationale": "resolution task maps North to customer region",
+            }
+        ],
+        "joins": [
+            {
+                "from_entity": "orders",
+                "from_field": "customer_id",
+                "to_entity": "customers",
+                "to_field": "id",
+                "rationale": "relationship exists in the packet",
+            }
+        ],
+        "group_by": [],
+        "order_by": [],
+        "limit": 100,
+        "ambiguity_questions": [],
+        "evidence": [
+            {
+                "claim": "North can bind to customers.region",
+                "graph_refs": ["customers.region"],
+            }
+        ],
+        "safety_notes": [],
+    }
+
+    validation = validate_resolution_proposal(packet, proposal)
+    result = render_resolution_proposal(packet, proposal, dialect="sqlite")
+
+    assert validation["valid"] is True
+    assert result["valid"] is True
+    assert result["sql"] == (
+        'SELECT "orders"."id" FROM "orders" '
+        'JOIN "customers" ON "orders"."customer_id" = "customers"."id" '
+        'WHERE "customers"."region" = \'North\' LIMIT 100'
+    )
 
 
 def test_openai_request_uses_compact_provider_packet(tmp_path: Path) -> None:

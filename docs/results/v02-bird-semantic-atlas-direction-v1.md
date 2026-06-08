@@ -69,17 +69,23 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
   fails closed instead of accepting a partial predicate set.
 - unscoped duplicate text values across plausible fields now fail closed unless
   a field role or metric co-location disambiguates the selected field.
+- those ambiguous duplicate-value bails now build `resolve_value_binding`
+  packets with exact field-scoped candidates, evidence source, and relationship
+  context, so provider fallback can choose/clarify without direct SQL.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
 slice after related-field, related-fact, output-span projection, ranked
 metric-value, and metric-filter count work is `7/7`, wrong accepted SQL `0`,
 bails `0`; first20 is `7/20`, wrong `0`, bailed `13`. The threshold exact
 probe for indexes `16` and `18` now bails `2/2` with
-`ambiguous_unscoped_value_field` instead of accepting wrong SQL. The next root
-cause is planner-side role binding for the remaining metric/value/group/order
-slots using the reusable query-time atlas/codebook candidates exposed on
-`intent_frame`. Numeric metric-like scope phrases are filtered out of value
-aliases, so phrases such as `eligible free rate` surface as metric evidence
-rather than bogus count-field values. A naive whole-query projection boost once
-regressed `zip code ... charter schools`; current planner use is intentionally
+`ambiguous_unscoped_value_field` instead of accepting wrong SQL. Index `18`
+now packetizes `directly funded` as `schools.fundingtype` versus
+`frpm.charter_funding_type`, and `Fresno` as the plausible county/name fields;
+a corrected typed proposal validates and renders through local guardrails. The
+next root cause is planner-side role binding for the remaining
+metric/value/group/order slots using reusable query-time atlas/codebook
+candidates. Numeric metric-like scope phrases are filtered out of value aliases,
+so phrases such as `eligible free rate` surface as metric evidence rather than
+bogus count-field values. A naive whole-query projection boost once regressed
+`zip code ... charter schools`; current planner use is intentionally
 slot/role-aware.

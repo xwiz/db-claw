@@ -344,6 +344,13 @@ def build_rejected_query_packet(
             "semsql_must_validate_before_execution": True,
         },
     }
+    resolution_task = _ambiguous_value_resolution_task(
+        question,
+        query_frame,
+        graph_rows,
+    )
+    if resolution_task is not None:
+        packet["resolution_task"] = resolution_task
     seed_entities, seed_fields = _provider_packet_seed_refs(
         packet,
         include_entity_hits=False,
@@ -375,6 +382,335 @@ def build_rejected_query_packet(
         max_value_dictionary_terms=12,
     )
     return packet
+
+
+def _ambiguous_value_resolution_task(
+    question: str,
+    query_frame: JsonObject | None,
+    graph_rows: JsonObject,
+) -> JsonObject | None:
+    if _query_frame_reject_reason(query_frame) != "ambiguous_unscoped_value_field":
+        return None
+    predicates = _query_frame_bound_predicates(query_frame)
+    if not predicates:
+        return None
+    field_by_ref = _graph_field_by_ref(graph_rows)
+    value_index = _graph_field_value_evidence_index(graph_rows)
+    relationships = [
+        relationship
+        for relationship in graph_rows.get("relationships", [])
+        if isinstance(relationship, dict)
+    ]
+    context_entities = _query_frame_context_entities(query_frame, predicates)
+    unresolved: list[JsonObject] = []
+    for predicate in predicates:
+        if not isinstance(predicate, dict):
+            continue
+        operator = _normalize_operator(
+            str(predicate.get("operator") or "="),
+            predicate.get("value"),
+        )
+        if operator not in {"=", "IN"}:
+            continue
+        raw_value = predicate.get("value")
+        value_key = _normalize_value(raw_value)
+        if raw_value is None or not value_key:
+            continue
+        selected_field = str(predicate.get("field") or "")
+        if selected_field not in field_by_ref:
+            selected_field = ""
+        evidence_by_field = value_index.get(value_key, {})
+        if not evidence_by_field:
+            continue
+        candidate_fields = _ambiguous_value_candidate_fields(
+            question,
+            selected_field,
+            raw_value,
+            evidence_by_field,
+            field_by_ref,
+            relationships,
+            context_entities,
+        )
+        if len(candidate_fields) < 2:
+            continue
+        unresolved.append(
+            {
+                "value": raw_value,
+                "normalized_value": value_key,
+                "operator": operator,
+                "selected_field": selected_field or None,
+                "candidate_fields": candidate_fields[:12],
+            }
+        )
+    if not unresolved:
+        return None
+    return {
+        "kind": "resolve_value_binding",
+        "reason": "ambiguous_unscoped_value_field",
+        "instructions": (
+            "Resolve only the listed value-to-field bindings. Use the exact "
+            "field-scoped candidates and relationships; if the question does "
+            "not disambiguate a value, ask a clarification instead of guessing."
+        ),
+        "unresolved_value_bindings": unresolved,
+    }
+
+
+def _query_frame_reject_reason(query_frame: JsonObject | None) -> str:
+    if not isinstance(query_frame, dict):
+        return ""
+    bound_plan = query_frame.get("bound_query_plan")
+    if isinstance(bound_plan, dict):
+        return str(bound_plan.get("reject_reason") or "")
+    return ""
+
+
+def _query_frame_bound_predicates(query_frame: JsonObject | None) -> list[Any]:
+    if not isinstance(query_frame, dict):
+        return []
+    bound_plan = query_frame.get("bound_query_plan")
+    if not isinstance(bound_plan, dict):
+        return []
+    predicates = bound_plan.get("predicates")
+    return predicates if isinstance(predicates, list) else []
+
+
+def _query_frame_context_entities(
+    query_frame: JsonObject | None,
+    predicates: list[Any],
+) -> set[str]:
+    entities: set[str] = set()
+    if isinstance(query_frame, dict):
+        bound_plan = query_frame.get("bound_query_plan")
+        if isinstance(bound_plan, dict):
+            base_entity = str(bound_plan.get("base_entity") or "")
+            if base_entity:
+                entities.add(base_entity)
+            for join in _as_list(bound_plan.get("joins")):
+                if not isinstance(join, dict):
+                    continue
+                for key in ("from_entity", "to_entity"):
+                    entity = str(join.get(key) or "")
+                    if entity:
+                        entities.add(entity)
+            for projection in _as_list(bound_plan.get("projections")):
+                if isinstance(projection, dict):
+                    field = str(projection.get("field") or "")
+                    projection_entity = _field_ref_entity(field)
+                    if projection_entity:
+                        entities.add(projection_entity)
+        runtime_frame = query_frame.get("runtime_query_frame")
+        if isinstance(runtime_frame, dict):
+            for entity in _as_list(runtime_frame.get("required_entities")):
+                if isinstance(entity, str) and entity:
+                    entities.add(entity)
+    for predicate in predicates:
+        if isinstance(predicate, dict):
+            predicate_entity = _field_ref_entity(str(predicate.get("field") or ""))
+            if predicate_entity:
+                entities.add(predicate_entity)
+    return entities
+
+
+def _graph_field_by_ref(graph_rows: JsonObject) -> dict[str, JsonObject]:
+    return {
+        f"{field['entity']}.{field['field']}": field
+        for field in graph_rows.get("fields", [])
+        if isinstance(field, dict) and field.get("entity") and field.get("field")
+    }
+
+
+def _graph_field_value_evidence_index(
+    graph_rows: JsonObject,
+) -> dict[str, dict[str, list[JsonObject]]]:
+    field_names = {
+        f"{field['entity']}.{field['field']}"
+        for field in graph_rows.get("fields", [])
+        if isinstance(field, dict) and field.get("entity") and field.get("field")
+    }
+    out: defaultdict[str, defaultdict[str, list[JsonObject]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for field_ref, examples in graph_rows.get("sample_values", {}).items():
+        if not isinstance(field_ref, str) or field_ref not in field_names:
+            continue
+        for sample in _as_list(examples):
+            raw_value = _sample_candidate_text(sample)
+            if raw_value is None or not _sample_value_is_safe_candidate(raw_value):
+                continue
+            _add_value_binding_evidence(
+                out,
+                field_ref,
+                raw_value,
+                {
+                    "source": "sample_value",
+                    "raw_value": raw_value,
+                    "operator": "=",
+                },
+            )
+    value_dictionary_by_field = _scope_predicates_by_field(
+        graph_rows.get("vocabulary", []),
+        field_names,
+        max_per_field=200,
+    )
+    for field_ref, entries in value_dictionary_by_field.items():
+        for entry in entries:
+            raw_value = entry.get("raw_value")
+            if raw_value is None:
+                continue
+            _add_value_binding_evidence(
+                out,
+                field_ref,
+                raw_value,
+                {
+                    "source": "scope_predicate_vocabulary",
+                    "term": entry.get("term"),
+                    "raw_value": raw_value,
+                    "operator": entry.get("operator") or "=",
+                    "scope": entry.get("scope"),
+                    "confidence": entry.get("confidence"),
+                },
+            )
+    return {
+        value: dict(fields)
+        for value, fields in out.items()
+        if value
+    }
+
+
+def _add_value_binding_evidence(
+    out: defaultdict[str, defaultdict[str, list[JsonObject]]],
+    field_ref: str,
+    raw_value: Any,
+    evidence: JsonObject,
+) -> None:
+    value_key = _normalize_value(raw_value)
+    if not value_key:
+        return
+    existing_keys = {
+        (
+            str(item.get("source") or ""),
+            str(item.get("term") or ""),
+            str(item.get("raw_value") or ""),
+        )
+        for item in out[value_key][field_ref]
+    }
+    key = (
+        str(evidence.get("source") or ""),
+        str(evidence.get("term") or ""),
+        str(evidence.get("raw_value") or ""),
+    )
+    if key not in existing_keys:
+        out[value_key][field_ref].append(evidence)
+
+
+def _ambiguous_value_candidate_fields(
+    question: str,
+    selected_field: str,
+    raw_value: Any,
+    evidence_by_field: dict[str, list[JsonObject]],
+    field_by_ref: dict[str, JsonObject],
+    relationships: list[JsonObject],
+    context_entities: set[str],
+) -> list[JsonObject]:
+    question_tokens = _tokens(question)
+    selected_entity = _field_ref_entity(selected_field) if selected_field else None
+    candidates: list[JsonObject] = []
+    for field_ref, evidence in evidence_by_field.items():
+        field = field_by_ref.get(field_ref)
+        if field is None:
+            continue
+        entity = _field_ref_entity(field_ref)
+        if not entity:
+            continue
+        if not _ambiguous_value_candidate_entity_allowed(
+            entity,
+            selected_entity,
+            context_entities,
+            relationships,
+        ):
+            continue
+        role = _field_role(field)
+        field_type = _field_type_kind(str(field.get("type") or ""))
+        if field_type in {"date", "datetime", "number", "boolean"}:
+            continue
+        field_tokens = _tokens(
+            f"{field.get('field') or ''} {field.get('db_column') or ''} "
+            f"{field.get('display_label') or ''}"
+        )
+        evidence_sources = sorted(
+            {
+                str(item.get("source") or "atlas_value")
+                for item in evidence
+                if isinstance(item, dict)
+            }
+        )
+        relationship_path = _ambiguous_value_relationship_path(
+            entity,
+            selected_entity,
+            context_entities,
+            relationships,
+        )
+        candidates.append(
+            {
+                "field": field_ref,
+                "entity": entity,
+                "role": role,
+                "type": field.get("type") or "unknown",
+                "display_label": field.get("display_label"),
+                "db_column": field.get("db_column"),
+                "value": raw_value,
+                "operator": "=",
+                "selected_by_runtime": field_ref == selected_field,
+                "matched_question_tokens": sorted(question_tokens & field_tokens),
+                "evidence_sources": evidence_sources,
+                "relationship_path": relationship_path,
+            }
+        )
+    candidates.sort(
+        key=lambda candidate: (
+            not bool(candidate.get("selected_by_runtime")),
+            -len(candidate.get("matched_question_tokens", [])),
+            len(candidate.get("relationship_path", [])),
+            str(candidate.get("field") or ""),
+        )
+    )
+    return candidates
+
+
+def _ambiguous_value_candidate_entity_allowed(
+    entity: str,
+    selected_entity: str | None,
+    context_entities: set[str],
+    relationships: list[JsonObject],
+) -> bool:
+    if entity in context_entities:
+        return True
+    if selected_entity and _relationship_path({selected_entity}, entity, relationships) is not None:
+        return True
+    return any(
+        _relationship_path({context_entity}, entity, relationships) is not None
+        for context_entity in context_entities
+    )
+
+
+def _ambiguous_value_relationship_path(
+    entity: str,
+    selected_entity: str | None,
+    context_entities: set[str],
+    relationships: list[JsonObject],
+) -> list[JsonObject]:
+    if entity in context_entities:
+        return []
+    anchors = [selected_entity] if selected_entity else []
+    anchors.extend(sorted(context_entities))
+    for anchor in anchors:
+        if not anchor or anchor == entity:
+            continue
+        path = _relationship_path({anchor}, entity, relationships)
+        if path is not None:
+            return [_relationship_card_from_join_step(step) for step in path]
+    return []
 
 
 def _enrich_schema_card_with_seed_fields(
@@ -2024,6 +2360,8 @@ def _provider_packet_seed_refs(
             order_by = runtime_frame.get("order_by")
             if isinstance(order_by, dict) and isinstance(order_by.get("field"), str):
                 seed_fields.add(order_by["field"])
+    for field_ref in _resolution_task_candidate_field_refs(packet):
+        seed_fields.add(field_ref)
     for field_ref in list(seed_fields):
         entity = _field_ref_entity(field_ref)
         if entity:
@@ -5149,6 +5487,7 @@ def _packet_allowed_fields(packet: JsonObject) -> set[str]:
             and hit.get("canonical_value")
         ):
             fields.add(str(hit["canonical_value"]))
+    fields.update(_resolution_task_candidate_field_refs(packet))
     return fields
 
 
@@ -5232,7 +5571,50 @@ def _packet_allowed_value_filters(packet: JsonObject) -> set[tuple[str, str, str
                     "raw_value": raw_value,
                 },
             )
+    for binding in _resolution_task_value_bindings(packet):
+        operator = _normalize_operator(
+            str(binding.get("operator") or "="),
+            binding.get("value"),
+        )
+        for candidate in _as_list(binding.get("candidate_fields")):
+            if not isinstance(candidate, dict):
+                continue
+            field = str(candidate.get("field") or "")
+            raw_value = candidate.get("value", binding.get("value"))
+            if field and raw_value is not None:
+                _add_value_filter(
+                    out,
+                    field,
+                    {
+                        "operator": operator,
+                        "raw_value": raw_value,
+                    },
+                )
     return out
+
+
+def _resolution_task_value_bindings(packet: JsonObject) -> list[Any]:
+    task = packet.get("resolution_task")
+    if not isinstance(task, dict):
+        return []
+    if task.get("kind") != "resolve_value_binding":
+        return []
+    bindings = task.get("unresolved_value_bindings")
+    return bindings if isinstance(bindings, list) else []
+
+
+def _resolution_task_candidate_field_refs(packet: JsonObject) -> set[str]:
+    fields: set[str] = set()
+    for binding in _resolution_task_value_bindings(packet):
+        if not isinstance(binding, dict):
+            continue
+        selected = binding.get("selected_field")
+        if isinstance(selected, str) and selected:
+            fields.add(selected)
+        for candidate in _as_list(binding.get("candidate_fields")):
+            if isinstance(candidate, dict) and isinstance(candidate.get("field"), str):
+                fields.add(candidate["field"])
+    return fields
 
 
 def _packet_field_type_map(packet: JsonObject) -> dict[str, str]:
