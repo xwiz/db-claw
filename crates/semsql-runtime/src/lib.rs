@@ -365,6 +365,8 @@ pub struct IntentFrameTrace {
     pub order_by: Option<IntentFrameOrderTrace>,
     /// Limit requested by the user.
     pub limit: Option<u32>,
+    /// Query-time SemanticAtlas/codebook candidates for typed fallback and future role binding.
+    pub codebook_candidates: Vec<SemanticAtlasCodebookCandidate>,
     /// Reject or clarify reason when no safe plan exists.
     pub reject_reason: Option<String>,
     /// Deterministic confidence prior for diagnostics.
@@ -2312,6 +2314,11 @@ fn semantic_value_aliases(
         if semantic_field_sensitive(field) {
             continue;
         }
+        if graph_field_looks_numeric(field)
+            && !graph_literal_compatible_with_field(&entry.term, &scope.raw_value, field)
+        {
+            continue;
+        }
         let mut aliases = Vec::new();
         push_unique_nonempty(&mut aliases, &entry.term);
         for alias in semantic_value_alias_phrases(&scope.raw_value, field) {
@@ -2753,6 +2760,7 @@ fn runtime_intent_frame_from_trace(
             limit: order.limit,
         }),
         limit: trace.order_by.as_ref().map(|order| order.limit),
+        codebook_candidates: runtime_intent_codebook_candidates(nl, atlas),
         reject_reason: None,
         confidence: 0.0,
     };
@@ -2809,6 +2817,22 @@ fn runtime_intent_frame_from_trace(
     intent.measures.sort();
     intent.measures.dedup();
     intent
+}
+
+const RUNTIME_INTENT_CODEBOOK_LIMIT: usize = 24;
+const RUNTIME_INTENT_CODEBOOK_PER_KIND_LIMIT: usize = 8;
+
+fn runtime_intent_codebook_candidates(
+    nl: &str,
+    atlas: &RuntimeSemanticAtlas,
+) -> Vec<SemanticAtlasCodebookCandidate> {
+    let mut out = Vec::new();
+    out.extend(atlas.lookup_entities(nl, RUNTIME_INTENT_CODEBOOK_PER_KIND_LIMIT));
+    out.extend(atlas.lookup_fields(nl, RUNTIME_INTENT_CODEBOOK_PER_KIND_LIMIT));
+    out.extend(atlas.lookup_values(nl, RUNTIME_INTENT_CODEBOOK_PER_KIND_LIMIT));
+    out.extend(atlas.lookup_metrics(nl, RUNTIME_INTENT_CODEBOOK_PER_KIND_LIMIT));
+    out.extend(atlas.lookup_join_paths(nl, RUNTIME_INTENT_CODEBOOK_PER_KIND_LIMIT));
+    semantic_codebook_finish(out, RUNTIME_INTENT_CODEBOOK_LIMIT)
 }
 
 fn runtime_intent_kind(trace: &RuntimeQueryFrameTrace, sql: &str) -> String {
@@ -25671,6 +25695,7 @@ mod graph_schema_atlas_tests {
         ));
         let vocabulary = vec![
             scope_vocab_entry("paying customers", "accounts.status", "active"),
+            scope_vocab_entry("invoice revenue", "invoices.amount", "invoice revenue"),
             vocab_entry("field", "invoice revenue", "invoices.amount"),
         ];
         let metrics = vec![MetricDefinitionRow {
@@ -25720,20 +25745,20 @@ mod graph_schema_atlas_tests {
             "{combined:?}"
         );
 
-        let entities = atlas.lookup_entities(question, 4);
+        let entity_candidates = atlas.lookup_entities(question, 4);
         assert!(
-            entities
+            entity_candidates
                 .iter()
                 .any(|candidate| candidate.target == "accounts"),
-            "{entities:?}"
+            "{entity_candidates:?}"
         );
-        let fields = atlas.lookup_fields(question, 8);
+        let field_candidates = atlas.lookup_fields(question, 8);
         assert!(
-            fields
+            field_candidates
                 .iter()
                 .any(|candidate| candidate.target == "invoices.amount"
                     && candidate.source == "field_alias"),
-            "{fields:?}"
+            "{field_candidates:?}"
         );
         let values = atlas.lookup_values(question, 8);
         assert!(
@@ -25750,6 +25775,13 @@ mod graph_schema_atlas_tests {
                 .all(|candidate| candidate.target != "accounts.email"),
             "{values:?}"
         );
+        assert!(
+            values.iter().all(|candidate| {
+                !(candidate.target == "invoices.amount"
+                    && candidate.value.as_deref() == Some("invoice revenue"))
+            }),
+            "{values:?}"
+        );
         let metrics = atlas.lookup_metrics("show paid invoice rate", 4);
         assert!(
             metrics
@@ -25764,6 +25796,19 @@ mod graph_schema_atlas_tests {
                     && candidate.target.eq_ignore_ascii_case("invoices->accounts")
             }),
             "{joins:?}"
+        );
+        let trace = graph_query_frame_trace(question, &entities, &fields, &relationships, &samples);
+        let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+        assert!(
+            intent
+                .codebook_candidates
+                .iter()
+                .any(
+                    |candidate| candidate.kind == SemanticAtlasCodebookKind::Value
+                        && candidate.target == "accounts.status"
+                        && candidate.value.as_deref() == Some("active")
+                ),
+            "{intent:?}"
         );
     }
 

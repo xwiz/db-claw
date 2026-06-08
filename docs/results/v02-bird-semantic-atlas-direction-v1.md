@@ -57,7 +57,9 @@ The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
 slice after related-field and related-fact promotion is `5/5`, wrong accepted
 SQL `0`, bails `0`; first20 is `5/20`, wrong `0`, bailed `15`. The next root
 cause is not another route patch; it is role-aware consumption of the reusable
-query-time atlas/codebook candidate API over value dictionaries, field roles,
-active tables, metric candidates, and fast graph loading. A naive projection
-boost from codebook aliases regressed `zip code ... charter schools` to a
-filter-field projection, so candidate use must be slot/role-aware.
+query-time atlas/codebook candidates now exposed on `intent_frame`. Numeric
+metric-like scope phrases are filtered out of value aliases, so phrases such as
+`eligible free rate` surface as metric evidence rather than bogus count-field
+values. A naive projection boost from codebook aliases regressed
+`zip code ... charter schools` to a filter-field projection, so planner use must
+be slot/role-aware.
