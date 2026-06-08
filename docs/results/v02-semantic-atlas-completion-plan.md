@@ -7,7 +7,7 @@ LLMs may propose typed plans over bounded evidence; direct provider SQL is never
 
 ## Next Loop
 1. Gate broad evals on accepted-wrong-SQL diagnostics before interpreting accuracy.
-2. Treat BIRD misses as DB-only atlas/codebook gaps: enrich relationships, active tables, display fields, values, metrics, dates, and similarity lookup without dev gold SQL or benchmark maps.
+2. Treat BIRD misses as DB-only virtual atlas/codebook gaps: enrich relationships, active tables, display fields, values, metrics, dates, and similarity lookup without dev gold SQL, physical benchmark tables, or benchmark maps.
 3. Route `missing_value_evidence` rejects to lookup/typed LLM proposals, not direct SQL.
 4. Convert fail-closed or newly emitted BIRD/real-schema cases into grounded plans by improving join/table selection, projection intent, and filter-vs-output separation over atlas/codebook evidence.
 5. Probe the next real app/schema with the alpha package path for source vocab, metrics, dates, live table-selection evidence, and fail-closed rejects.

@@ -3911,7 +3911,7 @@ fn runtime_predicate_field_label_score(
                 )
         });
         score += tokens.intersection(&q_tokens).count() as i32 * 2;
-        if form_norm.len() >= 4 && graph_norm_contains(&nl_norm, &form_norm) {
+        if tokens.len() > 1 && form_norm.len() >= 4 && graph_norm_contains(&nl_norm, &form_norm) {
             score += 6;
         }
     }
@@ -4910,6 +4910,14 @@ fn graph_query_frame_trace_with_vocab(
     predicates = graph_rewrite_lifecycle_predicates_to_related_table(
         nl,
         entities,
+        fields,
+        relationships,
+        sample_values,
+        vocabulary,
+        predicates,
+    );
+    predicates = graph_promote_related_predicate_fields(
+        nl,
         fields,
         relationships,
         sample_values,
@@ -13328,6 +13336,123 @@ fn graph_rewrite_lifecycle_predicates_to_related_table(
     predicates[status_idx].value = status_value;
     predicates[date_idx].field = date_field.canonical();
     predicates
+}
+
+fn graph_promote_related_predicate_fields(
+    nl: &str,
+    fields: &[FieldRow],
+    relationships: &[RelationshipRow],
+    sample_values: &[SampleValueRow],
+    vocabulary: &[VocabularyEntry],
+    mut predicates: Vec<GraphQueryPredicate>,
+) -> Vec<GraphQueryPredicate> {
+    let field_map = graph_field_map(fields);
+    for predicate in &mut predicates {
+        if !matches!(predicate.operator.as_str(), "=" | "in") {
+            continue;
+        }
+        let Some(selected) = field_map.get(&predicate.field).copied() else {
+            continue;
+        };
+        if graph_field_looks_date_like(selected) {
+            continue;
+        }
+        let selected_score = graph_predicate_field_label_score(nl, selected, vocabulary);
+        let selected_key = selected.canonical();
+        let mut candidates: Vec<(i32, &FieldRow, Option<String>)> = fields
+            .iter()
+            .filter(|candidate| {
+                !candidate.canonical().eq_ignore_ascii_case(&selected_key)
+                    && graph_entities_are_related(
+                        &selected.entity,
+                        &candidate.entity,
+                        relationships,
+                    )
+                    && graph_field_looks_date_like(candidate)
+                        == graph_field_looks_date_like(selected)
+            })
+            .filter_map(|candidate| {
+                let value = graph_predicate_value_for_field(candidate, predicate, sample_values)?;
+                let score = graph_predicate_field_label_score(nl, candidate, vocabulary);
+                (score >= selected_score + 2).then_some((score, candidate, value))
+            })
+            .collect();
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.canonical().cmp(&b.1.canonical()))
+        });
+        if let Some((_, candidate, value)) = candidates.into_iter().next() {
+            predicate.field = candidate.canonical();
+            if let Some(value) = value {
+                predicate.value = value;
+            }
+        }
+    }
+    predicates
+}
+
+fn graph_predicate_field_label_score(
+    nl: &str,
+    field: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> i32 {
+    let nl_norm = graph_norm(nl);
+    let q_tokens = graph_schema_match_tokens(nl);
+    let entity_tokens = graph_entity_tokens_with_vocab(&field.entity, vocabulary);
+    let mut score = 0;
+    for form in graph_field_display_forms_with_vocab(field, vocabulary) {
+        let form_norm = graph_norm(&form);
+        if form_norm.len() < 2 {
+            continue;
+        }
+        let mut tokens = graph_name_tokens(&form_norm);
+        tokens.retain(|token| {
+            !entity_tokens.contains(token)
+                && !matches!(
+                    token.as_str(),
+                    "date" | "time" | "on" | "at" | "before" | "after" | "from" | "to"
+                )
+        });
+        score += tokens.intersection(&q_tokens).count() as i32 * 2;
+        if tokens.len() > 1 && form_norm.len() >= 4 && graph_norm_contains(&nl_norm, &form_norm) {
+            score += 6;
+        }
+    }
+    score
+}
+
+fn graph_predicate_value_for_field(
+    field: &FieldRow,
+    predicate: &GraphQueryPredicate,
+    sample_values: &[SampleValueRow],
+) -> Option<Option<String>> {
+    let mut exact_values = Vec::new();
+    for value in predicate.value.split('|').map(str::trim) {
+        if value.is_empty() {
+            continue;
+        }
+        let target = graph_norm(value.trim_matches('\''));
+        if target.is_empty() {
+            return None;
+        }
+        let row = sample_values
+            .iter()
+            .find(|row| row.field_canonical.eq_ignore_ascii_case(&field.canonical()))?;
+        let sample = row
+            .examples
+            .iter()
+            .find(|sample| graph_norm(sample) == target)
+            .cloned()?;
+        exact_values.push(sample);
+    }
+    if exact_values.is_empty() {
+        return graph_literal_compatible_with_field("", &predicate.value, field).then_some(None);
+    }
+    if predicate.value.contains('|') {
+        Some(Some(exact_values.join("|")))
+    } else {
+        exact_values.into_iter().next().map(Some)
+    }
 }
 
 fn graph_related_lifecycle_table_candidate<'a>(
@@ -24826,8 +24951,8 @@ mod graph_schema_atlas_tests {
         runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
         runtime_prompt_related_predicate_field_ambiguity,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
-        semantic_runtime_atlas, semantic_runtime_atlas_with_metrics, Cascade, CascadeRunOptions,
-        BoundPlanPredicateTrace, BoundQueryPlanTrace, GraphQueryPredicate,
+        semantic_runtime_atlas, semantic_runtime_atlas_with_metrics, BoundPlanPredicateTrace,
+        BoundQueryPlanTrace, Cascade, CascadeRunOptions, GraphQueryPredicate,
         RuntimeQueryFrameJoinTrace, RuntimeQueryFrameOrderTrace, RuntimeQueryFramePredicateTrace,
         RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace, RuntimeSemanticAtlas,
     };
@@ -25593,7 +25718,13 @@ mod graph_schema_atlas_tests {
                 "Charter Funding Type",
             ),
         ];
-        let relationships = vec![relationship_row("frpm", "cdscode", "schools")];
+        let relationships = vec![RelationshipRow {
+            from_entity: "frpm".to_string(),
+            from_field: "cdscode".to_string(),
+            to_entity: "schools".to_string(),
+            to_field: "cdscode".to_string(),
+            kind: "many_to_one".to_string(),
+        }];
         let samples = vec![
             sample_row(
                 "schools.fundingtype",
@@ -25641,6 +25772,94 @@ mod graph_schema_atlas_tests {
             &stronger_plan,
             &atlas
         ));
+    }
+
+    #[test]
+    fn runtime_query_frame_promotes_related_predicate_field_with_stronger_label_evidence() {
+        let entities = vec![entity_row("schools"), entity_row("frpm")];
+        let fields = vec![
+            typed_field_row("schools", "cdscode", "TEXT"),
+            field_row("schools", "phone"),
+            typed_field_row("schools", "charter", "INTEGER"),
+            field_row("schools", "fundingtype"),
+            typed_field_row("schools", "opendate", "DATE"),
+            typed_field_row("frpm", "cdscode", "TEXT"),
+            labeled_field_row(
+                "frpm",
+                "charter_school_y_n",
+                "INTEGER",
+                "Charter School (Y/N)",
+            ),
+            labeled_field_row(
+                "frpm",
+                "charter_funding_type",
+                "TEXT",
+                "Charter Funding Type",
+            ),
+        ];
+        let relationships = vec![RelationshipRow {
+            from_entity: "frpm".to_string(),
+            from_field: "cdscode".to_string(),
+            to_entity: "schools".to_string(),
+            to_field: "cdscode".to_string(),
+            kind: "many_to_one".to_string(),
+        }];
+        let samples = vec![
+            sample_row(
+                "schools.fundingtype",
+                &["Directly funded", "Locally funded"],
+            ),
+            sample_row(
+                "frpm.charter_funding_type",
+                &["Directly funded", "Locally funded"],
+            ),
+            sample_row("schools.charter", &["0", "1"]),
+            sample_row("frpm.charter_school_y_n", &["0", "1"]),
+        ];
+        let vocabulary = vec![
+            scope_vocab_entry("directly funded", "schools.fundingtype", "directly funded"),
+            scope_vocab_entry("charter", "schools.charter", "1"),
+        ];
+        let question = "show phone numbers of direct charter-funded schools opened after 2000/1/1";
+
+        let trace = graph_query_frame_trace_with_vocab(
+            question,
+            &entities,
+            &fields,
+            &relationships,
+            &samples,
+            &vocabulary,
+        );
+
+        assert!(trace.routed, "{trace:?}");
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "frpm.charter_funding_type"
+                    && predicate.value == "Directly funded"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            trace
+                .predicates
+                .iter()
+                .any(|predicate| predicate.field == "frpm.charter_school_y_n"),
+            "{trace:?}"
+        );
+        assert!(
+            trace.joins.iter().any(|join| {
+                join.from_entity == "schools"
+                    && join.from_field == "cdscode"
+                    && join.to_entity == "frpm"
+                    && join.to_field == "cdscode"
+            }) || trace.joins.iter().any(|join| {
+                join.from_entity == "frpm"
+                    && join.from_field == "cdscode"
+                    && join.to_entity == "schools"
+                    && join.to_field == "cdscode"
+            }),
+            "{trace:?}"
+        );
     }
 
     #[test]

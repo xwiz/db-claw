@@ -4,14 +4,14 @@ Date: 2026-06-08. Current direction note; numbers live in
 
 ## Decision
 BIRD failures should be treated as SemanticAtlas coverage failures, not as a
-reason to add benchmark-shaped tables, static query examples, or direct SQL
-generation. The product path is:
+reason to add benchmark-shaped physical tables, static query examples, or
+direct SQL generation. The product path is:
 
 `database -> DB-only atlas/codebook -> typed intent -> bound plan -> guarded SQL`.
 
 ## Benchmark Rule
-For BIRD, build the same atlas a real customer database would get from DB-only
-evidence:
+For BIRD, build the same virtual atlas/codebook a real customer database would
+get from DB-only evidence:
 
 - table/field names, relationships, types, row counts, and active-table hints;
 - bounded non-PII sample values and code-like value dictionaries;
@@ -20,6 +20,12 @@ evidence:
 
 Do not use dev gold SQL, per-question examples, or BIRD-specific table-name
 maps to make a case pass.
+
+This means "create tables like real database examples" should be interpreted as
+virtual SemanticAtlas tables, not new physical benchmark tables. A lookup table
+is valid only when it is field-scoped, provenance-tagged, and derived from
+schema descriptions, relationships, bounded samples, framework/source
+vocabulary, or user-approved business definitions.
 
 ## Production Rule
 For real databases, enrich the atlas with app/framework/source vocabulary and
@@ -41,11 +47,11 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - projection intent now separates requested output fields from predicate-only
   fields, so `phone numbers ... opened after ...` projects phone while using
   the date only as a filter.
-- related predicate fields with stronger label/value evidence now fail closed
-  instead of accepting a weaker same-table shortcut.
+- related predicate fields with stronger label/value evidence are promoted to
+  the related table instead of accepting a weaker same-table shortcut.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
-slice after the projection fix is `3/4`, wrong accepted SQL `0`, with one
-intentional `ambiguous_related_predicate_field` bail. The next root cause is
-join/table selection over available atlas evidence, not missing value aliases.
-Also treat cold graph load/startup latency as a production-readiness blocker.
+slice after the related-field promotion is `4/4`, wrong accepted SQL `0`, bails
+`0`. The next root cause is scaling this atlas/codebook evidence across broad
+BIRD and real databases, especially value dictionaries, field roles, active
+tables, metric candidates, and fast graph loading.
