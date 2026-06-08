@@ -3144,6 +3144,7 @@ fn runtime_bound_plan_semantic_reject_reason(
     }
     if runtime_prompt_contains_numeric_range(nl)
         && !runtime_plan_has_numeric_range_predicate(plan, atlas)
+        && !runtime_plan_numeric_range_satisfied_by_selected_fields(nl, plan, trace, atlas)
     {
         return Some("missing_numeric_range_predicate".to_string());
     }
@@ -3242,6 +3243,84 @@ fn runtime_plan_has_numeric_range_predicate(
         }
     }
     false
+}
+
+fn runtime_plan_numeric_range_satisfied_by_selected_fields(
+    nl: &str,
+    plan: &BoundQueryPlanTrace,
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let markers = runtime_prompt_numeric_range_markers(nl);
+    if markers.is_empty() {
+        return false;
+    }
+    let mut field_keys = Vec::new();
+    for projection in &plan.projections {
+        if let Some(field) = &projection.field {
+            field_keys.push(field.as_str());
+        }
+    }
+    if let Some(projection) = &trace.projection {
+        field_keys.extend(projection.fields.iter().map(String::as_str));
+    }
+    if let Some(order) = &trace.order_by {
+        field_keys.push(order.field.as_str());
+    }
+    field_keys.into_iter().any(|field_key| {
+        atlas.field(field_key).is_some_and(|field| {
+            let mut forms = semantic_field_aliases(field, &atlas.vocabulary);
+            forms.push(field.field.clone());
+            forms.push(field.db_column.clone());
+            if let Some(label) = &field.display_label {
+                forms.push(label.clone());
+            }
+            forms.into_iter().any(|form| {
+                let compact = graph_alnum_compact(&form);
+                markers.iter().any(|marker| compact.contains(marker))
+            })
+        })
+    })
+}
+
+fn runtime_prompt_numeric_range_markers(nl: &str) -> Vec<String> {
+    let chars = nl.chars().collect::<Vec<_>>();
+    let mut markers = Vec::new();
+    for (idx, ch) in chars.iter().enumerate() {
+        if !matches!(ch, '-' | '–' | '—') {
+            continue;
+        }
+        let mut left_start = idx;
+        while left_start > 0 && chars[left_start - 1].is_ascii_digit() {
+            left_start -= 1;
+        }
+        let mut right_end = idx + 1;
+        while right_end < chars.len() && chars[right_end].is_ascii_digit() {
+            right_end += 1;
+        }
+        if left_start == idx || right_end == idx + 1 {
+            continue;
+        }
+        let left = chars[left_start..idx].iter().collect::<String>();
+        let right = chars[idx + 1..right_end].iter().collect::<String>();
+        for marker in [
+            format!("{left}{right}"),
+            format!("age{left}{right}"),
+            format!("ages{left}{right}"),
+        ] {
+            if !markers.iter().any(|existing| existing == &marker) {
+                markers.push(marker);
+            }
+        }
+    }
+    markers
+}
+
+fn graph_alnum_compact(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 fn runtime_prompt_requests_row_projection_but_plan_counts(
@@ -4683,9 +4762,10 @@ fn runtime_requested_projection_terms(nl: &str) -> Vec<String> {
                     if runtime_projection_term_is_filter_or_order_phrase(term) {
                         continue;
                     }
-                    if !term.is_empty() {
-                        out.push(term.to_string());
-                    }
+                    let Some(term) = runtime_projection_output_term(term) else {
+                        continue;
+                    };
+                    out.push(term);
                 }
             }
             search_start = end;
@@ -4731,7 +4811,7 @@ fn runtime_command_projection_terms(nl: &str) -> Vec<String> {
     }
     let end = runtime_command_projection_phrase_end(phrase);
     let phrase = phrase[..end].trim();
-    if phrase.is_empty() || runtime_projection_term_is_filter_or_order_phrase(phrase) {
+    if phrase.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -4742,10 +4822,10 @@ fn runtime_command_projection_terms(nl: &str) -> Vec<String> {
                 .trim_start_matches("the ")
                 .trim_start_matches("an ")
                 .trim_start_matches("a ");
-            if term.is_empty() || runtime_projection_term_is_filter_or_order_phrase(term) {
+            let Some(term) = runtime_projection_output_term(term) else {
                 continue;
-            }
-            out.push(term.to_string());
+            };
+            out.push(term);
         }
     }
     out
@@ -4781,6 +4861,62 @@ fn runtime_command_projection_phrase_end(phrase: &str) -> usize {
         }
     }
     end
+}
+
+fn runtime_projection_output_term(term: &str) -> Option<String> {
+    let mut words = graph_norm(term)
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    while words
+        .first()
+        .is_some_and(|word| runtime_projection_prefix_word(word))
+    {
+        words.remove(0);
+    }
+    let cleaned = words.join(" ");
+    if cleaned.is_empty() || runtime_projection_term_is_filter_or_order_phrase(&cleaned) {
+        return None;
+    }
+    Some(cleaned)
+}
+
+fn runtime_projection_prefix_word(word: &str) -> bool {
+    matches!(
+        word,
+        "the"
+            | "all"
+            | "their"
+            | "its"
+            | "a"
+            | "an"
+            | "each"
+            | "every"
+            | "top"
+            | "bottom"
+            | "highest"
+            | "lowest"
+            | "largest"
+            | "smallest"
+            | "greatest"
+            | "fewest"
+            | "most"
+            | "least"
+            | "best"
+            | "worst"
+            | "first"
+            | "last"
+            | "one"
+            | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "ten"
+    ) || word.parse::<u32>().is_ok()
 }
 
 fn runtime_projection_term_is_filter_or_order_phrase(term: &str) -> bool {
@@ -11262,7 +11398,13 @@ fn graph_metric_query_frame_trace(
         sample_values,
         vocabulary,
     );
-    let projection_field = if graph_metric_projection_requested(nl) {
+    let projects_metric_value = graph_metric_value_projection_requested(
+        nl,
+        metric.numerator,
+        metric.denominator,
+        vocabulary,
+    );
+    let projection_field = if !projects_metric_value && graph_metric_projection_requested(nl) {
         graph_metric_projection_field(
             nl,
             metric.numerator,
@@ -11320,7 +11462,12 @@ fn graph_metric_query_frame_trace(
     }
     let joins = graph_join_plan(nl, &base_entity, &required_entities, relationships)?;
     let join_sql = graph_render_joins(&base_entity, &joins, &entity_map, &field_map)?;
-    let where_sql = graph_render_where(&predicates, &field_map, &entity_map)?;
+    let mut where_sql = graph_render_where(&predicates, &field_map, &entity_map)?;
+    if !where_sql.is_empty() {
+        where_sql.push_str(" AND ");
+    }
+    where_sql.push_str(&metric_expr);
+    where_sql.push_str(" IS NOT NULL");
     let base = entity_map.get(&base_entity)?;
     let mut sql = format!(
         "SELECT {} FROM {}",
@@ -11496,6 +11643,27 @@ fn graph_metric_lowest_prompt(nl: &str) -> bool {
     graph_order_direction_limit(nl)
         .map(|(direction, _)| direction == "ASC")
         .unwrap_or(false)
+}
+
+fn graph_metric_value_projection_requested(
+    nl: &str,
+    numerator: &FieldRow,
+    denominator: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> bool {
+    let terms = runtime_explicit_projection_terms(nl);
+    if terms.is_empty() {
+        return false;
+    }
+    let numerator_tokens = graph_metric_field_tokens(numerator, vocabulary);
+    let denominator_tokens = graph_metric_field_tokens(denominator, vocabulary);
+    terms.iter().any(|term| {
+        let term_tokens = graph_metric_query_tokens(term);
+        graph_metric_field_mentions_percent(&term_tokens)
+            && (numerator_tokens.intersection(&term_tokens).count()
+                + denominator_tokens.intersection(&term_tokens).count())
+                > 0
+    })
 }
 
 fn graph_best_metric_ratio_candidate<'a>(
@@ -11894,6 +12062,14 @@ fn graph_metric_predicates(
                 })
         })
         .collect::<Vec<_>>();
+    graph_metric_prefer_base_entity_value_predicates(
+        &mut predicates,
+        numerator,
+        denominator,
+        fields,
+        sample_values,
+        vocabulary,
+    );
     predicates.sort_by(|a, b| {
         let a_metric_entity = field_map
             .get(&a.field)
@@ -11909,6 +12085,96 @@ fn graph_metric_predicates(
     predicates.dedup_by(|a, b| a.field == b.field && a.value == b.value);
     predicates.truncate(3);
     predicates
+}
+
+fn graph_metric_prefer_base_entity_value_predicates(
+    predicates: &mut [GraphQueryPredicate],
+    numerator: &FieldRow,
+    denominator: &FieldRow,
+    fields: &[FieldRow],
+    sample_values: &[SampleValueRow],
+    vocabulary: &[VocabularyEntry],
+) {
+    let field_map = graph_field_map(fields);
+    for predicate in predicates {
+        let Some(source_field) = field_map.get(&predicate.field) else {
+            continue;
+        };
+        if source_field.entity.eq_ignore_ascii_case(&numerator.entity)
+            || graph_is_plain_number(&predicate.value)
+        {
+            continue;
+        }
+        let Some(base_field) = graph_metric_base_entity_value_field(
+            &predicate.value,
+            source_field,
+            numerator,
+            denominator,
+            fields,
+            sample_values,
+            vocabulary,
+        ) else {
+            continue;
+        };
+        predicate.field = base_field.canonical();
+    }
+}
+
+fn graph_metric_base_entity_value_field<'a>(
+    value: &str,
+    source_field: &FieldRow,
+    numerator: &FieldRow,
+    denominator: &FieldRow,
+    fields: &'a [FieldRow],
+    sample_values: &[SampleValueRow],
+    vocabulary: &[VocabularyEntry],
+) -> Option<&'a FieldRow> {
+    let value_norm = graph_norm(value);
+    if value_norm.len() < 2 {
+        return None;
+    }
+    let sample_map: HashMap<String, &SampleValueRow> = sample_values
+        .iter()
+        .map(|row| (row.field_canonical.to_ascii_lowercase(), row))
+        .collect();
+    let source_tokens = graph_field_tokens_with_vocab(source_field, vocabulary);
+    let mut candidates = fields
+        .iter()
+        .filter(|field| field.entity.eq_ignore_ascii_case(&numerator.entity))
+        .filter(|field| {
+            !field
+                .canonical()
+                .eq_ignore_ascii_case(&numerator.canonical())
+                && !field
+                    .canonical()
+                    .eq_ignore_ascii_case(&denominator.canonical())
+                && !graph_field_looks_numeric(field)
+                && !graph_field_looks_unsafe_id(field)
+        })
+        .filter(|field| {
+            sample_map
+                .get(&field.canonical().to_ascii_lowercase())
+                .is_some_and(|row| {
+                    row.examples
+                        .iter()
+                        .map(|sample| graph_norm(sample))
+                        .any(|sample_norm| sample_norm == value_norm)
+                })
+        })
+        .map(|field| {
+            let tokens = graph_field_tokens_with_vocab(field, vocabulary);
+            let score = tokens.intersection(&source_tokens).count();
+            (score, field)
+        })
+        .filter(|(score, _)| *score > 0)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.canonical().cmp(&right.1.canonical()))
+    });
+    candidates.into_iter().map(|(_, field)| field).next()
 }
 
 fn graph_metric_ratio_expr(
@@ -14993,7 +15259,7 @@ fn graph_query_predicates_with_vocab(
             if value_norm.len() < 2 && aliases.is_empty() {
                 continue;
             }
-            if value_norm.len() >= 2 && graph_norm_contains(&nl_norm, &value_norm) {
+            if let Some(value_mention) = graph_norm_query_match_variant(&nl_norm, &value_norm) {
                 if graph_unquoted_literal_stopword(&value_norm)
                     && !quoted_norms.contains(&value_norm)
                 {
@@ -15004,7 +15270,7 @@ fn graph_query_predicates_with_vocab(
                     score += 3.0;
                 }
                 let field_tokens = graph_field_tokens(field);
-                let context = graph_mention_context(nl, value);
+                let context = graph_mention_context(nl, &value_mention);
                 let context_tokens = graph_tokens(&context);
                 score += field_tokens.intersection(&context_tokens).count() as f32 * 2.5;
                 let entity_tokens = graph_entity_tokens_with_vocab(&field.entity, vocabulary);
@@ -15018,17 +15284,18 @@ fn graph_query_predicates_with_vocab(
                     value_norm.clone(),
                     row.field_canonical.clone(),
                     value.clone(),
-                    value.clone(),
+                    value_mention,
                 ));
                 source_value_norms.insert(value_norm.clone());
             }
             for alias in aliases {
                 let alias_norm = graph_norm(alias);
-                if alias_norm.len() < 2 || !graph_norm_contains(&nl_norm, &alias_norm) {
+                let Some(alias_mention) = graph_norm_query_match_variant(&nl_norm, &alias_norm)
+                else {
                     continue;
-                }
+                };
                 let field_tokens = graph_field_tokens(field);
-                let context = graph_mention_context(nl, alias);
+                let context = graph_mention_context(nl, &alias_mention);
                 let context_tokens = graph_tokens(&context);
                 let mut score = 5.0 + alias_norm.len() as f32 / 8.0;
                 score += field_tokens.intersection(&context_tokens).count() as f32 * 2.5;
@@ -15043,7 +15310,7 @@ fn graph_query_predicates_with_vocab(
                     alias_norm,
                     row.field_canonical.clone(),
                     value.clone(),
-                    alias.to_string(),
+                    alias_mention,
                 ));
             }
         }
@@ -17370,6 +17637,16 @@ fn graph_simple_singular_form(label: &str) -> Option<String> {
     None
 }
 
+fn graph_simple_plural_form(label: &str) -> Option<String> {
+    if label.is_empty() || label.ends_with('s') {
+        return None;
+    }
+    if let Some(stem) = label.strip_suffix('y') {
+        return (!stem.is_empty()).then(|| format!("{stem}ies"));
+    }
+    Some(format!("{label}s"))
+}
+
 fn graph_entity_prefers_identifier_projection(entity: &str) -> bool {
     let tokens = graph_name_tokens(entity);
     [
@@ -18978,6 +19255,37 @@ fn graph_norm_contains(haystack: &str, needle: &str) -> bool {
     let padded_haystack = format!(" {haystack} ");
     let padded_needle = format!(" {needle} ");
     padded_haystack.contains(&padded_needle)
+}
+
+fn graph_norm_query_match_variant(haystack: &str, needle: &str) -> Option<String> {
+    graph_norm_phrase_variants(needle)
+        .into_iter()
+        .find(|variant| graph_norm_contains(haystack, variant))
+}
+
+fn graph_norm_phrase_variants(norm: &str) -> Vec<String> {
+    let words = norm
+        .split_whitespace()
+        .filter(|word| !word.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut variants = vec![words.join(" ")];
+    let last = &words[words.len() - 1];
+    if let Some(singular) = graph_simple_singular_form(last) {
+        let mut next = words[..words.len() - 1].to_vec();
+        next.push(singular);
+        variants.push(next.join(" "));
+    } else if let Some(plural) = graph_simple_plural_form(last) {
+        let mut next = words[..words.len() - 1].to_vec();
+        next.push(plural);
+        variants.push(next.join(" "));
+    }
+    variants.sort();
+    variants.dedup();
+    variants
 }
 
 fn graph_quoted_phrases(text: &str) -> Vec<String> {
@@ -33833,7 +34141,78 @@ mod graph_schema_atlas_tests {
         assert!(trace.used_for_final_sql, "{trace:?}");
         assert_eq!(
             outcome.sql_text,
-            "SELECT CAST(\"program_metrics\".\"free_meal_count_k_12\" AS REAL) / \"program_metrics\".\"enrollment_k_12\" FROM \"program_metrics\" WHERE \"program_metrics\".\"county_name\" = 'Alameda' ORDER BY CAST(\"program_metrics\".\"free_meal_count_k_12\" AS REAL) / \"program_metrics\".\"enrollment_k_12\" DESC LIMIT 1"
+            "SELECT CAST(\"program_metrics\".\"free_meal_count_k_12\" AS REAL) / \"program_metrics\".\"enrollment_k_12\" FROM \"program_metrics\" WHERE \"program_metrics\".\"county_name\" = 'Alameda' AND CAST(\"program_metrics\".\"free_meal_count_k_12\" AS REAL) / \"program_metrics\".\"enrollment_k_12\" IS NOT NULL ORDER BY CAST(\"program_metrics\".\"free_meal_count_k_12\" AS REAL) / \"program_metrics\".\"enrollment_k_12\" DESC LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn graph_query_frame_routes_ranked_metric_value_projection_with_age_band() {
+        let entities = vec![entity_row("program_metrics"), entity_row("programs")];
+        let fields = vec![
+            typed_field_row("program_metrics", "program_id", "INTEGER"),
+            field_row("program_metrics", "program_type"),
+            labeled_field_row(
+                "program_metrics",
+                "free_meal_count_ages_5_17",
+                "REAL",
+                "Free Meal Count (Ages 5-17)",
+            ),
+            labeled_field_row(
+                "program_metrics",
+                "enrollment_ages_5_17",
+                "REAL",
+                "Enrollment (Ages 5-17)",
+            ),
+            labeled_field_row(
+                "program_metrics",
+                "charter_school_number",
+                "TEXT",
+                "Charter School Number",
+            ),
+            typed_field_row("programs", "id", "INTEGER"),
+            labeled_field_row("programs", "program_type_name", "TEXT", "Program Type Name"),
+        ];
+        let relationships = vec![relationship_row(
+            "program_metrics",
+            "program_id",
+            "programs",
+        )];
+        let samples = vec![
+            sample_row("program_metrics.program_type", &["Continuation Programs"]),
+            sample_row("programs.program_type_name", &["Continuation Programs"]),
+        ];
+        let query =
+            "Please list the lowest three eligible free rates for students aged 5-17 in continuation programs.";
+        let trace = graph_query_frame_trace(query, &entities, &fields, &relationships, &samples);
+
+        assert!(trace.routed, "{trace:?}");
+        assert_eq!(trace.source, "runtime_graph_query_frame_metric");
+        let projection = trace.projection.as_ref().unwrap();
+        assert_eq!(
+            projection.fields,
+            vec![
+                "program_metrics.free_meal_count_ages_5_17".to_string(),
+                "program_metrics.enrollment_ages_5_17".to_string(),
+            ],
+            "{trace:?}"
+        );
+        assert!(
+            projection.expression.contains("free_meal_count_ages_5_17")
+                && projection.expression.contains("enrollment_ages_5_17"),
+            "{trace:?}"
+        );
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "program_metrics.program_type"
+                    && predicate.value == "Continuation Programs"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            graph_runtime_query_frame_final_sql_allowed(
+                true, &entities, &fields, &samples, query, &trace
+            ),
+            "{trace:?}"
         );
     }
 
@@ -33931,7 +34310,7 @@ mod graph_schema_atlas_tests {
         assert!(trace.used_for_final_sql, "{trace:?}");
         assert_eq!(
             outcome.sql_text,
-            "SELECT \"schools\".\"phone\" FROM \"schools\" INNER JOIN \"score_metrics\" ON \"schools\".\"cds_code\" = \"score_metrics\".\"cds_code\" ORDER BY CAST(\"score_metrics\".\"NumGE1500\" AS REAL) / \"score_metrics\".\"NumTstTakr\" DESC LIMIT 3"
+            "SELECT \"schools\".\"phone\" FROM \"schools\" INNER JOIN \"score_metrics\" ON \"schools\".\"cds_code\" = \"score_metrics\".\"cds_code\" WHERE CAST(\"score_metrics\".\"NumGE1500\" AS REAL) / \"score_metrics\".\"NumTstTakr\" IS NOT NULL ORDER BY CAST(\"score_metrics\".\"NumGE1500\" AS REAL) / \"score_metrics\".\"NumTstTakr\" DESC LIMIT 3"
         );
 
         let top_measure_query = "What is the phone number of the school that has the highest number of test takers with an SAT score of over 1500?";

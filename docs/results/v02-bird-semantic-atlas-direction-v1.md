@@ -55,14 +55,18 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - projection aliases are now consumed only from explicit output spans such as
   `list/show ... of/for/where`, so filter phrases do not promote predicate
   fields into the SELECT list.
+- ranked metric-value requests strip rank words from the output span, bind the
+  metric expression, prefer same-base categorical predicates, and filter NULL
+  metric ratios before ordering.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
-slice after related-field, related-fact, and output-span projection work is
-`5/5`, wrong accepted SQL `0`, bails `0`; first20 remains `5/20`, wrong `0`,
-bailed `15`. The next root cause is planner-side role binding for metric/value
-slots using the reusable query-time atlas/codebook candidates now exposed on
-`intent_frame`. Numeric metric-like scope phrases are filtered out of value
-aliases, so phrases such as `eligible free rate` surface as metric evidence
-rather than bogus count-field values. A naive whole-query projection boost once
-regressed `zip code ... charter schools`; current planner use is intentionally
+slice after related-field, related-fact, output-span projection, and ranked
+metric-value work is `6/6`, wrong accepted SQL `0`, bails `0`; first20 is
+`6/20`, wrong `0`, bailed `14`. The next root cause is planner-side role
+binding for the remaining metric/value/group/order slots using the reusable
+query-time atlas/codebook candidates exposed on `intent_frame`. Numeric
+metric-like scope phrases are filtered out of value aliases, so phrases such as
+`eligible free rate` surface as metric evidence rather than bogus count-field
+values. A naive whole-query projection boost once regressed
+`zip code ... charter schools`; current planner use is intentionally
 slot/role-aware.
