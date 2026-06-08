@@ -234,9 +234,11 @@ def _make_ambiguous_value_graph(path: Path) -> None:
             ("customers", "id", "id", "integer", "ID"),
             ("customers", "name", "name", "text", "Name"),
             ("customers", "region", "region", "text", "Region"),
+            ("customers", "segment", "segment", "text", "Segment"),
             ("orders", "id", "id", "integer", "ID"),
             ("orders", "customer_id", "customer_id", "integer", "Customer ID"),
             ("orders", "region", "region", "text", "Region"),
+            ("orders", "segment", "segment", "text", "Segment"),
             ("orders", "amount", "amount", "decimal", "Amount"),
             ("regions", "id", "id", "integer", "ID"),
             ("regions", "name", "name", "text", "Name"),
@@ -251,7 +253,9 @@ def _make_ambiguous_value_graph(path: Path) -> None:
         "VALUES (?, ?, 0)",
         [
             ("customers.region", '["North", "South"]'),
+            ("customers.segment", '["Priority", "Standard"]'),
             ("orders.region", '["North", "East"]'),
+            ("orders.segment", '["Priority", "Backlog"]'),
             ("regions.name", '["North", "West"]'),
         ],
     )
@@ -4921,6 +4925,188 @@ def test_resolution_task_candidates_are_allowed_as_field_scoped_filters(
         'SELECT "orders"."id" FROM "orders" '
         'JOIN "customers" ON "orders"."customer_id" = "customers"."id" '
         'WHERE "customers"."region" = \'North\' LIMIT 100'
+    )
+
+
+def test_resolution_task_auto_replaces_selected_ambiguous_filter(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_ambiguous_value_graph(graph)
+    packet = build_rejected_query_packet(
+        graph,
+        "show orders for north customers",
+        query_frame={
+            "bound_query_plan": {
+                "base_entity": "orders",
+                "reject_reason": "ambiguous_unscoped_value_field",
+                "joins": [
+                    {
+                        "from_entity": "orders",
+                        "from_field": "orders.customer_id",
+                        "to_entity": "customers",
+                        "to_field": "customers.id",
+                    }
+                ],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"}
+                ],
+                "projections": [{"field": "orders.id", "expression": "orders.id"}],
+            },
+            "runtime_query_frame": {
+                "required_entities": ["orders", "customers"],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"}
+                ],
+                "projection": {"fields": ["orders.id"]},
+            },
+        },
+    )
+    proposal = {
+        "schema_version": 1,
+        "action": "route",
+        "confidence": 0.83,
+        "intent": "list orders for north customers",
+        "target_entities": ["orders"],
+        "projections": [
+            {
+                "kind": "field",
+                "field": "orders.id",
+                "aggregate": "",
+                "rationale": "orders are the requested rows",
+            }
+        ],
+        "filters": [
+            {
+                "field": "orders.region",
+                "operator": "=",
+                "value": "North",
+                "value_kind": "sample_value",
+                "rationale": "runtime selected the ambiguous value field",
+            }
+        ],
+        "joins": [],
+        "group_by": [],
+        "order_by": [],
+        "limit": 100,
+        "ambiguity_questions": [],
+        "evidence": [
+            {"claim": "North is packet-backed", "graph_refs": ["orders.region"]}
+        ],
+        "safety_notes": [],
+    }
+
+    result = render_resolution_proposal(packet, proposal, dialect="sqlite")
+
+    assert result["valid"] is True
+    assert result["issues"][0]["code"] == "value_binding_auto_resolved"
+    assert result["query_frame_candidate"]["predicates"] == [
+        {"field": "customers.region", "value": "North", "operator": "="}
+    ]
+    assert result["query_frame_candidate"]["required_entities"] == [
+        "customers",
+        "orders",
+    ]
+    assert result["sql"] == (
+        'SELECT "orders"."id" FROM "orders" '
+        'JOIN "customers" ON "orders"."customer_id" = "customers"."id" '
+        'WHERE "customers"."region" = \'North\' LIMIT 100'
+    )
+
+
+def test_resolution_task_auto_co_locates_followup_ambiguous_filter(
+    tmp_path: Path,
+) -> None:
+    graph = tmp_path / "g.semsql"
+    _make_ambiguous_value_graph(graph)
+    packet = build_rejected_query_packet(
+        graph,
+        "show orders for north customers with priority",
+        query_frame={
+            "bound_query_plan": {
+                "base_entity": "orders",
+                "reject_reason": "ambiguous_unscoped_value_field",
+                "joins": [
+                    {
+                        "from_entity": "orders",
+                        "from_field": "orders.customer_id",
+                        "to_entity": "customers",
+                        "to_field": "customers.id",
+                    }
+                ],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"},
+                    {"field": "orders.segment", "operator": "=", "value": "Priority"},
+                ],
+                "projections": [{"field": "orders.id", "expression": "orders.id"}],
+            },
+            "runtime_query_frame": {
+                "required_entities": ["orders", "customers"],
+                "predicates": [
+                    {"field": "orders.region", "operator": "=", "value": "North"},
+                    {"field": "orders.segment", "operator": "=", "value": "Priority"},
+                ],
+                "projection": {"fields": ["orders.id"]},
+            },
+        },
+    )
+    proposal = {
+        "schema_version": 1,
+        "action": "route",
+        "confidence": 0.83,
+        "intent": "list priority north customer orders",
+        "target_entities": ["orders"],
+        "projections": [
+            {
+                "kind": "field",
+                "field": "orders.id",
+                "aggregate": "",
+                "rationale": "orders are the requested rows",
+            }
+        ],
+        "filters": [
+            {
+                "field": "orders.region",
+                "operator": "=",
+                "value": "North",
+                "value_kind": "sample_value",
+                "rationale": "runtime selected the ambiguous value field",
+            },
+            {
+                "field": "orders.segment",
+                "operator": "=",
+                "value": "Priority",
+                "value_kind": "sample_value",
+                "rationale": "runtime selected another ambiguous value field",
+            },
+        ],
+        "joins": [],
+        "group_by": [],
+        "order_by": [],
+        "limit": 100,
+        "ambiguity_questions": [],
+        "evidence": [
+            {"claim": "values are packet-backed", "graph_refs": ["orders.region"]}
+        ],
+        "safety_notes": [],
+    }
+
+    result = render_resolution_proposal(packet, proposal, dialect="sqlite")
+
+    assert result["valid"] is True
+    assert [issue["code"] for issue in result["issues"]] == [
+        "value_binding_auto_resolved",
+        "value_binding_auto_resolved",
+    ]
+    assert result["query_frame_candidate"]["predicates"] == [
+        {"field": "customers.region", "value": "North", "operator": "="},
+        {"field": "customers.segment", "value": "Priority", "operator": "="},
+    ]
+    assert result["sql"] == (
+        'SELECT "orders"."id" FROM "orders" '
+        'JOIN "customers" ON "orders"."customer_id" = "customers"."id" '
+        'WHERE "customers"."region" = \'North\' '
+        'AND "customers"."segment" = \'Priority\' LIMIT 100'
     )
 
 

@@ -634,6 +634,7 @@ def _ambiguous_value_candidate_fields(
         field_type = _field_type_kind(str(field.get("type") or ""))
         if field_type in {"date", "datetime", "number", "boolean"}:
             continue
+        entity_tokens = _tokens(entity)
         field_tokens = _tokens(
             f"{field.get('field') or ''} {field.get('db_column') or ''} "
             f"{field.get('display_label') or ''}"
@@ -662,7 +663,11 @@ def _ambiguous_value_candidate_fields(
                 "value": raw_value,
                 "operator": "=",
                 "selected_by_runtime": field_ref == selected_field,
-                "matched_question_tokens": sorted(question_tokens & field_tokens),
+                "matched_question_tokens": sorted(
+                    question_tokens & (field_tokens | entity_tokens)
+                ),
+                "matched_field_tokens": sorted(question_tokens & field_tokens),
+                "matched_entity_tokens": sorted(question_tokens & entity_tokens),
                 "evidence_sources": evidence_sources,
                 "relationship_path": relationship_path,
             }
@@ -700,6 +705,10 @@ def _ambiguous_value_relationship_path(
     context_entities: set[str],
     relationships: list[JsonObject],
 ) -> list[JsonObject]:
+    if selected_entity and selected_entity != entity:
+        path = _relationship_path({selected_entity}, entity, relationships)
+        if path is not None:
+            return [_relationship_card_from_join_step(step) for step in path]
     if entity in context_entities:
         return []
     anchors = [selected_entity] if selected_entity else []
@@ -2856,6 +2865,11 @@ def render_resolution_proposal(
     )
     promotion_issues = [*choice_issues, *promotion_issues]
     effective_proposal = _canonicalize_proposal_field_refs(packet, effective_proposal)
+    effective_proposal, value_binding_issues = _value_binding_auto_route_adjustment(
+        packet,
+        effective_proposal,
+    )
+    promotion_issues.extend(value_binding_issues)
     validation = validate_resolution_proposal(packet, effective_proposal)
     if not validation["valid"]:
         return _render_result(
@@ -3074,6 +3088,301 @@ def _canonicalize_proposal_field_refs(
         if isinstance(order, dict) and order.get("field"):
             order["field"] = canonical(order["field"])
     return adjusted
+
+
+def _value_binding_auto_route_adjustment(
+    packet: JsonObject,
+    proposal: JsonObject,
+) -> tuple[JsonObject, list[JsonObject]]:
+    if proposal.get("action") != "route":
+        return proposal, []
+    bindings = [
+        binding
+        for binding in _resolution_task_value_bindings(packet)
+        if isinstance(binding, dict)
+    ]
+    if not bindings:
+        return proposal, []
+    resolved: dict[int, tuple[JsonObject, str]] = {}
+    resolved_entities: set[str] = set()
+    for idx, binding in enumerate(bindings):
+        selected = _select_value_binding_candidate(
+            packet,
+            binding,
+            resolved_entities,
+            allow_colocation=False,
+        )
+        if selected is None:
+            continue
+        candidate, reason = selected
+        resolved[idx] = (candidate, reason)
+        entity = str(candidate.get("entity") or "")
+        if entity:
+            resolved_entities.add(entity)
+    for idx, binding in enumerate(bindings):
+        if idx in resolved:
+            continue
+        selected = _select_value_binding_candidate(
+            packet,
+            binding,
+            resolved_entities,
+            allow_colocation=True,
+        )
+        if selected is None:
+            continue
+        candidate, reason = selected
+        resolved[idx] = (candidate, reason)
+        entity = str(candidate.get("entity") or "")
+        if entity:
+            resolved_entities.add(entity)
+    if not resolved:
+        return proposal, []
+    adjusted = json.loads(json.dumps(proposal))
+    filters = adjusted.get("filters")
+    if not isinstance(filters, list):
+        return proposal, []
+    issues: list[JsonObject] = []
+    changed = False
+    for idx, binding in enumerate(bindings):
+        if idx not in resolved:
+            continue
+        candidate, reason = resolved[idx]
+        candidate_field = str(candidate.get("field") or "")
+        selected_field = str(binding.get("selected_field") or "")
+        if not candidate_field:
+            continue
+        replacements = 0
+        for filter_item in filters:
+            if not isinstance(filter_item, dict):
+                continue
+            if not _filter_matches_value_binding(filter_item, binding):
+                continue
+            current_field = str(filter_item.get("field") or "")
+            if current_field and current_field != selected_field:
+                candidate_fields = {
+                    str(item.get("field") or "")
+                    for item in _as_list(binding.get("candidate_fields"))
+                    if isinstance(item, dict)
+                }
+                if current_field not in candidate_fields:
+                    continue
+            if current_field == candidate_field:
+                continue
+            filter_item["field"] = candidate_field
+            if "value_kind" not in filter_item or not filter_item["value_kind"]:
+                filter_item["value_kind"] = _candidate_value_kind(candidate)
+            replacements += 1
+            changed = True
+        if replacements:
+            _append_resolution_candidate_relationships(adjusted, candidate)
+            _append_resolution_candidate_entity(adjusted, candidate_field)
+            issues.append(
+                {
+                    "level": "warning",
+                    "code": "value_binding_auto_resolved",
+                    "message": (
+                        "packet-backed value-binding evidence replaced an "
+                        "ambiguous filter field before local validation"
+                    ),
+                    "value": binding.get("value"),
+                    "from_field": selected_field,
+                    "to_field": candidate_field,
+                    "reason": reason,
+                    "replacements": replacements,
+                }
+            )
+    return (adjusted, issues) if changed else (proposal, [])
+
+
+def _select_value_binding_candidate(
+    packet: JsonObject,
+    binding: JsonObject,
+    resolved_entities: set[str],
+    *,
+    allow_colocation: bool,
+) -> tuple[JsonObject, str] | None:
+    scored: list[tuple[int, str, JsonObject]] = []
+    for candidate in _as_list(binding.get("candidate_fields")):
+        if not isinstance(candidate, dict):
+            continue
+        score, reasons = _value_binding_candidate_score(
+            str(packet.get("question") or ""),
+            binding,
+            candidate,
+            resolved_entities,
+            allow_colocation=allow_colocation,
+        )
+        if score <= 0:
+            continue
+        scored.append((score, "+".join(reasons), candidate))
+    if not scored:
+        return None
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            not bool(item[2].get("selected_by_runtime")),
+            str(item[2].get("field") or ""),
+        )
+    )
+    best = scored[0]
+    runner_up_score = scored[1][0] if len(scored) > 1 else 0
+    if best[0] <= runner_up_score:
+        return None
+    return best[2], best[1]
+
+
+def _value_binding_candidate_score(
+    question: str,
+    binding: JsonObject,
+    candidate: JsonObject,
+    resolved_entities: set[str],
+    *,
+    allow_colocation: bool,
+) -> tuple[int, list[str]]:
+    matched_tokens = {
+        str(token)
+        for token in _as_list(candidate.get("matched_field_tokens"))
+        if isinstance(token, str)
+    }
+    non_generic = matched_tokens - GENERIC_SCHEMA_MATCH_TOKENS
+    score = len(non_generic) * 8
+    reasons: list[str] = []
+    if non_generic:
+        reasons.append("candidate_token_match")
+    context_score = _value_binding_candidate_local_context_score(
+        question,
+        binding.get("value"),
+        candidate,
+    )
+    if context_score:
+        score += context_score
+        reasons.append("value_context_match")
+    entity = str(candidate.get("entity") or "")
+    if allow_colocation and entity and entity in resolved_entities:
+        score += 30
+        reasons.append("resolved_entity_colocation")
+    evidence_sources = {
+        str(source)
+        for source in _as_list(candidate.get("evidence_sources"))
+        if isinstance(source, str)
+    }
+    if {"sample_value", "scope_predicate_vocabulary"} <= evidence_sources:
+        score += 2
+    return score, reasons
+
+
+def _value_binding_candidate_local_context_score(
+    question: str,
+    raw_value: Any,
+    candidate: JsonObject,
+) -> int:
+    question_tokens = re.findall(r"[a-z0-9]+", question.lower())
+    value_tokens = re.findall(r"[a-z0-9]+", str(raw_value).lower())
+    if not question_tokens or not value_tokens:
+        return 0
+    field_ref = str(candidate.get("field") or "")
+    field_name = field_ref.split(".", 1)[1] if "." in field_ref else field_ref
+    field_tokens = _tokens(
+        " ".join(
+            [
+                field_name,
+                str(candidate.get("db_column") or ""),
+                str(candidate.get("display_label") or ""),
+            ]
+        )
+    )
+    entity_tokens = _tokens(str(candidate.get("entity") or ""))
+    if not field_tokens and not entity_tokens:
+        return 0
+    best = 0
+    width = len(value_tokens)
+    for idx in range(0, len(question_tokens) - width + 1):
+        if question_tokens[idx : idx + width] != value_tokens:
+            continue
+        before = _tokens(" ".join(question_tokens[max(0, idx - 3) : idx]))
+        after = _tokens(" ".join(question_tokens[idx + width : idx + width + 3]))
+        window = _tokens(
+            " ".join(
+                question_tokens[max(0, idx - 4) : min(len(question_tokens), idx + width + 4)]
+            )
+        )
+        score = 0
+        if after & field_tokens:
+            score += 30 * len(after & field_tokens)
+        if before & field_tokens:
+            score += 18 * len(before & field_tokens)
+        if after & entity_tokens:
+            score += 30 * len(after & entity_tokens)
+        if window & field_tokens:
+            score += 5 * len(window & field_tokens)
+        best = max(best, score)
+    return best
+
+
+def _filter_matches_value_binding(
+    filter_item: JsonObject,
+    binding: JsonObject,
+) -> bool:
+    operator = _normalize_operator(
+        str(filter_item.get("operator") or "="),
+        filter_item.get("value"),
+    )
+    binding_operator = _normalize_operator(
+        str(binding.get("operator") or "="),
+        binding.get("value"),
+    )
+    if operator != binding_operator:
+        return False
+    return _normalize_value(filter_item.get("value")) == _normalize_value(
+        binding.get("value")
+    )
+
+
+def _candidate_value_kind(candidate: JsonObject) -> str:
+    evidence_sources = {
+        str(source)
+        for source in _as_list(candidate.get("evidence_sources"))
+        if isinstance(source, str)
+    }
+    if "scope_predicate_vocabulary" in evidence_sources:
+        return "value_dictionary"
+    if "sample_value" in evidence_sources:
+        return "sample_value"
+    return "literal"
+
+
+def _append_resolution_candidate_relationships(
+    proposal: JsonObject,
+    candidate: JsonObject,
+) -> None:
+    joins = proposal.setdefault("joins", [])
+    if not isinstance(joins, list):
+        return
+    seen = {_join_edge_refs(join) for join in joins if isinstance(join, dict)}
+    for relationship in _as_list(candidate.get("relationship_path")):
+        if not isinstance(relationship, dict):
+            continue
+        join = _join_from_relationship_ref(relationship)
+        edge = _join_edge_refs(join)
+        reverse_edge = (edge[1], edge[0])
+        if edge in seen or reverse_edge in seen:
+            continue
+        joins.append(join)
+        seen.add(edge)
+
+
+def _append_resolution_candidate_entity(
+    proposal: JsonObject,
+    candidate_field: str,
+) -> None:
+    entity = _field_ref_entity(candidate_field)
+    if not entity:
+        return
+    target_entities = proposal.setdefault("target_entities", [])
+    if not isinstance(target_entities, list):
+        return
+    if entity not in target_entities:
+        target_entities.append(entity)
 
 
 def _clarify_auto_route_adjustment(

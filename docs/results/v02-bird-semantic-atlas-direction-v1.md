@@ -72,6 +72,10 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - those ambiguous duplicate-value bails now build `resolve_value_binding`
   packets with exact field-scoped candidates, evidence source, and relationship
   context, so provider fallback can choose/clarify without direct SQL.
+- route proposals that keep the runtime-selected ambiguous field can be locally
+  repaired when candidate field-label/value-neighborhood evidence is unique;
+  follow-up ambiguous values can co-locate to the resolved entity. Broad subject
+  entity words such as `schools` do not by themselves bind value fields.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
 slice after related-field, related-fact, output-span projection, ranked
@@ -81,11 +85,12 @@ probe for indexes `16` and `18` now bails `2/2` with
 `ambiguous_unscoped_value_field` instead of accepting wrong SQL. Index `18`
 now packetizes `directly funded` as `schools.fundingtype` versus
 `frpm.charter_funding_type`, and `Fresno` as the plausible county/name fields;
-a corrected typed proposal validates and renders through local guardrails. The
-next root cause is planner-side role binding for the remaining
-metric/value/group/order slots using reusable query-time atlas/codebook
-candidates. Numeric metric-like scope phrases are filtered out of value aliases,
-so phrases such as `eligible free rate` surface as metric evidence rather than
-bogus count-field values. A naive whole-query projection boost once regressed
-`zip code ... charter schools`; current planner use is intentionally
-slot/role-aware.
+a route-shaped proposal that kept `schools.*` is repaired to
+`frpm.charter_funding_type` plus co-located `frpm.county_name` and renders
+through local guardrails. The next root cause is planner-side role binding for
+the remaining metric/value/group/order slots using reusable query-time
+atlas/codebook candidates. Numeric metric-like scope phrases are filtered out
+of value aliases, so phrases such as `eligible free rate` surface as metric
+evidence rather than bogus count-field values. A naive whole-query projection
+boost once regressed `zip code ... charter schools`; current planner use is
+intentionally slot/role-aware.
