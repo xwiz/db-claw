@@ -3172,6 +3172,9 @@ fn runtime_bound_plan_semantic_reject_reason(
     if runtime_prompt_explicit_numeric_predicate_field_missing(nl, plan, atlas) {
         return Some("missing_explicit_predicate_field".to_string());
     }
+    if runtime_prompt_high_confidence_value_candidate_missing(nl, plan, intent) {
+        return Some("missing_value_candidate".to_string());
+    }
     if runtime_prompt_related_predicate_field_ambiguity(nl, plan, atlas) {
         return Some("ambiguous_related_predicate_field".to_string());
     }
@@ -4288,6 +4291,13 @@ fn runtime_prompt_related_predicate_field_ambiguity(
     atlas: &RuntimeSemanticAtlas,
 ) -> bool {
     plan.predicates.iter().any(|predicate| {
+        if predicate
+            .evidence
+            .iter()
+            .any(|item| item == "scope_predicate_vocabulary")
+        {
+            return false;
+        }
         if !matches!(predicate.operator.as_str(), "=" | "in") {
             return false;
         }
@@ -4316,6 +4326,121 @@ fn runtime_prompt_related_predicate_field_ambiguity(
             candidate_score >= selected_score + 2
         })
     })
+}
+
+fn runtime_prompt_high_confidence_value_candidate_missing(
+    nl: &str,
+    plan: &BoundQueryPlanTrace,
+    intent: &IntentFrameTrace,
+) -> bool {
+    intent.codebook_candidates.iter().any(|candidate| {
+        if candidate.kind != SemanticAtlasCodebookKind::Value
+            || candidate.score < 15.0
+            || !matches!(
+                candidate.source.as_str(),
+                "sample_values" | "vocabulary_scope_predicate"
+            )
+            || !runtime_value_candidate_alias_strongly_grounded(nl, &candidate.matched_alias)
+        {
+            return false;
+        }
+        let Some(value) = candidate.value.as_deref() else {
+            return false;
+        };
+        if runtime_plan_value_covers_codebook_candidate(plan, candidate) {
+            return false;
+        }
+        !plan.predicates.iter().any(|predicate| {
+            predicate.field.eq_ignore_ascii_case(&candidate.target)
+                && graph_norm(&predicate.value) == graph_norm(value)
+        })
+    })
+}
+
+fn runtime_plan_value_covers_codebook_candidate(
+    plan: &BoundQueryPlanTrace,
+    candidate: &SemanticAtlasCodebookCandidate,
+) -> bool {
+    let alias_norm = graph_norm(&candidate.matched_alias);
+    if alias_norm.len() < 3 {
+        return false;
+    }
+    let alias_tokens = graph_tokens_with_aliases(&alias_norm);
+    let candidate_value_norm = candidate.value.as_deref().map(graph_norm);
+    plan.predicates.iter().any(|predicate| {
+        let value_norm = graph_norm(&predicate.value);
+        if value_norm.len() < 3 {
+            return false;
+        }
+        if candidate_value_norm
+            .as_deref()
+            .is_some_and(|candidate_value| {
+                candidate_value == value_norm
+                    || runtime_lifecycle_values_equivalent(candidate_value, &value_norm)
+            })
+        {
+            return true;
+        }
+        if graph_norm_contains(&value_norm, &alias_norm) {
+            return true;
+        }
+        let value_tokens = graph_tokens_with_aliases(&value_norm);
+        !alias_tokens.is_empty()
+            && alias_tokens.is_subset(&value_tokens)
+            && value_tokens.len() > alias_tokens.len()
+    })
+}
+
+fn runtime_lifecycle_values_equivalent(left: &str, right: &str) -> bool {
+    fn lifecycle_terminal_class(value: &str) -> Option<&'static str> {
+        match graph_norm(value).as_str() {
+            "churn" | "churned" | "cancel" | "cancelled" | "canceled" | "ended" | "terminated" => {
+                Some("terminal")
+            }
+            "active" | "current" | "open" | "ongoing" => Some("active"),
+            _ => None,
+        }
+    }
+    matches!(
+        (lifecycle_terminal_class(left), lifecycle_terminal_class(right)),
+        (Some(left_class), Some(right_class)) if left_class == right_class
+    )
+}
+
+fn runtime_value_candidate_alias_strongly_grounded(nl: &str, alias: &str) -> bool {
+    let alias_norm = graph_norm(alias);
+    if alias_norm.len() < 3 {
+        return false;
+    }
+    let nl_norm = graph_norm(nl);
+    if graph_norm_query_match_variant(&nl_norm, &alias_norm).is_some() {
+        return true;
+    }
+    let mut alias_tokens = graph_tokens_with_aliases(alias);
+    alias_tokens.retain(|token| {
+        !matches!(
+            token.as_str(),
+            "the"
+                | "a"
+                | "an"
+                | "of"
+                | "for"
+                | "in"
+                | "and"
+                | "or"
+                | "school"
+                | "schools"
+                | "student"
+                | "students"
+                | "public"
+        )
+    });
+    if alias_tokens.len() < 2 {
+        return false;
+    }
+    let nl_tokens = graph_tokens_with_aliases(nl);
+    let overlap = alias_tokens.intersection(&nl_tokens).count();
+    overlap >= 2 && overlap as f32 / alias_tokens.len() as f32 >= 0.8
 }
 
 fn runtime_predicate_field_label_score(
@@ -11521,6 +11646,9 @@ fn graph_scalar_aggregate_query_frame_trace(
     vocabulary: &[VocabularyEntry],
 ) -> Option<RuntimeQueryFrameTrace> {
     let lower = format!(" {} ", graph_norm(nl));
+    if graph_prompt_requests_count(&lower) {
+        return None;
+    }
     if lower.contains(" by ")
         || graph_order_direction_limit(nl).is_some()
         || graph_prompt_requests_metric_ratio(nl)
@@ -11617,6 +11745,15 @@ fn graph_prompt_requests_metric_ratio(nl: &str) -> bool {
     ["rate", "ratio", "percentage", "percent", "share"]
         .iter()
         .any(|token| tokens.contains(*token))
+}
+
+fn graph_prompt_requests_count(lower_nl: &str) -> bool {
+    lower_nl.contains(" how many ")
+        || lower_nl.contains(" number of ")
+        || lower_nl.contains(" no of ")
+        || lower_nl.contains(" no. of ")
+        || lower_nl.contains(" count of ")
+        || lower_nl.starts_with(" count ")
 }
 
 fn graph_metric_prompt_has_unsafe_terms(nl: &str) -> bool {
@@ -21647,6 +21784,7 @@ fn graph_value_field_bonus(nl: &str, context: &str, field: &FieldRow, value: &st
     let lower_context = context.to_ascii_lowercase();
     let lower_name = field.db_column.to_ascii_lowercase();
     let mut score = 0.0;
+    score += graph_field_label_context_bonus(context, field);
     if graph_is_plain_number(value)
         && graph_numeric_context_targets_score(&lower_context)
         && graph_field_looks_score_like(field)
@@ -21703,6 +21841,43 @@ fn graph_value_field_bonus(nl: &str, context: &str, field: &FieldRow, value: &st
         score -= 1.5;
     }
     score
+}
+
+fn graph_field_label_context_bonus(context: &str, field: &FieldRow) -> f32 {
+    let context_norm = graph_norm(context);
+    if context_norm.len() < 3 {
+        return 0.0;
+    }
+    let context_tokens = graph_tokens_with_aliases(&context_norm);
+    let mut forms = vec![field.field.clone(), field.db_column.clone()];
+    if let Some(label) = &field.display_label {
+        forms.push(label.clone());
+    }
+
+    let mut best: f32 = 0.0;
+    for form in forms {
+        let form_norm = graph_norm(&form);
+        if form_norm.len() < 3 {
+            continue;
+        }
+        if graph_norm_phrase_variants(&form_norm)
+            .into_iter()
+            .any(|variant| graph_norm_contains(&context_norm, &variant))
+        {
+            best = best.max(18.0);
+            continue;
+        }
+        let form_tokens = graph_tokens_with_aliases(&form_norm);
+        if form_tokens.len() < 2 {
+            continue;
+        }
+        let overlap = form_tokens.intersection(&context_tokens).count();
+        let coverage = overlap as f32 / form_tokens.len() as f32;
+        if overlap >= 2 && coverage >= 0.5 {
+            best = best.max(coverage * 8.0);
+        }
+    }
+    best
 }
 
 fn graph_sample_value_is_temporal_subject_descriptor(
@@ -23361,6 +23536,9 @@ fn graph_derived_named_location_predicates(
         if graph_named_location_literal_is_noise(&phrase, &lower_question) {
             continue;
         }
+        if graph_phrase_is_measure_field_modifier(nl, &phrase, fields) {
+            continue;
+        }
         let context = graph_mention_context(nl, &phrase).to_ascii_lowercase();
         if !(context.contains(" in ")
             || context.contains(" from ")
@@ -23385,6 +23563,53 @@ fn graph_derived_named_location_predicates(
         }
     }
     out
+}
+
+fn graph_phrase_is_measure_field_modifier(nl: &str, phrase: &str, fields: &[FieldRow]) -> bool {
+    let modifier = graph_norm(phrase);
+    if modifier.len() < 2 {
+        return false;
+    }
+    if graph_phrase_is_assessment_subject_modifier(nl, phrase) {
+        return true;
+    }
+    let context = graph_mention_context(nl, phrase);
+    let context_tokens = graph_tokens_with_aliases(&context);
+    let measure_context = [
+        "score", "scores", "rate", "metric", "amount", "count", "number", "average", "avg",
+        "total", "sum", "mean",
+    ]
+    .iter()
+    .any(|token| context_tokens.contains(*token));
+    if !measure_context {
+        return false;
+    }
+    fields
+        .iter()
+        .any(|field| graph_field_tokens(field).contains(&modifier))
+}
+
+fn graph_phrase_is_assessment_subject_modifier(nl: &str, phrase: &str) -> bool {
+    let raw = phrase.trim_matches('\'');
+    if !(2..=8).contains(&raw.len())
+        || !raw.chars().any(|ch| ch.is_ascii_alphabetic())
+        || !raw
+            .chars()
+            .filter(|ch| ch.is_ascii_alphabetic())
+            .all(|ch| ch.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let context = graph_mention_context(nl, phrase);
+    let context_norm = format!(" {} ", graph_norm(&context));
+    let phrase_norm = graph_norm(phrase);
+    let subject_test = ["test", "exam", "assessment"]
+        .iter()
+        .any(|kind| context_norm.contains(&format!(" {phrase_norm} {kind} ")));
+    let score_context = [" score ", " scores ", " scored "]
+        .iter()
+        .any(|needle| context_norm.contains(needle));
+    subject_test || score_context
 }
 
 fn graph_named_location_literal_is_noise(phrase: &str, lower_question: &str) -> bool {
@@ -25811,14 +26036,15 @@ mod graph_schema_atlas_tests {
         graph_scope_term_is_temporal_subject_descriptor, graph_subject_entity_from_field_entities,
         graph_subject_entity_with_vocab, graph_topk_group_dimension_phrase,
         runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
+        runtime_prompt_high_confidence_value_candidate_missing,
         runtime_prompt_related_predicate_field_ambiguity,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
         semantic_atlas_codebook_lookup, semantic_runtime_atlas,
         semantic_runtime_atlas_with_metrics, BoundPlanPredicateTrace, BoundQueryPlanTrace, Cascade,
-        CascadeRunOptions, GraphQueryPredicate, RuntimeQueryFrameJoinTrace,
+        CascadeRunOptions, GraphQueryPredicate, IntentFrameTrace, RuntimeQueryFrameJoinTrace,
         RuntimeQueryFrameOrderTrace, RuntimeQueryFramePredicateTrace,
         RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace, RuntimeSemanticAtlas,
-        SemanticAtlasCodebookInput, SemanticAtlasCodebookKind,
+        SemanticAtlasCodebookCandidate, SemanticAtlasCodebookInput, SemanticAtlasCodebookKind,
     };
     use semsql_graph::read::{
         EntityRow, FieldRow, MetricDefinitionRow, RelationshipRow, SampleValueRow, VocabularyEntry,
@@ -26824,6 +27050,22 @@ mod graph_schema_atlas_tests {
         assert!(!runtime_prompt_related_predicate_field_ambiguity(
             question,
             &stronger_plan,
+            &atlas
+        ));
+
+        let field_scoped_plan = BoundQueryPlanTrace {
+            predicates: vec![BoundPlanPredicateTrace {
+                field: "schools.fundingtype".to_string(),
+                operator: "=".to_string(),
+                value: "Directly funded".to_string(),
+                backed_by_atlas: true,
+                evidence: vec!["scope_predicate_vocabulary".to_string()],
+            }],
+            ..BoundQueryPlanTrace::default()
+        };
+        assert!(!runtime_prompt_related_predicate_field_ambiguity(
+            question,
+            &field_scoped_plan,
             &atlas
         ));
     }
@@ -34214,6 +34456,213 @@ mod graph_schema_atlas_tests {
             ),
             "{trace:?}"
         );
+    }
+
+    #[test]
+    fn graph_query_frame_routes_count_with_related_metric_threshold_and_scope_value() {
+        let entities = vec![entity_row("core_records"), entity_row("score_facts")];
+        let fields = vec![
+            typed_field_row("core_records", "id", "INTEGER"),
+            labeled_field_row("core_records", "virtual_state", "TEXT", "Delivery Mode"),
+            typed_field_row("core_records", "county_code", "TEXT"),
+            typed_field_row("score_facts", "core_record_id", "INTEGER"),
+            labeled_field_row(
+                "score_facts",
+                "avg_math_score",
+                "REAL",
+                "Average Score in Math",
+            ),
+            labeled_field_row(
+                "score_facts",
+                "num_ge_1500",
+                "INTEGER",
+                "Number of Test Takers Whose Total Scores Are Greater or Equal to 1500",
+            ),
+        ];
+        let relationships = vec![relationship_row(
+            "score_facts",
+            "core_record_id",
+            "core_records",
+        )];
+        let samples = vec![sample_row("core_records.virtual_state", &["F", "T"])];
+        let vocabulary = vec![scope_vocab_entry(
+            "exclusively virtual",
+            "core_records.virtual_state",
+            "F",
+        )];
+        let query = "How many core records with an average score in Math greater than 400 in the SAT test are exclusively virtual?";
+        let trace = graph_query_frame_trace_with_vocab(
+            query,
+            &entities,
+            &fields,
+            &relationships,
+            &samples,
+            &vocabulary,
+        );
+
+        assert!(trace.routed, "{trace:?}");
+        assert_eq!(trace.source, "runtime_graph_query_frame", "{trace:?}");
+        assert_eq!(
+            trace
+                .projection
+                .as_ref()
+                .map(|projection| projection.expression.as_str()),
+            Some("COUNT(*)"),
+            "{trace:?}"
+        );
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "score_facts.avg_math_score"
+                    && predicate.operator == ">"
+                    && predicate.value == "400"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "core_records.virtual_state"
+                    && predicate.operator == "="
+                    && predicate.value == "F"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            !trace
+                .predicates
+                .iter()
+                .any(|predicate| matches!(predicate.value.as_str(), "Math" | "SAT")),
+            "{trace:?}"
+        );
+        assert!(
+            graph_runtime_query_frame_final_sql_allowed_with_vocab(
+                true,
+                &entities,
+                &fields,
+                &samples,
+                &vocabulary,
+                query,
+                &trace
+            ),
+            "{trace:?}"
+        );
+    }
+
+    #[test]
+    fn bound_query_plan_rejects_missing_high_confidence_value_candidate() {
+        let entities = vec![
+            entity_row("core_records"),
+            entity_row("score_facts"),
+            entity_row("funding_facts"),
+        ];
+        let fields = vec![
+            typed_field_row("core_records", "id", "INTEGER"),
+            typed_field_row("score_facts", "core_record_id", "INTEGER"),
+            labeled_field_row(
+                "score_facts",
+                "avg_math_score",
+                "REAL",
+                "Average Score in Math",
+            ),
+            labeled_field_row(
+                "score_facts",
+                "num_ge_1500",
+                "INTEGER",
+                "Number of Test Takers Whose Total Scores Are Greater or Equal to 1500",
+            ),
+            typed_field_row("funding_facts", "core_record_id", "INTEGER"),
+            labeled_field_row("funding_facts", "funding_type", "TEXT", "Funding Type"),
+        ];
+        let relationships = vec![
+            relationship_row("score_facts", "core_record_id", "core_records"),
+            relationship_row("funding_facts", "core_record_id", "core_records"),
+        ];
+        let samples = vec![
+            sample_row("score_facts.num_ge_1500", &["1"]),
+            sample_row("funding_facts.funding_type", &["Directly funded"]),
+        ];
+        let atlas = semantic_runtime_atlas(&entities, &fields, &relationships, &samples, &[]);
+        let question = "Among core records with the average score in Math over 560, how many are directly funded?";
+        let trace = RuntimeQueryFrameTrace {
+            schema_version: 1,
+            source: "runtime_graph_query_frame".to_string(),
+            question: question.to_string(),
+            routed: true,
+            used_for_final_sql: false,
+            route_reason: "routed_generic".to_string(),
+            sql: Some("SELECT COUNT(*) FROM score_facts".to_string()),
+            projection: Some(RuntimeQueryFrameProjectionTrace {
+                entity: "core_records".to_string(),
+                field: None,
+                fields: Vec::new(),
+                expression: "COUNT(*)".to_string(),
+            }),
+            predicates: vec![
+                RuntimeQueryFramePredicateTrace {
+                    field: "score_facts.num_ge_1500".to_string(),
+                    operator: "=".to_string(),
+                    value: "1".to_string(),
+                },
+                RuntimeQueryFramePredicateTrace {
+                    field: "score_facts.avg_math_score".to_string(),
+                    operator: ">".to_string(),
+                    value: "560".to_string(),
+                },
+            ],
+            required_entities: vec!["core_records".to_string(), "score_facts".to_string()],
+            joins: vec![RuntimeQueryFrameJoinTrace {
+                from_entity: "core_records".to_string(),
+                from_field: "id".to_string(),
+                to_entity: "score_facts".to_string(),
+                to_field: "core_record_id".to_string(),
+            }],
+            order_by: None,
+        };
+        let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+        assert!(
+            intent.codebook_candidates.iter().any(|candidate| {
+                candidate.kind == SemanticAtlasCodebookKind::Value
+                    && candidate.target == "funding_facts.funding_type"
+                    && candidate.value.as_deref() == Some("Directly funded")
+            }),
+            "{intent:?}"
+        );
+        let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
+        assert_eq!(
+            plan.reject_reason.as_deref(),
+            Some("missing_value_candidate"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn missing_value_candidate_gate_allows_more_specific_selected_value() {
+        let question = "list zip codes in Fresno County Office of Education";
+        let plan = BoundQueryPlanTrace {
+            predicates: vec![BoundPlanPredicateTrace {
+                field: "frpm.district_name".to_string(),
+                operator: "=".to_string(),
+                value: "Fresno County Office of Education".to_string(),
+                backed_by_atlas: true,
+                evidence: vec!["sample_value".to_string()],
+            }],
+            ..BoundQueryPlanTrace::default()
+        };
+        let intent = IntentFrameTrace {
+            codebook_candidates: vec![SemanticAtlasCodebookCandidate {
+                kind: SemanticAtlasCodebookKind::Value,
+                target: "schools.doc".to_string(),
+                value: Some("00".to_string()),
+                score: 22.0,
+                matched_alias: "county office of education".to_string(),
+                source: "vocabulary_scope_predicate".to_string(),
+                evidence: vec!["code".to_string(), "display".to_string()],
+            }],
+            ..IntentFrameTrace::default()
+        };
+
+        assert!(!runtime_prompt_high_confidence_value_candidate_missing(
+            question, &plan, &intent
+        ));
     }
 
     #[test]

@@ -58,11 +58,17 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - ranked metric-value requests strip rank words from the output span, bind the
   metric expression, prefer same-base categorical predicates, and filter NULL
   metric ratios before ordering.
+- count queries with descriptive metric filters stay on the count route; local
+  field-label context grounds numeric thresholds such as `average score in
+  Math > 400` without treating `Math`/`SAT` as location values.
+- high-confidence value candidates from samples/dictionaries must be selected
+  or covered by a more specific/lifecycle-equivalent value; otherwise the plan
+  fails closed instead of accepting a partial predicate set.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
-slice after related-field, related-fact, output-span projection, and ranked
-metric-value work is `6/6`, wrong accepted SQL `0`, bails `0`; first20 is
-`6/20`, wrong `0`, bailed `14`. The next root cause is planner-side role
+slice after related-field, related-fact, output-span projection, ranked
+metric-value, and metric-filter count work is `7/7`, wrong accepted SQL `0`,
+bails `0`; first20 is `7/20`, wrong `0`, bailed `13`. The next root cause is planner-side role
 binding for the remaining metric/value/group/order slots using the reusable
 query-time atlas/codebook candidates exposed on `intent_frame`. Numeric
 metric-like scope phrases are filtered out of value aliases, so phrases such as
