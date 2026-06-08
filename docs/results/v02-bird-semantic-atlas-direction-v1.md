@@ -1,5 +1,5 @@
 # v0.2 BIRD SemanticAtlas Direction
-Date: 2026-06-07. Current direction note; numbers live in
+Date: 2026-06-08. Current direction note; numbers live in
 [v02-evidence-ledger.md](v02-evidence-ledger.md).
 
 ## Decision
@@ -38,7 +38,14 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - date-role scoring prefers `OpenDate`/start fields for opened/created prompts;
 - scope predicate matching handles field-scoped variants such as
   `direct charter-funded` -> `directly funded`.
+- projection intent now separates requested output fields from predicate-only
+  fields, so `phone numbers ... opened after ...` projects phone while using
+  the date only as a filter.
+- related predicate fields with stronger label/value evidence now fail closed
+  instead of accepting a weaker same-table shortcut.
 
-The description-aware first50 checkpoint stayed at `3/50` with accepted wrong
-SQL `0`, so the next root cause is join/table selection and projection pruning
-over available atlas evidence, not missing value aliases.
+The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
+slice after the projection fix is `3/4`, wrong accepted SQL `0`, with one
+intentional `ambiguous_related_predicate_field` bail. The next root cause is
+join/table selection over available atlas evidence, not missing value aliases.
+Also treat cold graph load/startup latency as a production-readiness blocker.

@@ -2820,6 +2820,9 @@ fn runtime_bound_plan_semantic_reject_reason(
     if runtime_prompt_explicit_numeric_predicate_field_missing(nl, plan, atlas) {
         return Some("missing_explicit_predicate_field".to_string());
     }
+    if runtime_prompt_related_predicate_field_ambiguity(nl, plan, atlas) {
+        return Some("ambiguous_related_predicate_field".to_string());
+    }
     if runtime_prompt_subject_entity_mismatch(nl, trace, atlas) {
         return Some("subject_entity_mismatch".to_string());
     }
@@ -3849,6 +3852,108 @@ fn runtime_entity_is_projection_subject(projected: &str, mentioned: &str) -> boo
     projected.eq_ignore_ascii_case(mentioned) || runtime_entities_overlap(projected, mentioned)
 }
 
+fn runtime_prompt_related_predicate_field_ambiguity(
+    nl: &str,
+    plan: &BoundQueryPlanTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    plan.predicates.iter().any(|predicate| {
+        if !matches!(predicate.operator.as_str(), "=" | "in") {
+            return false;
+        }
+        let Some(selected) = atlas.field(&predicate.field) else {
+            return false;
+        };
+        if graph_field_looks_date_like(selected) {
+            return false;
+        }
+        let selected_score = runtime_predicate_field_label_score(nl, selected, atlas);
+        atlas.fields.values().any(|candidate| {
+            if candidate
+                .canonical()
+                .eq_ignore_ascii_case(&selected.canonical())
+                || !graph_entities_are_related(
+                    &selected.entity,
+                    &candidate.entity,
+                    &atlas.relationships,
+                )
+                || graph_field_looks_date_like(candidate) != graph_field_looks_date_like(selected)
+                || !runtime_field_has_predicate_value_evidence(candidate, predicate, atlas)
+            {
+                return false;
+            }
+            let candidate_score = runtime_predicate_field_label_score(nl, candidate, atlas);
+            candidate_score >= selected_score + 2
+        })
+    })
+}
+
+fn runtime_predicate_field_label_score(
+    nl: &str,
+    field: &FieldRow,
+    atlas: &RuntimeSemanticAtlas,
+) -> i32 {
+    let nl_norm = graph_norm(nl);
+    let q_tokens = graph_schema_match_tokens(nl);
+    let entity_tokens = graph_entity_tokens_with_vocab(&field.entity, &atlas.vocabulary);
+    let mut score = 0;
+    for form in graph_field_display_forms_with_vocab(field, &atlas.vocabulary) {
+        let form_norm = graph_norm(&form);
+        if form_norm.len() < 2 {
+            continue;
+        }
+        let mut tokens = graph_name_tokens(&form_norm);
+        tokens.retain(|token| {
+            !entity_tokens.contains(token)
+                && !matches!(
+                    token.as_str(),
+                    "date" | "time" | "on" | "at" | "before" | "after" | "from" | "to"
+                )
+        });
+        score += tokens.intersection(&q_tokens).count() as i32 * 2;
+        if form_norm.len() >= 4 && graph_norm_contains(&nl_norm, &form_norm) {
+            score += 6;
+        }
+    }
+    score
+}
+
+fn runtime_field_has_predicate_value_evidence(
+    field: &FieldRow,
+    predicate: &BoundPlanPredicateTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    predicate.value.split('|').map(str::trim).all(|value| {
+        if value.is_empty() {
+            return true;
+        }
+        let target = graph_norm(value.trim_matches('\''));
+        if target.is_empty() {
+            return false;
+        }
+        let sample_match = atlas
+            .sample_values
+            .get(&field.canonical().to_ascii_lowercase())
+            .is_some_and(|row| {
+                !row.pii_redacted
+                    && row
+                        .examples
+                        .iter()
+                        .any(|sample| graph_norm(sample) == target)
+            });
+        if sample_match {
+            return true;
+        }
+        graph_literal_compatible_with_field("", value, field)
+            || atlas.vocabulary.iter().any(|entry| {
+                entry
+                    .canonical_value
+                    .eq_ignore_ascii_case(&field.canonical())
+                    && graph_norm(&entry.term) == target
+            })
+    })
+}
+
 fn runtime_prompt_subject_entity_mismatch(
     nl: &str,
     trace: &RuntimeQueryFrameTrace,
@@ -4127,6 +4232,13 @@ fn runtime_term_is_predicate_context(
         };
         if !runtime_term_matches_field(term, &term_tokens, field, atlas) {
             return false;
+        }
+        if matches!(
+            predicate.operator.as_str(),
+            "range" | "<" | "<=" | ">" | ">="
+        ) || graph_field_looks_date_like(field)
+        {
+            return true;
         }
         graph_predicate_value_norms(&predicate.value)
             .into_iter()
@@ -14907,6 +15019,15 @@ fn graph_query_projection(
             if let Some(field) =
                 graph_default_display_field_for_entity_with_vocab(&entity, fields, vocabulary)
             {
+                let field = graph_explicit_singular_projection_field(
+                    nl,
+                    &entity,
+                    fields,
+                    relationships,
+                    predicates,
+                    vocabulary,
+                )
+                .unwrap_or(field);
                 let mut projection_fields = graph_requested_projection_fields(
                     nl,
                     field,
@@ -14964,6 +15085,15 @@ fn graph_query_projection(
                 if let Some(field) =
                     graph_default_display_field_for_entity_with_vocab(&entity, fields, vocabulary)
                 {
+                    let field = graph_explicit_singular_projection_field(
+                        nl,
+                        &entity,
+                        fields,
+                        relationships,
+                        predicates,
+                        vocabulary,
+                    )
+                    .unwrap_or(field);
                     let mut projection_fields = graph_requested_projection_fields(
                         nl,
                         field,
@@ -15227,6 +15357,91 @@ fn graph_projection_focus_requests_display(tokens: &HashSet<String>) -> bool {
     .any(|token| tokens.contains(*token))
 }
 
+fn graph_explicit_singular_projection_field<'a>(
+    nl: &str,
+    subject_entity: &str,
+    fields: &'a [FieldRow],
+    relationships: &[RelationshipRow],
+    predicates: &[GraphQueryPredicate],
+    vocabulary: &[VocabularyEntry],
+) -> Option<&'a FieldRow> {
+    if graph_query_requests_multiple_projection(nl) || graph_order_direction_limit(nl).is_some() {
+        return None;
+    }
+    let lower = nl.to_ascii_lowercase();
+    let focus_tokens = graph_projection_focus_tokens(nl);
+    if focus_tokens.is_empty() {
+        return None;
+    }
+    let field_map = graph_field_map(fields);
+    let predicate_fields: HashSet<&str> = predicates
+        .iter()
+        .map(|predicate| predicate.field.as_str())
+        .collect();
+    let predicate_entities: HashSet<String> = predicates
+        .iter()
+        .filter_map(|predicate| field_map.get(&predicate.field))
+        .map(|field| field.entity.clone())
+        .collect();
+    let mut predicate_context_tokens = HashSet::new();
+    for predicate in predicates {
+        if let Some(field) = field_map.get(&predicate.field) {
+            predicate_context_tokens.extend(graph_field_tokens_with_vocab(field, vocabulary));
+        }
+        predicate_context_tokens.extend(graph_name_tokens(&predicate.value));
+    }
+    let mut candidates: Vec<(f32, &FieldRow)> = Vec::new();
+    fields
+        .iter()
+        .filter(|field| !predicate_fields.contains(field.canonical().as_str()))
+        .filter(|field| {
+            (graph_field_looks_display_field(field) || graph_field_looks_numeric(field))
+                && graph_field_allowed_for_projection(nl, field, vocabulary)
+        })
+        .filter(|field| {
+            field.entity.eq_ignore_ascii_case(subject_entity)
+                || predicate_entities.contains(&field.entity)
+                || graph_entities_are_related(subject_entity, &field.entity, relationships)
+                || predicate_entities
+                    .iter()
+                    .any(|entity| graph_entities_are_related(entity, &field.entity, relationships))
+        })
+        .for_each(|field| {
+            let entity_tokens = graph_entity_tokens_with_vocab(&field.entity, vocabulary);
+            let mut field_tokens = graph_field_tokens_with_vocab(field, vocabulary);
+            field_tokens.retain(|token| {
+                !entity_tokens.contains(token)
+                    && !predicate_context_tokens.contains(token)
+                    && !matches!(
+                        token.as_str(),
+                        "date"
+                            | "time"
+                            | "on"
+                            | "at"
+                            | "before"
+                            | "after"
+                            | "since"
+                            | "from"
+                            | "to"
+                    )
+            });
+            let overlap = field_tokens.intersection(&focus_tokens).count() as f32;
+            if overlap == 0.0 {
+                return;
+            }
+            let score = overlap * 3.0
+                + graph_projection_phrase_bonus(&lower, field)
+                + graph_field_vocab_phrase_bonus(nl, field, vocabulary);
+            candidates.push((score, field));
+        });
+    candidates.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.canonical().cmp(&b.1.canonical()))
+    });
+    candidates.into_iter().map(|(_, field)| field).next()
+}
+
 fn graph_requested_projection_fields<'a>(
     nl: &str,
     primary: &'a FieldRow,
@@ -15356,6 +15571,7 @@ fn graph_projection_fields_with_predicate_date_context<'a>(
         .filter(|field| field.entity.eq_ignore_ascii_case(&primary.entity))
         .filter(|field| graph_field_looks_date_like(field))
         .filter(|field| graph_field_context_requested_in_prompt(nl, field, vocabulary))
+        .filter(|field| graph_date_predicate_requested_as_output(nl, field, vocabulary))
         .collect();
     candidates.sort_by_key(|field| field.canonical());
 
@@ -15582,6 +15798,9 @@ fn graph_projection_date_predicate_default_order(
     if !graph_projection_context_date_prompt_with_vocab(nl, &projection.entity, vocabulary) {
         return None;
     }
+    if !graph_date_predicate_default_order_requested(nl) {
+        return None;
+    }
     let mut candidates: Vec<&FieldRow> = predicates
         .iter()
         .filter(|predicate| {
@@ -15619,6 +15838,74 @@ fn graph_field_context_requested_in_prompt(
         )
     });
     !field_tokens.is_empty() && !field_tokens.is_disjoint(&q_tokens)
+}
+
+fn graph_date_predicate_requested_as_output(
+    nl: &str,
+    field: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> bool {
+    if !graph_date_projection_requested(nl, field, vocabulary) {
+        return false;
+    }
+    let lower = format!(" {} ", graph_norm(nl));
+    if [
+        " when ", " date ", " dates ", " time ", " times ", " day ", " days ", " month ",
+        " months ", " year ", " years ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    let requested_terms = runtime_requested_projection_terms(nl);
+    if !requested_terms.is_empty()
+        && graph_projection_field_requested_by_terms_with_vocab(&requested_terms, field, vocabulary)
+    {
+        return true;
+    }
+    let field_tokens = graph_field_tokens_with_vocab(field, vocabulary);
+    let date_role_tokens: HashSet<&str> = ["created", "opened", "closed", "resolved", "captured"]
+        .into_iter()
+        .filter(|token| field_tokens.contains(*token))
+        .collect();
+    if date_role_tokens.is_empty() {
+        return false;
+    }
+    let ordered = graph_ordered_tokens(nl);
+    ordered.windows(2).any(|window| {
+        let first = window.first().map(String::as_str);
+        let second = window.get(1).map(String::as_str);
+        matches!(second, Some("date" | "time" | "day"))
+            && first.is_some_and(|token| {
+                date_role_tokens.contains(token)
+                    || (token == "open" && date_role_tokens.contains("opened"))
+                    || (token == "close" && date_role_tokens.contains("closed"))
+                    || (token == "create" && date_role_tokens.contains("created"))
+                    || (token == "resolve" && date_role_tokens.contains("resolved"))
+                    || (token == "capture" && date_role_tokens.contains("captured"))
+            })
+    })
+}
+
+fn graph_date_predicate_default_order_requested(nl: &str) -> bool {
+    let lower = format!(" {} ", nl.trim().to_ascii_lowercase().replace('\n', " "));
+    [
+        " earliest ",
+        " latest ",
+        " oldest ",
+        " newest ",
+        " recent ",
+        " most recent ",
+        " first ",
+        " last ",
+        " order by ",
+        " sort by ",
+        " ordered by ",
+        " sorted by ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn graph_projection_context_date_prompt(nl: &str, entity: &str) -> bool {
@@ -24537,11 +24824,12 @@ mod graph_schema_atlas_tests {
         graph_scope_term_is_temporal_subject_descriptor, graph_subject_entity_from_field_entities,
         graph_subject_entity_with_vocab, graph_topk_group_dimension_phrase,
         runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
+        runtime_prompt_related_predicate_field_ambiguity,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
         semantic_runtime_atlas, semantic_runtime_atlas_with_metrics, Cascade, CascadeRunOptions,
-        GraphQueryPredicate, RuntimeQueryFrameJoinTrace, RuntimeQueryFrameOrderTrace,
-        RuntimeQueryFramePredicateTrace, RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace,
-        RuntimeSemanticAtlas,
+        BoundPlanPredicateTrace, BoundQueryPlanTrace, GraphQueryPredicate,
+        RuntimeQueryFrameJoinTrace, RuntimeQueryFrameOrderTrace, RuntimeQueryFramePredicateTrace,
+        RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace, RuntimeSemanticAtlas,
     };
     use semsql_graph::read::{
         EntityRow, FieldRow, MetricDefinitionRow, RelationshipRow, SampleValueRow, VocabularyEntry,
@@ -25242,11 +25530,117 @@ mod graph_schema_atlas_tests {
                 .any(|predicate| predicate.field == "schools.charter" && predicate.value == "1"),
             "{trace:?}"
         );
+        assert_eq!(
+            trace
+                .projection
+                .as_ref()
+                .map(|projection| projection.fields.clone())
+                .unwrap_or_default(),
+            vec!["schools.phone".to_string()],
+            "{trace:?}"
+        );
+        assert!(
+            trace.order_by.is_none(),
+            "date predicate should not become an implicit sort key without recency/sort intent: {trace:?}"
+        );
 
         let atlas = semantic_runtime_atlas(&entities, &fields, &[], &[], &vocabulary);
         let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
         let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
         assert!(plan.valid, "{plan:?}");
+
+        let date_question = "show open date of direct charter-funded schools opened after 2000/1/1";
+        let date_trace = graph_query_frame_trace_with_vocab(
+            date_question,
+            &entities,
+            &fields,
+            &[],
+            &[],
+            &vocabulary,
+        );
+        assert!(date_trace.routed, "{date_trace:?}");
+        assert!(
+            date_trace
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection
+                    .fields
+                    .iter()
+                    .any(|field| field == "schools.opendate")),
+            "{date_trace:?}"
+        );
+    }
+
+    #[test]
+    fn bound_query_plan_rejects_weaker_related_predicate_field_binding() {
+        let entities = vec![entity_row("schools"), entity_row("frpm")];
+        let fields = vec![
+            typed_field_row("schools", "cdscode", "TEXT"),
+            field_row("schools", "phone"),
+            typed_field_row("schools", "charter", "INTEGER"),
+            field_row("schools", "fundingtype"),
+            typed_field_row("frpm", "cdscode", "TEXT"),
+            labeled_field_row(
+                "frpm",
+                "charter_school_y_n",
+                "INTEGER",
+                "Charter School (Y/N)",
+            ),
+            labeled_field_row(
+                "frpm",
+                "charter_funding_type",
+                "TEXT",
+                "Charter Funding Type",
+            ),
+        ];
+        let relationships = vec![relationship_row("frpm", "cdscode", "schools")];
+        let samples = vec![
+            sample_row(
+                "schools.fundingtype",
+                &["Directly funded", "Locally funded"],
+            ),
+            sample_row(
+                "frpm.charter_funding_type",
+                &["Directly funded", "Locally funded"],
+            ),
+            sample_row("schools.charter", &["0", "1"]),
+            sample_row("frpm.charter_school_y_n", &["0", "1"]),
+        ];
+        let atlas = semantic_runtime_atlas(&entities, &fields, &relationships, &samples, &[]);
+        let question =
+            "Please list the phone numbers of the direct charter-funded schools opened after 2000/1/1.";
+
+        let weaker_plan = BoundQueryPlanTrace {
+            predicates: vec![BoundPlanPredicateTrace {
+                field: "schools.fundingtype".to_string(),
+                operator: "=".to_string(),
+                value: "Directly funded".to_string(),
+                backed_by_atlas: true,
+                evidence: vec!["sample_value".to_string()],
+            }],
+            ..BoundQueryPlanTrace::default()
+        };
+        assert!(runtime_prompt_related_predicate_field_ambiguity(
+            question,
+            &weaker_plan,
+            &atlas
+        ));
+
+        let stronger_plan = BoundQueryPlanTrace {
+            predicates: vec![BoundPlanPredicateTrace {
+                field: "frpm.charter_funding_type".to_string(),
+                operator: "=".to_string(),
+                value: "Directly funded".to_string(),
+                backed_by_atlas: true,
+                evidence: vec!["sample_value".to_string()],
+            }],
+            ..BoundQueryPlanTrace::default()
+        };
+        assert!(!runtime_prompt_related_predicate_field_ambiguity(
+            question,
+            &stronger_plan,
+            &atlas
+        ));
     }
 
     #[test]
@@ -29367,7 +29761,7 @@ mod graph_schema_atlas_tests {
             projection
                 .fields
                 .iter()
-                .any(|field| field == "accounts.renewal_date"),
+                .all(|field| field != "accounts.renewal_date"),
             "{trace:?}"
         );
         let sql = trace.sql.as_deref().unwrap_or_default();
@@ -29377,8 +29771,8 @@ mod graph_schema_atlas_tests {
             "{sql}"
         );
         assert!(
-            sql.contains("ORDER BY \"accounts\".\"renewal_date\" ASC"),
-            "{sql}"
+            trace.order_by.is_none(),
+            "filter-only renewal date should not become an implicit sort key: {trace:?}"
         );
         assert!(
             graph_runtime_query_frame_final_sql_allowed(
@@ -29620,7 +30014,7 @@ mod graph_schema_atlas_tests {
     }
 
     #[test]
-    fn semantic_alias_renewal_intersection_projects_requested_date_alias() {
+    fn semantic_alias_renewal_intersection_treats_date_alias_as_filter() {
         let entities = ["organizations", "support_cases"]
             .into_iter()
             .map(entity_row)
@@ -29679,14 +30073,12 @@ mod graph_schema_atlas_tests {
             projection
                 .fields
                 .iter()
-                .any(|field| field == "organizations.renewal_due_on"),
+                .all(|field| field != "organizations.renewal_due_on"),
             "{trace:?}"
         );
         assert!(
-            trace.order_by.as_ref().is_some_and(|order| {
-                order.field == "organizations.renewal_due_on" && order.direction == "ASC"
-            }),
-            "{trace:?}"
+            trace.order_by.is_none(),
+            "filter-only renewal date should not become an implicit sort key: {trace:?}"
         );
         assert!(
             graph_runtime_query_frame_final_sql_allowed_with_vocab(
@@ -29705,6 +30097,27 @@ mod graph_schema_atlas_tests {
         let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
         let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
         assert!(plan.valid, "{plan:?}");
+
+        let date_question = "Show renewal date for customers with open severity 1 tickets";
+        let date_trace = graph_query_frame_trace_with_vocab(
+            date_question,
+            &entities,
+            &fields,
+            &relationships,
+            &samples,
+            &vocabulary,
+        );
+        assert!(date_trace.routed, "{date_trace:?}");
+        assert!(
+            date_trace
+                .projection
+                .as_ref()
+                .is_some_and(|projection| projection
+                    .fields
+                    .iter()
+                    .any(|field| field == "organizations.renewal_due_on")),
+            "{date_trace:?}"
+        );
     }
 
     #[test]
@@ -29776,14 +30189,19 @@ mod graph_schema_atlas_tests {
             projection
                 .fields
                 .iter()
-                .any(|field| field == "t_zephyr_03.c_uplink_11"),
+                .any(|field| field == "t_zephyr_03.c_shard_02"),
             "{trace:?}"
         );
         assert!(
-            trace.order_by.as_ref().is_some_and(|order| {
-                order.field == "t_zephyr_03.c_uplink_11" && order.direction == "ASC"
-            }),
+            projection
+                .fields
+                .iter()
+                .all(|field| field != "t_zephyr_03.c_uplink_11"),
             "{trace:?}"
+        );
+        assert!(
+            trace.order_by.is_none(),
+            "filter-only renewal date should not become an implicit sort key: {trace:?}"
         );
     }
 
@@ -30995,7 +31413,8 @@ mod graph_schema_atlas_tests {
                 .projection
                 .as_ref()
                 .and_then(|p| p.field.as_deref()),
-            Some("sales.id")
+            Some("sales.id"),
+            "{date_lookup:?}"
         );
         assert!(date_lookup
             .predicates
