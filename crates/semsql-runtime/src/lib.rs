@@ -4696,6 +4696,93 @@ fn runtime_requested_projection_terms(nl: &str) -> Vec<String> {
     out
 }
 
+fn runtime_explicit_projection_terms(nl: &str) -> Vec<String> {
+    let mut out = runtime_requested_projection_terms(nl);
+    out.extend(runtime_command_projection_terms(nl));
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn runtime_command_projection_terms(nl: &str) -> Vec<String> {
+    let cleaned = graph_norm(&graph_text_without_quoted_phrases(nl));
+    let mut lower = cleaned.as_str();
+    for prefix in ["please ", "kindly ", "can you ", "could you "] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            lower = rest;
+            break;
+        }
+    }
+    let Some(tail) = [
+        "show me ", "show ", "list me ", "list ", "display ", "give me ", "give ", "provide ",
+    ]
+    .iter()
+    .find_map(|prefix| lower.strip_prefix(prefix)) else {
+        return Vec::new();
+    };
+    let mut phrase = tail.trim();
+    for article in [
+        "the ", "all ", "their ", "its ", "a ", "an ", "each ", "every ",
+    ] {
+        if let Some(rest) = phrase.strip_prefix(article) {
+            phrase = rest.trim_start();
+            break;
+        }
+    }
+    let end = runtime_command_projection_phrase_end(phrase);
+    let phrase = phrase[..end].trim();
+    if phrase.is_empty() || runtime_projection_term_is_filter_or_order_phrase(phrase) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for part in phrase.split([',', '/', '&']) {
+        for subpart in part.split(" and ") {
+            let term = subpart
+                .trim()
+                .trim_start_matches("the ")
+                .trim_start_matches("an ")
+                .trim_start_matches("a ");
+            if term.is_empty() || runtime_projection_term_is_filter_or_order_phrase(term) {
+                continue;
+            }
+            out.push(term.to_string());
+        }
+    }
+    out
+}
+
+fn runtime_command_projection_phrase_end(phrase: &str) -> usize {
+    let mut end = phrase.len();
+    for marker in [
+        " of ",
+        " for ",
+        " from ",
+        " where ",
+        " that ",
+        " which ",
+        " whose ",
+        " with ",
+        " by ",
+        " in ",
+        " after ",
+        " before ",
+        " since ",
+        " opened ",
+        " closed ",
+        " created ",
+        " signed ",
+        " renewing ",
+        " ordered ",
+        " ranked ",
+        " based on ",
+    ] {
+        if let Some(offset) = phrase.find(marker) {
+            end = end.min(offset);
+        }
+    }
+    end
+}
+
 fn runtime_projection_term_is_filter_or_order_phrase(term: &str) -> bool {
     [
         "top ",
@@ -14549,6 +14636,72 @@ fn graph_projection_field_requested_by_terms_with_vocab(
     })
 }
 
+fn graph_projection_explicit_term_score(
+    terms: &[String],
+    field: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> f32 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let mut aliases = graph_field_display_forms_with_vocab(field, vocabulary);
+    aliases.extend(semantic_field_aliases(field, vocabulary));
+    aliases.sort();
+    aliases.dedup();
+    let mut best: f32 = 0.0;
+    for term in terms {
+        let term_norm = graph_norm(term);
+        if term_norm.len() < 2 {
+            continue;
+        }
+        let term_tokens = graph_name_tokens(&term_norm);
+        let term_words = graph_singular_norm_words(&term_norm);
+        for alias in &aliases {
+            let alias_norm = graph_norm(alias);
+            if alias_norm.len() < 2 || graph_projection_order_stopword(&alias_norm) {
+                continue;
+            }
+            let alias_tokens = graph_name_tokens(&alias_norm);
+            if alias_tokens.is_empty() {
+                continue;
+            }
+            let score = if term_norm == alias_norm {
+                12.0
+            } else if graph_singular_words_end_with(&term_words, &alias_norm) {
+                11.0
+            } else if alias_tokens.len() > 1 && graph_norm_contains(&term_norm, &alias_norm) {
+                9.0
+            } else if alias_tokens.len() > 1
+                && alias_tokens.iter().all(|token| term_tokens.contains(token))
+            {
+                6.0
+            } else {
+                0.0
+            };
+            best = best.max(score);
+        }
+    }
+    best
+}
+
+fn graph_singular_norm_words(text: &str) -> Vec<String> {
+    graph_norm(text)
+        .split_whitespace()
+        .map(|word| {
+            graph_simple_singular_form(word)
+                .unwrap_or_else(|| word.to_string())
+                .to_ascii_lowercase()
+        })
+        .collect()
+}
+
+fn graph_singular_words_end_with(term_words: &[String], alias: &str) -> bool {
+    let alias_words = graph_singular_norm_words(alias);
+    !alias_words.is_empty()
+        && term_words.len() >= alias_words.len()
+        && term_words[term_words.len() - alias_words.len()..] == alias_words
+}
+
 fn graph_date_projection_requested(
     nl: &str,
     field: &FieldRow,
@@ -15895,6 +16048,7 @@ fn graph_explicit_singular_projection_field<'a>(
     if focus_tokens.is_empty() {
         return None;
     }
+    let explicit_terms = runtime_explicit_projection_terms(nl);
     let field_map = graph_field_map(fields);
     let predicate_fields: HashSet<&str> = predicates
         .iter()
@@ -15948,10 +16102,13 @@ fn graph_explicit_singular_projection_field<'a>(
                     )
             });
             let overlap = field_tokens.intersection(&focus_tokens).count() as f32;
-            if overlap == 0.0 {
+            let explicit_score =
+                graph_projection_explicit_term_score(&explicit_terms, field, vocabulary);
+            if overlap == 0.0 && explicit_score == 0.0 {
                 return;
             }
             let score = overlap * 3.0
+                + explicit_score
                 + graph_projection_phrase_bonus(&lower, field)
                 + graph_field_vocab_phrase_bonus(nl, field, vocabulary);
             candidates.push((score, field));
@@ -15976,7 +16133,7 @@ fn graph_requested_projection_fields<'a>(
     if !graph_query_requests_multiple_projection(nl) {
         return out;
     }
-    let requested_terms = runtime_requested_projection_terms(nl);
+    let requested_terms = runtime_explicit_projection_terms(nl);
     let projection_text = if requested_terms.is_empty() {
         nl.to_string()
     } else {
@@ -25934,6 +26091,69 @@ mod graph_schema_atlas_tests {
             &field,
             &vocabulary,
         ));
+    }
+
+    #[test]
+    fn runtime_query_frame_uses_projection_alias_span_without_scope_field_leak() {
+        let entities = vec![entity_row("customers"), entity_row("customer_flags")];
+        let fields = vec![
+            typed_field_row("customers", "id", "INTEGER"),
+            labeled_field_row("customers", "c_name", "TEXT", "Customer Name"),
+            typed_field_row("customers", "c_postal", "TEXT"),
+            typed_field_row("customer_flags", "id", "INTEGER"),
+            typed_field_row("customer_flags", "customer_id", "INTEGER"),
+            labeled_field_row(
+                "customer_flags",
+                "priority_customer",
+                "INTEGER",
+                "Priority Customer",
+            ),
+        ];
+        let relationships = vec![relationship_row(
+            "customer_flags",
+            "customer_id",
+            "customers",
+        )];
+        let samples = vec![sample_row("customer_flags.priority_customer", &["0", "1"])];
+        let vocabulary = vec![
+            vocab_entry("field", "postal code", "customers.c_postal"),
+            scope_vocab_entry("priority", "customer_flags.priority_customer", "1"),
+        ];
+        let question = "Please list the postal codes of priority customers.";
+        let trace = graph_query_frame_trace_with_vocab(
+            question,
+            &entities,
+            &fields,
+            &relationships,
+            &samples,
+            &vocabulary,
+        );
+
+        assert!(trace.routed, "{trace:?}");
+        assert_eq!(
+            trace
+                .projection
+                .as_ref()
+                .map(|projection| projection.fields.clone())
+                .unwrap_or_default(),
+            vec!["customers.c_postal".to_string()],
+            "{trace:?}"
+        );
+        assert!(
+            trace.predicates.iter().any(|predicate| {
+                predicate.field == "customer_flags.priority_customer" && predicate.value == "1"
+            }),
+            "{trace:?}"
+        );
+        assert!(
+            trace.projection.as_ref().is_none_or(|projection| {
+                !projection
+                    .fields
+                    .iter()
+                    .any(|field| field == "customer_flags.priority_customer")
+            }),
+            "{trace:?}"
+        );
     }
 
     #[test]

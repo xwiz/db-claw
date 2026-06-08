@@ -52,14 +52,17 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 - related fact-table metrics are accepted when the prompt names a related
   dimension entity but the atlas proves all grounded measure/filter evidence
   belongs on the fact table.
+- projection aliases are now consumed only from explicit output spans such as
+  `list/show ... of/for/where`, so filter phrases do not promote predicate
+  fields into the SELECT list.
 
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
-slice after related-field and related-fact promotion is `5/5`, wrong accepted
-SQL `0`, bails `0`; first20 is `5/20`, wrong `0`, bailed `15`. The next root
-cause is not another route patch; it is role-aware consumption of the reusable
-query-time atlas/codebook candidates now exposed on `intent_frame`. Numeric
-metric-like scope phrases are filtered out of value aliases, so phrases such as
-`eligible free rate` surface as metric evidence rather than bogus count-field
-values. A naive projection boost from codebook aliases regressed
-`zip code ... charter schools` to a filter-field projection, so planner use must
-be slot/role-aware.
+slice after related-field, related-fact, and output-span projection work is
+`5/5`, wrong accepted SQL `0`, bails `0`; first20 remains `5/20`, wrong `0`,
+bailed `15`. The next root cause is planner-side role binding for metric/value
+slots using the reusable query-time atlas/codebook candidates now exposed on
+`intent_frame`. Numeric metric-like scope phrases are filtered out of value
+aliases, so phrases such as `eligible free rate` surface as metric evidence
+rather than bogus count-field values. A naive whole-query projection boost once
+regressed `zip code ... charter schools`; current planner use is intentionally
+slot/role-aware.
