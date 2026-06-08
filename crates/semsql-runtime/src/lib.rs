@@ -1671,6 +1671,57 @@ struct RuntimeSemanticAtlas {
     metric_definitions: Vec<MetricDefinitionRow>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Candidate class returned by query-time SemanticAtlas codebook lookup.
+pub enum SemanticAtlasCodebookKind {
+    /// Entity/table-level alias candidate.
+    Entity,
+    /// Field/column-level alias candidate.
+    Field,
+    /// Field-scoped value alias candidate.
+    Value,
+    /// Governed or derived metric candidate.
+    Metric,
+    /// Relationship-backed join-path candidate.
+    JoinPath,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+/// Ranked, provenance-bearing SemanticAtlas candidate for a natural query.
+pub struct SemanticAtlasCodebookCandidate {
+    /// Candidate class.
+    pub kind: SemanticAtlasCodebookKind,
+    /// Canonical target, such as an entity, field, metric name, or join path.
+    pub target: String,
+    /// Optional selected value or field list associated with the target.
+    pub value: Option<String>,
+    /// Ranking score; higher is more relevant within the same query.
+    pub score: f32,
+    /// Alias or phrase that matched the natural-language query.
+    pub matched_alias: String,
+    /// Evidence source, such as `sample_values`, `field_alias`, or relationship kind.
+    pub source: String,
+    /// Additional evidence tags, roles, or provenance hints.
+    pub evidence: Vec<String>,
+}
+
+/// Borrowed graph evidence used by SemanticAtlas codebook lookup.
+pub struct SemanticAtlasCodebookInput<'a> {
+    /// Entity/table rows available to the planner.
+    pub entities: &'a [EntityRow],
+    /// Field/column rows available to the planner.
+    pub fields: &'a [FieldRow],
+    /// Relationship edges available for join-path candidates.
+    pub relationships: &'a [RelationshipRow],
+    /// Bounded non-PII sample values.
+    pub sample_values: &'a [SampleValueRow],
+    /// Field/entity/value vocabulary entries.
+    pub vocabulary: &'a [VocabularyEntry],
+    /// Governed metric definitions.
+    pub metric_definitions: &'a [MetricDefinitionRow],
+}
+
 impl RuntimeSemanticAtlas {
     #[cfg(test)]
     fn from_rows(
@@ -1727,6 +1778,135 @@ impl RuntimeSemanticAtlas {
 
     fn field_from_parts(&self, entity: &str, field: &str) -> Option<&FieldRow> {
         self.field(&format!("{entity}.{field}"))
+    }
+
+    fn lookup_entities(&self, nl: &str, limit: usize) -> Vec<SemanticAtlasCodebookCandidate> {
+        let mut out = Vec::new();
+        for entity in self.entities.values() {
+            for alias in semantic_entity_aliases(entity, &self.vocabulary) {
+                let Some(score) = semantic_codebook_alias_score(nl, &alias, 10.0) else {
+                    continue;
+                };
+                out.push(SemanticAtlasCodebookCandidate {
+                    kind: SemanticAtlasCodebookKind::Entity,
+                    target: entity.canonical_name.clone(),
+                    value: None,
+                    score,
+                    matched_alias: alias,
+                    source: "entity_alias".to_string(),
+                    evidence: vec!["semantic_atlas.entity".to_string()],
+                });
+            }
+        }
+        semantic_codebook_finish(out, limit)
+    }
+
+    fn lookup_fields(&self, nl: &str, limit: usize) -> Vec<SemanticAtlasCodebookCandidate> {
+        let mut out = Vec::new();
+        for field in self.fields.values() {
+            for alias in semantic_field_aliases(field, &self.vocabulary) {
+                let Some(mut score) = semantic_codebook_alias_score(nl, &alias, 9.0) else {
+                    continue;
+                };
+                score += semantic_codebook_field_context_bonus(nl, field);
+                out.push(SemanticAtlasCodebookCandidate {
+                    kind: SemanticAtlasCodebookKind::Field,
+                    target: field.canonical(),
+                    value: None,
+                    score,
+                    matched_alias: alias,
+                    source: "field_alias".to_string(),
+                    evidence: semantic_field_roles(field),
+                });
+            }
+        }
+        semantic_codebook_finish(out, limit)
+    }
+
+    fn lookup_values(&self, nl: &str, limit: usize) -> Vec<SemanticAtlasCodebookCandidate> {
+        let mut out = Vec::new();
+        for value_alias in
+            semantic_value_aliases(&self.fields, &self.sample_values, &self.vocabulary)
+        {
+            let field = self.field(&value_alias.field);
+            for alias in &value_alias.aliases {
+                let Some(mut score) = semantic_codebook_alias_score(nl, alias, 11.0) else {
+                    continue;
+                };
+                if let Some(field) = field {
+                    score += semantic_codebook_field_context_bonus(nl, field);
+                }
+                out.push(SemanticAtlasCodebookCandidate {
+                    kind: SemanticAtlasCodebookKind::Value,
+                    target: value_alias.field.clone(),
+                    value: Some(value_alias.value.clone()),
+                    score,
+                    matched_alias: alias.clone(),
+                    source: value_alias.source.clone(),
+                    evidence: value_alias.field_roles.clone(),
+                });
+            }
+        }
+        semantic_codebook_finish(out, limit)
+    }
+
+    fn lookup_metrics(&self, nl: &str, limit: usize) -> Vec<SemanticAtlasCodebookCandidate> {
+        let mut out = Vec::new();
+        for metric in
+            semantic_metric_candidates(&self.fields, &self.vocabulary, &self.metric_definitions)
+        {
+            for alias in &metric.aliases {
+                let Some(score) = semantic_codebook_alias_score(nl, alias, 12.0) else {
+                    continue;
+                };
+                out.push(SemanticAtlasCodebookCandidate {
+                    kind: SemanticAtlasCodebookKind::Metric,
+                    target: metric.name.clone(),
+                    value: Some(metric.fields.join("|")),
+                    score,
+                    matched_alias: alias.clone(),
+                    source: metric.kind.clone(),
+                    evidence: metric.evidence.clone(),
+                });
+            }
+        }
+        semantic_codebook_finish(out, limit)
+    }
+
+    fn lookup_join_paths(&self, nl: &str, limit: usize) -> Vec<SemanticAtlasCodebookCandidate> {
+        let entity_scores = self
+            .lookup_entities(nl, self.entities.len().max(1))
+            .into_iter()
+            .map(|candidate| (candidate.target.to_ascii_lowercase(), candidate.score))
+            .collect::<HashMap<_, _>>();
+        let mut out = Vec::new();
+        for relationship in &self.relationships {
+            let from_score = entity_scores
+                .get(&relationship.from_entity.to_ascii_lowercase())
+                .copied();
+            let to_score = entity_scores
+                .get(&relationship.to_entity.to_ascii_lowercase())
+                .copied();
+            let (Some(from_score), Some(to_score)) = (from_score, to_score) else {
+                continue;
+            };
+            out.push(SemanticAtlasCodebookCandidate {
+                kind: SemanticAtlasCodebookKind::JoinPath,
+                target: format!("{}->{}", relationship.from_entity, relationship.to_entity),
+                value: Some(format!(
+                    "{}.{}={}.{}",
+                    relationship.from_entity,
+                    relationship.from_field,
+                    relationship.to_entity,
+                    relationship.to_field
+                )),
+                score: from_score + to_score + 2.0,
+                matched_alias: format!("{} {}", relationship.from_entity, relationship.to_entity),
+                source: relationship.kind.clone(),
+                evidence: vec!["semantic_atlas.relationship".to_string()],
+            });
+        }
+        semantic_codebook_finish(out, limit)
     }
 
     fn trace(&self) -> SemanticAtlasTrace {
@@ -1812,6 +1992,153 @@ impl RuntimeSemanticAtlas {
             ),
         }
     }
+}
+
+fn semantic_codebook_alias_score(nl: &str, alias: &str, base: f32) -> Option<f32> {
+    let alias_norm = graph_norm(alias);
+    if alias_norm.len() < 2 {
+        return None;
+    }
+    let alias_tokens = graph_name_tokens(&alias_norm);
+    if alias_tokens.is_empty() {
+        return None;
+    }
+    let nl_norm = graph_norm(nl);
+    if graph_norm_contains(&nl_norm, &alias_norm) {
+        let phrase_bonus = if alias_tokens.len() > 1 { 8.0 } else { 3.0 };
+        return Some(base + phrase_bonus + (alias_norm.len().min(48) as f32 / 12.0));
+    }
+    let q_tokens = graph_schema_match_tokens(nl);
+    let overlap = alias_tokens.intersection(&q_tokens).count();
+    if overlap == 0 || (overlap == 1 && alias_tokens.len() > 2) {
+        return None;
+    }
+    let coverage = overlap as f32 / alias_tokens.len() as f32;
+    Some(base + overlap as f32 * 2.0 + coverage)
+}
+
+fn semantic_codebook_field_context_bonus(nl: &str, field: &FieldRow) -> f32 {
+    let mut score = 0.0;
+    let lower = format!(" {} ", nl.to_ascii_lowercase().replace('\n', " "));
+    let roles = semantic_field_roles(field);
+    if roles.iter().any(|role| role == "date")
+        && [
+            " date ",
+            " when ",
+            " opened ",
+            " created ",
+            " closed ",
+            " yesterday ",
+            " today ",
+            " month ",
+            " year ",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        score += 2.0;
+    }
+    if roles.iter().any(|role| role == "display")
+        && [
+            " name ",
+            " names ",
+            " title ",
+            " address ",
+            " phone ",
+            " email ",
+            " website ",
+            " list ",
+            " show ",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        score += 1.5;
+    }
+    if roles.iter().any(|role| role == "status")
+        && [" status ", " state ", " active ", " inactive ", " closed "]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    {
+        score += 1.5;
+    }
+    if roles.iter().any(|role| role == "numeric")
+        && [
+            " average ",
+            " avg ",
+            " total ",
+            " sum ",
+            " highest ",
+            " lowest ",
+            " over ",
+            " under ",
+            " greater ",
+            " less ",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        score += 1.5;
+    }
+    score
+}
+
+fn semantic_codebook_finish(
+    mut candidates: Vec<SemanticAtlasCodebookCandidate>,
+    limit: usize,
+) -> Vec<SemanticAtlasCodebookCandidate> {
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.target.cmp(&right.target))
+            .then_with(|| left.matched_alias.cmp(&right.matched_alias))
+    });
+    let mut seen = HashSet::new();
+    candidates.retain(|candidate| {
+        seen.insert(format!(
+            "{:?}\u{0}{}\u{0}{}\u{0}{}",
+            candidate.kind,
+            candidate.target,
+            candidate.value.as_deref().unwrap_or_default(),
+            candidate.source
+        ))
+    });
+    candidates.truncate(limit);
+    candidates
+}
+
+/// Return ranked, field-scoped SemanticAtlas/codebook candidates for a query.
+///
+/// The lookup is evidence-only: candidates come from schema aliases,
+/// relationships, bounded non-PII sample values, vocabulary, and governed or
+/// derived metric definitions. It does not use gold SQL, examples, or
+/// benchmark-specific maps.
+pub fn semantic_atlas_codebook_lookup(
+    nl: &str,
+    input: SemanticAtlasCodebookInput<'_>,
+    limit: usize,
+) -> Vec<SemanticAtlasCodebookCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let atlas = RuntimeSemanticAtlas::from_rows_with_metrics(
+        input.entities,
+        input.fields,
+        input.relationships,
+        input.sample_values,
+        input.vocabulary,
+        input.metric_definitions,
+    );
+    let per_kind_limit = limit.max(4);
+    let mut out = Vec::new();
+    out.extend(atlas.lookup_entities(nl, per_kind_limit));
+    out.extend(atlas.lookup_fields(nl, per_kind_limit));
+    out.extend(atlas.lookup_values(nl, per_kind_limit));
+    out.extend(atlas.lookup_metrics(nl, per_kind_limit));
+    out.extend(atlas.lookup_join_paths(nl, per_kind_limit));
+    semantic_codebook_finish(out, limit)
 }
 
 fn semantic_entity_aliases(entity: &EntityRow, vocabulary: &[VocabularyEntry]) -> Vec<String> {
@@ -24997,10 +25324,12 @@ mod graph_schema_atlas_tests {
         runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
         runtime_prompt_related_predicate_field_ambiguity,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
-        semantic_runtime_atlas, semantic_runtime_atlas_with_metrics, BoundPlanPredicateTrace,
-        BoundQueryPlanTrace, Cascade, CascadeRunOptions, GraphQueryPredicate,
-        RuntimeQueryFrameJoinTrace, RuntimeQueryFrameOrderTrace, RuntimeQueryFramePredicateTrace,
+        semantic_atlas_codebook_lookup, semantic_runtime_atlas,
+        semantic_runtime_atlas_with_metrics, BoundPlanPredicateTrace, BoundQueryPlanTrace, Cascade,
+        CascadeRunOptions, GraphQueryPredicate, RuntimeQueryFrameJoinTrace,
+        RuntimeQueryFrameOrderTrace, RuntimeQueryFramePredicateTrace,
         RuntimeQueryFrameProjectionTrace, RuntimeQueryFrameTrace, RuntimeSemanticAtlas,
+        SemanticAtlasCodebookInput, SemanticAtlasCodebookKind,
     };
     use semsql_graph::read::{
         EntityRow, FieldRow, MetricDefinitionRow, RelationshipRow, SampleValueRow, VocabularyEntry,
@@ -25329,6 +25658,112 @@ mod graph_schema_atlas_tests {
                 .iter()
                 .any(|alias| alias.contains("average")),
             "{derived_amount:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_atlas_codebook_lookup_ranks_grounded_candidates() {
+        let (entities, mut fields, relationships, mut samples) = growth_ops_fixture();
+        fields.push(field_row("accounts", "email"));
+        samples.push(sample_row(
+            "accounts.email",
+            &["owner@example.test", "ops@example.test"],
+        ));
+        let vocabulary = vec![
+            scope_vocab_entry("paying customers", "accounts.status", "active"),
+            vocab_entry("field", "invoice revenue", "invoices.amount"),
+        ];
+        let metrics = vec![MetricDefinitionRow {
+            name: "paid_invoice_rate".to_string(),
+            display_label: Some("Paid invoice rate".to_string()),
+            metric_kind: "conditional_rate".to_string(),
+            subject_entity: "invoices".to_string(),
+            numerator_field: "invoices.status".to_string(),
+            numerator_operator: "=".to_string(),
+            numerator_value: "paid".to_string(),
+            numerator_value_kind: "sample_values".to_string(),
+            denominator_field: "invoices.id".to_string(),
+            scale: 100.0,
+            measure_field: None,
+            aggregate: None,
+            distinct_measure: false,
+            required_entities: vec!["invoices".to_string()],
+            aliases: vec!["paid rate".to_string()],
+        }];
+        let atlas = semantic_runtime_atlas_with_metrics(
+            &entities,
+            &fields,
+            &relationships,
+            &samples,
+            &vocabulary,
+            &metrics,
+        );
+        let question = "average invoice revenue for paying customers by region";
+        let combined = semantic_atlas_codebook_lookup(
+            question,
+            SemanticAtlasCodebookInput {
+                entities: &entities,
+                fields: &fields,
+                relationships: &relationships,
+                sample_values: &samples,
+                vocabulary: &vocabulary,
+                metric_definitions: &metrics,
+            },
+            12,
+        );
+        assert!(
+            combined.iter().any(
+                |candidate| candidate.kind == SemanticAtlasCodebookKind::Value
+                    && candidate.target == "accounts.status"
+                    && candidate.value.as_deref() == Some("active")
+            ),
+            "{combined:?}"
+        );
+
+        let entities = atlas.lookup_entities(question, 4);
+        assert!(
+            entities
+                .iter()
+                .any(|candidate| candidate.target == "accounts"),
+            "{entities:?}"
+        );
+        let fields = atlas.lookup_fields(question, 8);
+        assert!(
+            fields
+                .iter()
+                .any(|candidate| candidate.target == "invoices.amount"
+                    && candidate.source == "field_alias"),
+            "{fields:?}"
+        );
+        let values = atlas.lookup_values(question, 8);
+        assert!(
+            values.iter().any(|candidate| {
+                candidate.target == "accounts.status"
+                    && candidate.value.as_deref() == Some("active")
+                    && candidate.source == "vocabulary_scope_predicate"
+            }),
+            "{values:?}"
+        );
+        assert!(
+            values
+                .iter()
+                .all(|candidate| candidate.target != "accounts.email"),
+            "{values:?}"
+        );
+        let metrics = atlas.lookup_metrics("show paid invoice rate", 4);
+        assert!(
+            metrics
+                .iter()
+                .any(|candidate| candidate.target == "paid_invoice_rate"),
+            "{metrics:?}"
+        );
+        let joins = atlas.lookup_join_paths("invoice revenue for accounts", 4);
+        assert!(
+            joins.iter().any(|candidate| {
+                candidate.kind == SemanticAtlasCodebookKind::JoinPath
+                    && candidate.target.eq_ignore_ascii_case("invoices->accounts")
+            }),
+            "{joins:?}"
         );
     }
 

@@ -13,7 +13,7 @@ LLMs may propose typed plans over bounded evidence; direct provider SQL is never
 5. Probe the next real app/schema with the alpha package path for source vocab, metrics, dates, live table-selection evidence, and fail-closed rejects.
 6. Capture unresolved cases as typed fallback packets, not static runtime routes.
 7. Reduce cold graph load/startup latency; current BIRD graph CLI probes can exceed production-friendly timings even when Stage 0a work is tiny.
-8. Add a reusable query-time codebook retrieval API for entities, fields, values, metrics, and join paths before adding more route-specific planner branches.
+8. Use the reusable query-time codebook candidate API role-aware: projection candidates must not be promoted from predicate/filter words, and value candidates must remain field-scoped.
 9. Tighten metric catalogs, active-table ranking, and date/value normalization from private alpha and BIRD stress evidence.
 10. Keep strict production-readiness aggregation green before any wider release.
 

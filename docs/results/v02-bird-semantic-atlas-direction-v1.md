@@ -56,6 +56,8 @@ The runtime now distinguishes these generic evidence cases that BIRD exposed:
 The retained description-aware first50 checkpoint stayed at `3/50`. A targeted
 slice after related-field and related-fact promotion is `5/5`, wrong accepted
 SQL `0`, bails `0`; first20 is `5/20`, wrong `0`, bailed `15`. The next root
-cause is not another route patch; it is a reusable query-time atlas/codebook
-retrieval layer over value dictionaries, field roles, active tables, metric
-candidates, and fast graph loading.
+cause is not another route patch; it is role-aware consumption of the reusable
+query-time atlas/codebook candidate API over value dictionaries, field roles,
+active tables, metric candidates, and fast graph loading. A naive projection
+boost from codebook aliases regressed `zip code ... charter schools` to a
+filter-field projection, so candidate use must be slot/role-aware.
