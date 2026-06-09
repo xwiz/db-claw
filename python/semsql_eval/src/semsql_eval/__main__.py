@@ -6816,6 +6816,7 @@ def _run_llm_resolution_resolve_packet(
     render_out: Path | None = None,
     model: str | None = None,
     dialect: str = "sqlite",
+    clarification_choice: str | None = None,
     execute_sqlite: Path | None = None,
     execute_db_url: str | None = None,
     execution_out: Path | None = None,
@@ -6825,14 +6826,13 @@ def _run_llm_resolution_resolve_packet(
 ) -> dict[str, object]:
     if provider is not None and proposal_json is not None:
         raise click.UsageError("--provider and --proposal-json are mutually exclusive")
-    if provider is None and proposal_json is None:
-        raise click.UsageError("provide either --proposal-json or --provider")
     if execute_sqlite is not None and execute_db_url is not None:
         raise click.UsageError("--execute-sqlite and --execute-db-url are mutually exclusive")
     packet_payload = _read_json_file(packet_json)
     packet = packet_payload.get("packet", packet_payload)
     if not isinstance(packet, dict):
         raise click.ClickException("--packet-json must contain a packet object")
+    packet = _hydrate_packet_schema_card(packet)
 
     provider_called = False
     provider_error: str | None = None
@@ -6844,6 +6844,7 @@ def _run_llm_resolution_resolve_packet(
     )
     proposal_payload: dict[str, Any] | None = None
     selected_source: str | None = None
+    fallback_proposal_source: str | None = None
 
     if proposal_json is not None:
         loaded = _read_json_file(proposal_json)
@@ -6851,6 +6852,7 @@ def _run_llm_resolution_resolve_packet(
             raise click.ClickException("--proposal-json must contain a JSON object")
         proposal_payload = loaded
         selected_source = "typed_proposal"
+        fallback_proposal_source = "typed_proposal"
     elif provider is not None:
         if not provider_readiness["configured"]:
             provider_error = str(provider_readiness["skipped_reason"])
@@ -6868,16 +6870,27 @@ def _run_llm_resolution_resolve_packet(
                 provider_error = str(exc)
         if proposal_payload is not None:
             selected_source = "typed_provider"
+            fallback_proposal_source = "typed_provider"
             if provider_out is not None:
                 provider_out.parent.mkdir(parents=True, exist_ok=True)
                 provider_out.write_text(
                     json.dumps(proposal_payload, indent=2) + "\n",
                     encoding="utf-8",
                 )
+    else:
+        local_proposal = build_runtime_frame_resolution_proposal(packet)
+        if local_proposal is not None:
+            proposal_payload = {
+                "source": "local_runtime_frame_resolution_task",
+                "proposal": local_proposal,
+            }
+            selected_source = "local_runtime_frame_resolution_task"
+            fallback_proposal_source = "local_runtime_frame_resolution_task"
     proposal: dict[str, Any] | None = None
     render_result: dict[str, Any] | None = None
     render_valid: bool | None = None
     render_issue_count: int | None = None
+    render_issues: list[dict[str, object]] | None = None
     render_error: str | None = None
     selected_sql: str | None = None
     result_shape: dict[str, object] | None = None
@@ -6895,9 +6908,15 @@ def _run_llm_resolution_resolve_packet(
                     json.dumps(proposal, indent=2) + "\n",
                     encoding="utf-8",
                 )
-            render_result = render_resolution_proposal(packet, proposal, dialect=dialect)
+            render_result = render_resolution_proposal(
+                packet,
+                proposal,
+                dialect=dialect,
+                clarification_choice=clarification_choice,
+            )
             render_valid = bool(render_result.get("valid"))
             render_issue_count = len(render_result.get("issues", []))
+            render_issues = _summarize_render_issues(render_result.get("issues"))
             rendered_sql = render_result.get("sql")
             if render_valid and isinstance(rendered_sql, str):
                 selected_sql = rendered_sql
@@ -6966,6 +6985,8 @@ def _run_llm_resolution_resolve_packet(
         "provider_call_count": 1 if provider_called else 0,
         "provider_error": provider_error,
         "used_direct_llm_sql": False,
+        "clarification_choice": clarification_choice,
+        "fallback_proposal_source": fallback_proposal_source,
         "status": "selected" if selected_sql else "unresolved",
         "selected_source": selected_source if selected_sql else None,
         "selected_sql": selected_sql,
@@ -6973,6 +6994,10 @@ def _run_llm_resolution_resolve_packet(
         "render_valid": render_valid,
         "render_issue_count": render_issue_count,
         "render_error": render_error,
+        "fallback_render_valid": render_valid,
+        "fallback_render_issue_count": render_issue_count,
+        "fallback_render_issues": render_issues,
+        "fallback_render_error": render_error,
         "execution": execution_result,
         "artifacts": {
             "packet": str(packet_json),
@@ -6982,6 +7007,30 @@ def _run_llm_resolution_resolve_packet(
             "execution": str(execution_out) if execution_out is not None and execution_out.exists() else None,
         },
     }
+
+
+def _hydrate_packet_schema_card(packet: dict[str, Any]) -> dict[str, Any]:
+    schema_card = packet.get("schema_card")
+    if not isinstance(schema_card, dict):
+        return packet
+    entities = schema_card.get("entities")
+    if isinstance(entities, list) and entities:
+        return packet
+    graph_value = schema_card.get("graph")
+    if not isinstance(graph_value, str) or not graph_value:
+        return packet
+    graph_path = Path(graph_value)
+    if not graph_path.exists():
+        return packet
+
+    hydrated = build_schema_card(graph_path, include_samples=False)
+    merged_schema_card = dict(hydrated)
+    for key, value in schema_card.items():
+        if value not in (None, [], {}):
+            merged_schema_card[key] = value
+    hydrated_packet = dict(packet)
+    hydrated_packet["schema_card"] = merged_schema_card
+    return hydrated_packet
 
 
 def _execute_selected_sqlite(
@@ -9248,30 +9297,39 @@ def _run_llm_resolution_fallback_batch(
             question = packet.get("question")
             if not isinstance(question, str) or not question.strip():
                 raise ValueError("packet question is required")
-            graph = Path(str(raw_graph))
             selected_proposal = proposal_path if proposal_path.exists() else None
             clarification_choice = clarification_choices.get(stem)
-            case_summary = _run_llm_resolution_fallback_query(
-                graph=graph,
-                question=question,
-                out_dir=case_out_dir,
-                semsql_bin=semsql_bin,
-                cascade_manifest=cascade_manifest,
-                intent_yaml=intent_yaml,
+            case_out_dir.mkdir(parents=True, exist_ok=True)
+            provider_out = (
+                case_out_dir / f"{provider}.provider.json"
+                if provider != "none"
+                else None
+            )
+            case_summary = _run_llm_resolution_resolve_packet(
+                packet_json=packet_path,
+                proposal_json=selected_proposal,
+                provider=None if provider == "none" else provider,
+                provider_base_url=provider_base_url,
+                provider_api_key_env=provider_api_key_env,
+                provider_out=provider_out,
+                proposal_out=case_out_dir / "proposal.json",
+                render_out=case_out_dir / "render.json",
+                model=model,
                 dialect=dialect,
+                clarification_choice=clarification_choice,
                 execute_sqlite=execute_sqlite,
                 execute_db_url=case_execute_db_url,
+                execution_out=case_out_dir / "execution.json",
                 max_rows=max_rows,
                 retain_execution_rows=retain_execution_rows,
                 exec_timeout_seconds=exec_timeout_seconds,
-                timeout_seconds=timeout_seconds,
+            )
+            case_summary = _adapt_packet_resolution_to_fallback_case(
+                case_summary,
+                graph=str(raw_graph),
+                route_reason=packet.get("route_reason"),
                 include_samples=include_samples,
-                provider=provider,
-                provider_base_url=provider_base_url,
-                provider_api_key_env=provider_api_key_env,
-                proposal_json=selected_proposal,
-                clarification_choice=clarification_choice,
-                model=model,
+                case_out_dir=case_out_dir,
             )
         except (OSError, ValueError, click.ClickException) as exc:
             packet_error = str(exc)
@@ -9334,6 +9392,13 @@ def _run_llm_resolution_fallback_batch(
             if case.get("fallback_proposal_source")
             == "local_runtime_frame_resolution_task"
         ),
+        "local_runtime_frame_selected_count": sum(
+            1
+            for case in cases
+            if case.get("status") == "selected"
+            and case.get("fallback_proposal_source")
+            == "local_runtime_frame_resolution_task"
+        ),
         "provider_call_count": sum(
             cast(int, case["provider_call_count"]) for case in cases
         ),
@@ -9357,6 +9422,52 @@ def _run_llm_resolution_fallback_batch(
         ),
         "cases": cases,
     }
+
+
+def _adapt_packet_resolution_to_fallback_case(
+    summary: dict[str, object],
+    *,
+    graph: str,
+    route_reason: object,
+    include_samples: bool,
+    case_out_dir: Path,
+) -> dict[str, object]:
+    adapted = dict(summary)
+    proposal_source = adapted.get("fallback_proposal_source")
+    if adapted.get("status") == "selected":
+        adapted["selected_source"] = "typed_fallback"
+    adapted.update(
+        {
+            "source": "llm_resolution_fallback_query",
+            "graph": graph,
+            "include_samples": include_samples,
+            "local_routed": False,
+            "local_stage_pinned": "captured_packet",
+            "local_error_detail": None,
+            "local_sql_rejected_reason": route_reason,
+            "local_result_shape": None,
+            "elapsed_seconds": 0.0,
+            "fallback_proposal_source": proposal_source,
+        }
+    )
+    artifacts = dict(cast(dict[str, object], adapted.get("artifacts") or {}))
+    artifacts.update(
+        {
+            "query_frame": None,
+            "openai_request": None,
+            "summary_json": str(case_out_dir / "fallback-query.json"),
+            "summary_markdown": str(case_out_dir / "fallback-query.md"),
+        }
+    )
+    adapted["artifacts"] = artifacts
+    summary_path = case_out_dir / "fallback-query.json"
+    summary_md_path = case_out_dir / "fallback-query.md"
+    summary_path.write_text(json.dumps(adapted, indent=2) + "\n", encoding="utf-8")
+    summary_md_path.write_text(
+        _render_llm_resolution_fallback_query_markdown(adapted),
+        encoding="utf-8",
+    )
+    return adapted
 
 
 def _llm_fallback_batch_case(
@@ -9536,6 +9647,7 @@ def _render_llm_resolution_fallback_batch_markdown(summary: dict[str, object]) -
         f"- local selected: `{summary['local_selected_count']}`",
         f"- typed fallback selected: `{summary['typed_fallback_selected_count']}`",
         f"- local runtime-frame proposals: `{summary.get('local_runtime_frame_proposal_count', 0)}`",
+        f"- local runtime-frame selected: `{summary.get('local_runtime_frame_selected_count', 0)}`",
         f"- provider calls: `{summary['provider_call_count']}`",
         f"- direct LLM SQL used: `{summary['direct_llm_sql_count']}`",
         f"- fallback render valid: `{summary['fallback_render_valid_count']}`",

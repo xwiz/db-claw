@@ -7,7 +7,8 @@ Date: 2026-06-02
 After closing the focused 13-example failure set, a fresh BIRD first-100 run is
 still weak:
 
-- report: `artifacts/results-json/docs-results/v02-bird-first100-after-focused13-v1-report.json`
+- retained source: this summary; the bulky raw JSON was removed during artifact
+  cleanup
 - total: `100`
 - correct: `5`
 - wrong: `81`

@@ -9,6 +9,10 @@ direct SQL generation. The product path is:
 
 `database -> DB-only atlas/codebook -> typed intent -> bound plan -> guarded SQL`.
 
+Materialize the atlas once per database as queryable metadata tables or indexes
+beside the `.semsql` graph. This gives BIRD the same pre-query analysis used for
+customer databases without altering benchmark data.
+
 ## Benchmark Rule
 For BIRD, build the same virtual atlas/codebook a real customer database would
 get from DB-only evidence:
@@ -16,7 +20,9 @@ get from DB-only evidence:
 - table/field names, relationships, types, row counts, and active-table hints;
 - bounded non-PII sample values and code-like value dictionaries;
 - inferred field roles, display fields, metric candidates, and date roles;
-- similarity lookup over entity, field, value, and metric aliases.
+- lexical and similarity lookup over entity, field, value, and metric aliases;
+- provenance, type compatibility, relationship distance, and confidence for
+  every candidate.
 
 Do not use dev gold SQL, per-question examples, or BIRD-specific table-name
 maps to make a case pass.
@@ -33,6 +39,22 @@ user-approved business definitions when available. When the atlas cannot ground
 a value, metric, or join, emit a typed resolution packet for lookup/LLM/clarify.
 Provider output may propose a bounded plan; direct provider SQL remains
 rejected.
+
+## Query-Time Retrieval
+Use a staged linker rather than one global fuzzy table:
+
+1. decompose the question into entity, projection, metric, predicate, grouping,
+   ordering, date, and limit spans;
+2. retrieve candidates independently for each role using exact aliases,
+   normalized tokens, descriptions, bounded values, and semantic similarity;
+3. expand only along proven relationship paths;
+4. score complete bindings for type compatibility, value-field fit, role fit,
+   co-location, and join cost;
+5. render only a complete validated plan; otherwise clarify or send the bounded
+   candidate set to typed fallback.
+
+Similarity is candidate generation, not authority. A fuzzy value hit cannot
+cross fields or invent a metric, relationship, or SQL shape.
 
 ## Current Runtime Step
 The runtime now distinguishes these generic evidence cases that BIRD exposed:
@@ -97,3 +119,9 @@ phrases are filtered out of value aliases, so phrases such as
 values. A naive whole-query projection boost once regressed
 `zip code ... charter schools`; current planner use is intentionally
 slot/role-aware.
+
+The captured-packet batch now resolves packets directly instead of rerunning
+the cascade. On the current three BIRD ambiguity packets it completed in
+`1.5s`: `1/3` selected locally, `2/3` unresolved, `0` provider calls, and `0`
+direct SQL. The unresolved index `8` is a metric/ranking binding failure, not a
+value-alias failure, so adding more lookup synonyms would be the wrong fix.
