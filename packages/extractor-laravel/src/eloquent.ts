@@ -18,10 +18,9 @@
  * Layer assignment: ORM (= 2). Higher than DB schema, lower than i18n /
  * Filament — those still win when they disagree.
  *
- * Relationships (`$this->hasMany(...)`, `belongsTo(...)`, etc.) are
- * emitted as `relationship` fragments by the PHP AST walker; the
- * v0.2 cut is intentionally property-only because relationship methods
- * require expression-level analysis.
+ * Relationship methods (`hasMany`, `belongsTo`, pivots, and morphs) are not
+ * emitted yet. They require expression-level analysis and exact key metadata;
+ * DB foreign keys remain the current relationship authority.
  *
  * The walker also exposes a **class-to-table index** that `filament.ts`
  * consults before falling back to convention pluralisation — this is the

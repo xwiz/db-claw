@@ -7,14 +7,14 @@ LLMs may propose typed plans over bounded evidence; direct provider SQL is never
 
 ## Next Loop
 1. Gate broad evals on accepted-wrong-SQL diagnostics before interpreting accuracy.
-2. Persist a DB-only atlas index per graph: aliases, descriptions, field roles, relationships, bounded values, value dictionaries, metric candidates, date roles, activity hints, provenance, and confidence.
-3. Add hybrid exact/lexical/similarity retrieval per intent role. Similarity proposes candidates; field type, value compatibility, relationship paths, and plan validation decide.
-4. Route missing or ambiguous bindings to bounded lookup/typed LLM proposals, not direct SQL.
-5. Convert fail-closed BIRD/real-schema cases into grounded plans by improving join/table selection, projection intent, fact/dimension metric handling, and filter/output separation over atlas candidates.
-6. Add metric/ranking role binding for top-by-one-measure/project-another, grouped top-k, ordinal ranges, and metric filters with separate projections.
-7. Probe the next real app/schema with the alpha package path for source vocab, metrics, dates, live table-selection evidence, and fail-closed rejects.
-8. Capture unresolved cases as typed fallback packets, not static runtime routes.
-9. Reduce cold graph load/startup latency; current BIRD graph CLI probes can exceed production-friendly timings even when Stage 0a work is tiny.
+2. Make Laravel the reference application-aware integration: exact ORM relationships/keys, scopes, casts, accessors, validation/API resources, Filament filters, and safe report/query-builder shapes.
+3. Add a source-controlled authored semantic contract for approved aliases, virtual fields, metrics, join paths, table rules, and typed plan templates.
+4. Add operational resolution memory with schema/source drift keys and provisional, confirmed, governed, stale, and rejected states.
+5. Persist a DB-profile atlas per graph for raw DB bootstrap: aliases, descriptions, roles, relationships, bounded values, statistics, metrics, dates, activity, provenance, and confidence.
+6. Retrieve candidates per intent role and enumerate complete plans. Similarity proposes candidates; application evidence, type/value compatibility, relationship paths, and validation decide.
+7. Route missing or ambiguous plans to bounded lookup/typed LLM proposals or clarification, never direct SQL.
+8. Evaluate held-out real-app questions with app-aware versus DB-only ablations, then port the contract to Django, Rails, Prisma, and Drizzle.
+9. Keep BIRD as a raw-DB stress test and reduce cold graph load, but do not let it displace application-aware product work.
 10. Keep strict production-readiness aggregation green before any wider release.
 
 ## Backlog

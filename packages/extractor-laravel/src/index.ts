@@ -7,7 +7,8 @@
  *    (highest fidelity for enum labels — explicit UI value mappings).
  *  - Filament `Tables\Columns\TextColumn::make()->label()`.
  *  - Filament Resource `$navigationLabel`, `$modelLabel`, `$pluralModelLabel`.
- *  - Eloquent `$casts`, `$fillable`, relationship methods, global scopes.
+ *  - Eloquent `$casts`, `$fillable`, model aliases, and simple parameterless
+ *    local scopes.
  *  - `lang/*.php`, `lang/**\/*.json` via @semsql/extractor-i18n.
  *  - Blade `<th>label</th>` adjacent to `{{ $model->field }}`.
  *
