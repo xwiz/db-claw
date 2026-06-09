@@ -1,7 +1,6 @@
 # Results Index
 
 Only Start Here docs are live; other Markdown is retained one-run history.
-
 ## Start Here
 | Doc | Role |
 |---|---|
@@ -9,6 +8,7 @@ Only Start Here docs are live; other Markdown is retained one-run history.
 | [v02-evidence-ledger.md](v02-evidence-ledger.md) | regression anchors |
 | [v02-quality-gate.md](v02-quality-gate.md) | release stop rules |
 | [v02-semantic-atlas-completion-plan.md](v02-semantic-atlas-completion-plan.md) | active loop |
+| [v02-app-context-first-direction-v1.md](v02-app-context-first-direction-v1.md) | product direction |
 | [v02-bird-semantic-atlas-direction-v1.md](v02-bird-semantic-atlas-direction-v1.md) | benchmark direction |
 
 ## Hygiene Contract

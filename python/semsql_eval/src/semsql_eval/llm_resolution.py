@@ -324,7 +324,7 @@ def build_rejected_query_packet(
         include_samples=include_samples,
     )
     packet = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "semsql_rejected_query_packet",
         "question": question,
         "route_reason": route_reason,
@@ -351,6 +351,12 @@ def build_rejected_query_packet(
     )
     if resolution_task is not None:
         packet["resolution_task"] = resolution_task
+    packet["resolution_decision"] = _resolution_decision_for_packet(
+        route_reason,
+        query_frame,
+        schema_card,
+        resolution_task,
+    )
     seed_entities, seed_fields = _provider_packet_seed_refs(
         packet,
         include_entity_hits=False,
@@ -382,6 +388,59 @@ def build_rejected_query_packet(
         max_value_dictionary_terms=12,
     )
     return packet
+
+
+def _resolution_decision_for_packet(
+    route_reason: str,
+    query_frame: JsonObject | None,
+    schema_card: JsonObject,
+    resolution_task: JsonObject | None,
+) -> JsonObject:
+    if isinstance(query_frame, dict):
+        existing = query_frame.get("resolution_decision")
+        if isinstance(existing, dict):
+            return copy.deepcopy(existing)
+    reject_reason = _query_frame_reject_reason(query_frame) or route_reason
+    if resolution_task is not None or reject_reason in {
+        "missing_value_evidence",
+        "unknown_join_path",
+        "not_routed_no_join_path",
+        "not_routed_ambiguous_physical_table_family",
+        "missing_group_dimension",
+        "missing_specific_date_window",
+        "missing_month_date_window",
+        "missing_projection",
+    }:
+        decision = "ask_user"
+        next_action = "ask the user to choose or define the missing semantic binding"
+    elif reject_reason in {
+        "not_routed_complex_shape",
+        "not_routed_large_schema_grouped_metric_needs_typed_proposal",
+        "not_routed_grouped_metric_topk_unresolved",
+        "unsupported_anti_join_shape",
+        "missing_comparison_dimension",
+        "missing_superlative_order",
+        "manual_rejected",
+    } and bool(_as_list(schema_card.get("entities"))):
+        decision = "ask_llm"
+        next_action = (
+            "ask an LLM for a typed plan proposal over this bounded packet, "
+            "then validate locally"
+        )
+    else:
+        decision = "reject"
+        next_action = "reject; no safe bounded resolution is available"
+    return {
+        "schema_version": 1,
+        "source": "semsql_eval_resolution_decision",
+        "decision": decision,
+        "reason": reject_reason,
+        "next_action": next_action,
+        "llm_eligible": decision == "ask_llm",
+        "user_actionable": decision == "ask_user",
+        "unresolved_slots": [],
+        "atlas_strength": None,
+    }
 
 
 def build_runtime_frame_resolution_proposal(packet: JsonObject) -> JsonObject | None:
@@ -1577,6 +1636,10 @@ def resolve_resolution_proposal_batch(
         try:
             packet_payload = _read_json_payload(packet_path)
             packet = packet_payload.get("packet", packet_payload)
+            if not _packet_allows_llm_handoff(packet):
+                raise ValueError(
+                    "resolution_decision does not permit an LLM provider call"
+                )
             if proposal_path.exists() and not overwrite:
                 proposal_payload = _read_json_payload(proposal_path)
                 proposal = _provider_result_proposal(proposal_payload)
@@ -1651,6 +1714,14 @@ def resolve_resolution_proposal_batch(
     }
     summary.update(_batch_contract_summary(cases))
     return summary
+
+
+def _packet_allows_llm_handoff(packet: JsonObject) -> bool:
+    decision = packet.get("resolution_decision")
+    if not isinstance(decision, dict):
+        # Backward compatibility for retained schema-v1 packets.
+        return True
+    return str(decision.get("decision") or "") == "ask_llm"
 
 
 def render_resolution_provider_batch_markdown(summary: JsonObject) -> str:

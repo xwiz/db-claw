@@ -4,6 +4,7 @@
 #![allow(clippy::items_after_test_module)]
 
 mod extract;
+mod resolve;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -91,6 +92,12 @@ enum Cmd {
         /// Stage 0a).
         #[arg(long)]
         intent_yaml: Option<PathBuf>,
+        /// Optional authored semantic contract (YAML or JSON).
+        #[arg(long)]
+        semantic_contract: Option<PathBuf>,
+        /// Optional approved resolution-memory sidecar (YAML or JSON).
+        #[arg(long)]
+        resolution_memory: Option<PathBuf>,
         /// Diagnostic-only Stage 2 oracle skeleton override.
         #[arg(long, hide = true)]
         oracle_skeleton: Option<String>,
@@ -113,6 +120,10 @@ enum Cmd {
         /// safety.
         #[arg(long)]
         rejection_include_samples: bool,
+        /// Output format. `json` emits the typed resolution decision and SQL
+        /// only when the decision is `execute`.
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 
     /// Surface conflicts and deployment-readiness warnings.
@@ -176,6 +187,12 @@ enum Cmd {
         /// ignore it and run the deterministic-only cascade).
         #[arg(long)]
         cascade_manifest: Option<PathBuf>,
+        /// Optional authored semantic contract to validate and summarize.
+        #[arg(long)]
+        semantic_contract: Option<PathBuf>,
+        /// Optional resolution-memory sidecar to validate and check for drift.
+        #[arg(long)]
+        resolution_memory: Option<PathBuf>,
     },
 
     /// Run an evaluation suite against a graph + cascade.
@@ -186,6 +203,26 @@ enum Cmd {
         /// Path to the `.semsql` file.
         #[arg(long)]
         graph: PathBuf,
+    },
+    /// Resolve a fail-closed packet through web, CLI, or JSON/API mode.
+    Resolve {
+        /// Rejected-query packet produced by `semsql query`.
+        packet: PathBuf,
+        /// Resolution surface: `web`, `cli`, or `json`.
+        #[arg(long, default_value = "web")]
+        mode: String,
+        /// Resolution-memory sidecar to update after explicit approval.
+        #[arg(long)]
+        memory: Option<PathBuf>,
+        /// Non-interactive selected candidate.
+        #[arg(long)]
+        choice: Option<String>,
+        /// Natural-language term the selected target should resolve.
+        #[arg(long)]
+        term: Option<String>,
+        /// Canonical mapping kind override.
+        #[arg(long)]
+        kind: Option<String>,
     },
 }
 
@@ -222,24 +259,30 @@ async fn main() -> Result<()> {
             dialect,
             cascade_manifest,
             intent_yaml,
+            semantic_contract,
+            resolution_memory,
             oracle_skeleton,
             oracle_schema_json,
             oracle_slots_json,
             query_frame_json,
             rejection_packet_json,
             rejection_include_samples,
+            format,
         } => cmd_query(QueryArgs {
             graph: &graph,
             nl: &nl,
             dialect: dialect.as_deref(),
             cascade_manifest: cascade_manifest.as_deref(),
             intent_yaml: intent_yaml.as_deref(),
+            semantic_contract: semantic_contract.as_deref(),
+            resolution_memory: resolution_memory.as_deref(),
             oracle_skeleton: oracle_skeleton.as_deref(),
             oracle_schema_json: oracle_schema_json.as_deref(),
             oracle_slots_json: oracle_slots_json.as_deref(),
             query_frame_json: query_frame_json.as_deref(),
             rejection_packet_json: rejection_packet_json.as_deref(),
             rejection_include_samples,
+            format: &format,
         }),
 
         Cmd::Doctor {
@@ -251,6 +294,8 @@ async fn main() -> Result<()> {
             rls_strict,
             format,
             cascade_manifest,
+            semantic_contract,
+            resolution_memory,
         } => {
             cmd_doctor(
                 &graph,
@@ -261,11 +306,28 @@ async fn main() -> Result<()> {
                 rls_strict,
                 &format,
                 cascade_manifest.as_deref(),
+                semantic_contract.as_deref(),
+                resolution_memory.as_deref(),
             )
             .await
         }
 
         Cmd::Eval { suite, graph } => cmd_eval(&suite, &graph),
+        Cmd::Resolve {
+            packet,
+            mode,
+            memory,
+            choice,
+            term,
+            kind,
+        } => resolve::run(
+            &packet,
+            &mode,
+            memory.as_deref(),
+            choice.as_deref(),
+            term.as_deref(),
+            kind.as_deref(),
+        ),
     }
 }
 
@@ -632,12 +694,15 @@ struct QueryArgs<'a> {
     dialect: Option<&'a str>,
     cascade_manifest: Option<&'a std::path::Path>,
     intent_yaml: Option<&'a std::path::Path>,
+    semantic_contract: Option<&'a std::path::Path>,
+    resolution_memory: Option<&'a std::path::Path>,
     oracle_skeleton: Option<&'a str>,
     oracle_schema_json: Option<&'a str>,
     oracle_slots_json: Option<&'a str>,
     query_frame_json: Option<&'a std::path::Path>,
     rejection_packet_json: Option<&'a std::path::Path>,
     rejection_include_samples: bool,
+    format: &'a str,
 }
 
 fn cmd_query(args: QueryArgs<'_>) -> Result<()> {
@@ -647,19 +712,31 @@ fn cmd_query(args: QueryArgs<'_>) -> Result<()> {
         dialect,
         cascade_manifest,
         intent_yaml,
+        semantic_contract,
+        resolution_memory,
         oracle_skeleton,
         oracle_schema_json,
         oracle_slots_json,
         query_frame_json,
         rejection_packet_json,
         rejection_include_samples,
+        format,
     } = args;
+    if !matches!(format, "text" | "json") {
+        anyhow::bail!("unsupported query format `{format}`; expected `text` or `json`");
+    }
     let target_dialect = match dialect {
         None => None,
         Some(name) => Some(parse_dialect(name)?),
     };
-    let cascade = semsql_runtime::Cascade::load_with_manifest(graph, intent_yaml, cascade_manifest)
-        .with_context(|| format!("loading cascade from {}", graph.display()))?;
+    let cascade = semsql_runtime::Cascade::load_with_context(
+        graph,
+        intent_yaml,
+        cascade_manifest,
+        semantic_contract,
+        resolution_memory,
+    )
+    .with_context(|| format!("loading cascade from {}", graph.display()))?;
     let run_options = semsql_runtime::CascadeRunOptions {
         oracle_linked: oracle_schema_json
             .map(parse_oracle_schema_json)
@@ -679,7 +756,16 @@ fn cmd_query(args: QueryArgs<'_>) -> Result<()> {
                     .with_context(|| format!("dialect render `{d:?}`"))?,
                 None => out.sql_text.clone(),
             };
-            println!("{final_sql}");
+            if format == "json" {
+                let payload = query_frame_payload(nl, &out, &final_sql);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload)
+                        .context("serialising query JSON response")?
+                );
+            } else {
+                println!("{final_sql}");
+            }
             eprintln!("stage_pinned={}", out.stage_pinned);
             eprintln!("repair_attempts={}", out.repair_attempts);
             if !out.slot_decisions.is_empty() {
@@ -731,21 +817,28 @@ fn cmd_query(args: QueryArgs<'_>) -> Result<()> {
                 "error"
             };
             eprintln!("stage_pinned={stage_pinned}");
+            let payload = query_frame_error_payload(nl, &cascade, &msg, stage_pinned);
+            let packet = rejected_query_packet_payload(
+                graph,
+                nl,
+                stage_pinned,
+                payload.clone(),
+                rejection_include_samples,
+            )?;
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&packet)
+                        .context("serialising rejected query JSON response")?
+                );
+            }
             if let Some(path) = query_frame_json {
-                let payload = query_frame_error_payload(nl, &cascade, &msg, stage_pinned);
                 let bytes = serde_json::to_vec_pretty(&payload)
                     .context("serialising query frame error diagnostics")?;
                 std::fs::write(path, bytes)
                     .with_context(|| format!("writing query frame `{}`", path.display()))?;
                 eprintln!("query_frame_json={}", path.display());
                 if let Some(packet_path) = rejection_packet_json {
-                    let packet = rejected_query_packet_payload(
-                        graph,
-                        nl,
-                        stage_pinned,
-                        payload,
-                        rejection_include_samples,
-                    )?;
                     let bytes = serde_json::to_vec_pretty(&packet)
                         .context("serialising rejection packet")?;
                     std::fs::write(packet_path, bytes).with_context(|| {
@@ -754,14 +847,6 @@ fn cmd_query(args: QueryArgs<'_>) -> Result<()> {
                     eprintln!("rejection_packet_json={}", packet_path.display());
                 }
             } else if let Some(packet_path) = rejection_packet_json {
-                let payload = query_frame_error_payload(nl, &cascade, &msg, stage_pinned);
-                let packet = rejected_query_packet_payload(
-                    graph,
-                    nl,
-                    stage_pinned,
-                    payload,
-                    rejection_include_samples,
-                )?;
                 let bytes =
                     serde_json::to_vec_pretty(&packet).context("serialising rejection packet")?;
                 std::fs::write(packet_path, bytes).with_context(|| {
@@ -807,11 +892,21 @@ fn rejected_query_packet_payload(
     let local_candidates = local_candidate_payload(question, &schema_card);
     let resolution_task =
         resolution_task_payload(question, route_reason, &query_frame, &local_candidates);
+    let resolution_decision = query_frame
+        .get("resolution_decision")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let graph_context = serde_json::json!({
+        "schema_hash": semsql_graph::read::metadata(graph, "schema_hash")?,
+        "application_name": semsql_graph::read::metadata(graph, "application_name")?,
+    });
     Ok(serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "source": "semsql_rejected_query_packet",
         "question": question,
         "route_reason": route_reason,
+        "graph_context": graph_context,
+        "resolution_decision": resolution_decision,
         "resolution_task": resolution_task,
         "schema_card": schema_card,
         "local_candidates": local_candidates,
@@ -1486,6 +1581,21 @@ fn resolution_task_payload(
     query_frame: &serde_json::Value,
     local_candidates: &serde_json::Value,
 ) -> serde_json::Value {
+    let decision = query_frame
+        .get("resolution_decision")
+        .and_then(|value| value.get("decision"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("reject");
+    let atlas_strength = query_frame
+        .get("resolution_decision")
+        .and_then(|value| value.get("atlas_strength"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let unresolved_slots = query_frame
+        .get("resolution_decision")
+        .and_then(|value| value.get("unresolved_slots"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     let bound_plan = query_frame.get("bound_query_plan");
     let reject_reason = bound_plan
         .and_then(|plan| plan.get("reject_reason"))
@@ -1497,6 +1607,9 @@ fn resolution_task_payload(
             "kind": "resolve_value_binding",
             "reject_reason": reject_reason,
             "question": question,
+            "recommended_handoff": decision,
+            "atlas_strength": atlas_strength,
+            "unresolved_slots": unresolved_slots,
             "unresolved_value_bindings": unresolved_bindings,
             "allowed_actions": [
                 "choose a field-scoped value from local_candidates",
@@ -1514,6 +1627,9 @@ fn resolution_task_payload(
         "kind": "classify_or_plan_rejection",
         "reject_reason": reject_reason,
         "question": question,
+        "recommended_handoff": decision,
+        "atlas_strength": atlas_strength,
+        "unresolved_slots": unresolved_slots,
         "allowed_actions": [
             "return a typed proposal over schema_card and local_candidates",
             "ask a clarifying question when evidence is ambiguous or incomplete"
@@ -1828,7 +1944,7 @@ fn query_frame_error_payload(
     error: &str,
     stage_pinned: &str,
 ) -> serde_json::Value {
-    let (runtime_query_frame, semantic_atlas, intent_frame, bound_query_plan) =
+    let (runtime_query_frame, semantic_atlas, intent_frame, bound_query_plan, resolution_decision) =
         cascade.runtime_query_diagnostics(nl);
     let mut payload = serde_json::json!({
         "schema_version": 3,
@@ -1841,6 +1957,7 @@ fn query_frame_error_payload(
         "semantic_atlas": semantic_atlas,
         "intent_frame": intent_frame,
         "bound_query_plan": bound_query_plan,
+        "resolution_decision": resolution_decision,
         "note": "diagnostic packet written after a fail-closed cascade error; no SQL was promoted",
     });
     cap_query_frame_diagnostic_payload(&mut payload);
@@ -1955,6 +2072,7 @@ fn query_frame_payload(
         "semantic_atlas": &out.semantic_atlas,
         "intent_frame": &out.intent_frame,
         "bound_query_plan": &out.bound_query_plan,
+        "resolution_decision": &out.resolution_decision,
         "pre_stage3": &out.query_frame,
         "stage3": {
             "frame": {
@@ -2816,18 +2934,22 @@ async fn cmd_doctor(
     rls_strict: bool,
     format: &str,
     cascade_manifest: Option<&std::path::Path>,
+    semantic_contract: Option<&std::path::Path>,
+    resolution_memory: Option<&std::path::Path>,
 ) -> Result<()> {
     match format {
         "text" => {}
         "json" => {
-            return cmd_doctor_json(
+            return cmd_doctor_json(DoctorJsonArgs {
                 graph,
                 db_url,
                 eval_report,
                 write_overrides,
                 rls_strict,
                 cascade_manifest,
-            )
+                semantic_contract,
+                resolution_memory,
+            })
             .await;
         }
         other => anyhow::bail!("unknown --format `{other}` — supported: text, json"),
@@ -2836,6 +2958,7 @@ async fn cmd_doctor(
         .with_context(|| format!("reading coverage from {}", graph.display()))?;
     let conflicts = semsql_graph::read::conflicts(graph)
         .with_context(|| format!("reading conflict_log from {}", graph.display()))?;
+    let context = semsql_runtime::context::load(graph, semantic_contract, resolution_memory)?;
 
     println!("graph: {}", graph.display());
     println!(
@@ -2848,6 +2971,10 @@ async fn cmd_doctor(
         cov.vocab_count,
         cov.enum_count,
         cov.scope_count,
+    );
+    println!(
+        "  authored_aliases={} approved_memory={} stale_memory={}",
+        context.authored_alias_count, context.approved_memory_count, context.stale_memory_count,
     );
 
     if !cov.entities_lacking_ui_vocab.is_empty() {
@@ -2957,19 +3084,34 @@ async fn cmd_doctor(
 /// diagnostic the text path surfaces, suitable for CI parsing.
 /// Schema is intentionally flat — keys map directly to the text
 /// blocks (`coverage`, `conflicts`, `rls`, `eval_report`).
-#[allow(unused_mut, unused_variables)]
-async fn cmd_doctor_json(
-    graph: &std::path::Path,
-    db_url: Option<&str>,
-    eval_report: Option<&std::path::Path>,
-    write_overrides: Option<&std::path::Path>,
+struct DoctorJsonArgs<'a> {
+    graph: &'a std::path::Path,
+    db_url: Option<&'a str>,
+    eval_report: Option<&'a std::path::Path>,
+    write_overrides: Option<&'a std::path::Path>,
     rls_strict: bool,
-    cascade_manifest: Option<&std::path::Path>,
-) -> Result<()> {
+    cascade_manifest: Option<&'a std::path::Path>,
+    semantic_contract: Option<&'a std::path::Path>,
+    resolution_memory: Option<&'a std::path::Path>,
+}
+
+#[allow(unused_mut, unused_variables)]
+async fn cmd_doctor_json(args: DoctorJsonArgs<'_>) -> Result<()> {
+    let DoctorJsonArgs {
+        graph,
+        db_url,
+        eval_report,
+        write_overrides,
+        rls_strict,
+        cascade_manifest,
+        semantic_contract,
+        resolution_memory,
+    } = args;
     let cov = semsql_graph::read::coverage(graph)
         .with_context(|| format!("reading coverage from {}", graph.display()))?;
     let conflicts = semsql_graph::read::conflicts(graph)
         .with_context(|| format!("reading conflict_log from {}", graph.display()))?;
+    let context = semsql_runtime::context::load(graph, semantic_contract, resolution_memory)?;
 
     let mut overrides_written: Option<String> = None;
     if let Some(out_path) = write_overrides {
@@ -3081,6 +3223,12 @@ async fn cmd_doctor_json(
             "scopes": cov.scope_count,
             "entities_lacking_ui_vocab": cov.entities_lacking_ui_vocab,
             "scoped_entities": cov.scoped_entities,
+        },
+        "semantic_context": {
+            "authored_aliases": context.authored_alias_count,
+            "authored_metrics": context.metric_definitions.len(),
+            "approved_memory": context.approved_memory_count,
+            "stale_memory": context.stale_memory_count,
         },
         "conflicts": conflicts.iter().map(|c| serde_json::json!({
             "id": c.id,
@@ -3286,18 +3434,20 @@ fn write_overrides_yaml(
     let mut buf = String::new();
     let _ = writeln!(
         buf,
-        "# semsql vocabulary overrides — generated by `semsql doctor --write-overrides`."
+        "# DB Claw semantic contract - generated by `semsql doctor --write-overrides`."
     );
     let _ = writeln!(
         buf,
-        "# Each entry is a tie-breaker for one conflict_log row. Uncomment the"
+        "# Add reviewed mappings under `aliases`; unresolved extraction conflicts"
     );
     let _ = writeln!(
         buf,
-        "# `override:` line and edit the value to lock the resolution before re-extracting."
+        "# remain below as provenance and do not affect runtime behavior."
     );
-    let _ = writeln!(buf, "version: 1");
-    let _ = writeln!(buf, "overrides:");
+    let _ = writeln!(buf, "schema_version: 1");
+    let _ = writeln!(buf, "aliases: []");
+    let _ = writeln!(buf, "metrics: []");
+    let _ = writeln!(buf, "review_conflicts:");
     if conflicts.is_empty() {
         let _ = writeln!(buf, "  []  # no conflicts in the current graph");
     } else {
@@ -3308,13 +3458,21 @@ fn write_overrides_yaml(
             let _ = writeln!(buf, "    resolution: {}", yaml_escape(&c.resolution));
             match &c.suggested_override {
                 Some(sug) => {
-                    let _ = writeln!(buf, "    # override: {}", yaml_escape(sug));
-                }
-                None => {
+                    let _ = writeln!(buf, "    suggested_mapping: {}", yaml_escape(sug));
                     let _ = writeln!(
                         buf,
-                        "    # override: <fill in — no suggestion was generated>"
+                        "    # Add an approved mapping under top-level aliases:"
                     );
+                    let _ = writeln!(buf, "    #   - term: \"user-facing phrase\"");
+                    let _ = writeln!(buf, "    #     kind: field");
+                    let _ = writeln!(
+                        buf,
+                        "    #     target: {}",
+                        yaml_escape(&c.canonical_target)
+                    );
+                }
+                None => {
+                    let _ = writeln!(buf, "    suggested_mapping: null");
                 }
             }
         }
@@ -3919,8 +4077,9 @@ mod tests {
         let p = dir.path().join("overrides.yaml");
         write_overrides_yaml(&p, &[]).unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
-        assert!(body.contains("version: 1"));
-        assert!(body.contains("overrides:"));
+        assert!(body.contains("schema_version: 1"));
+        assert!(body.contains("aliases: []"));
+        assert!(body.contains("review_conflicts:"));
         assert!(body.contains("no conflicts in the current graph"));
     }
 
@@ -3940,7 +4099,7 @@ mod tests {
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(body.contains("- id: 7"));
         assert!(body.contains("target: \"users.status_code\""));
-        assert!(body.contains("# override: \"users.status_code <- Status\""));
+        assert!(body.contains("suggested_mapping: \"users.status_code <- Status\""));
     }
 
     fn write_rejection_packet_test_graph(path: &std::path::Path) {
@@ -4318,12 +4477,15 @@ mod tests {
             dialect: Some("sqlite"),
             cascade_manifest: None,
             intent_yaml: None,
+            semantic_contract: None,
+            resolution_memory: None,
             oracle_skeleton: None,
             oracle_schema_json: None,
             oracle_slots_json: None,
             query_frame_json: None,
             rejection_packet_json: Some(&packet_path),
             rejection_include_samples: false,
+            format: "text",
         })
         .unwrap_err();
 
@@ -4449,6 +4611,7 @@ mod tests {
             semantic_atlas: None,
             intent_frame: None,
             bound_query_plan: None,
+            resolution_decision: None,
             slot_decisions: vec![
                 semsql_runtime::stage_slotfiller::SlotDecision {
                     slot_name: "@field1".into(),
@@ -4676,6 +4839,7 @@ mod tests {
             semantic_atlas: None,
             intent_frame: None,
             bound_query_plan: None,
+            resolution_decision: None,
             slot_decisions: vec![
                 semsql_runtime::stage_slotfiller::SlotDecision {
                     slot_name: "@field1".into(),

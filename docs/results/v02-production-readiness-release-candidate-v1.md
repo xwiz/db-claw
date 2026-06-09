@@ -1,10 +1,12 @@
-# v0.2 Production Readiness Release Candidate
+# v0.2 Historical Private-Alpha Readiness Probe
 
 Date: 2026-06-06. Retained evidence report; current decision lives in
 [v02-current-status.md](v02-current-status.md).
 
-Strict production readiness now passes for the pre-release/private-alpha gate.
-This is not a broad arbitrary NL-to-SQL benchmark claim.
+Historical probe only. Do not use this file as the current product-readiness
+decision. The active release gate now requires the resolution-decision loop:
+`execute`, `ask_user`, `ask_llm`, or `reject`, plus durable approved mappings.
+This was never a broad arbitrary NL-to-SQL benchmark claim.
 
 | Surface | Result |
 |---|---:|

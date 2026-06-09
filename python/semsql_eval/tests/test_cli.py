@@ -4211,8 +4211,10 @@ def test_doctor_write_overrides_creates_yaml_scaffold(
     )
     assert out.exists()
     body = out.read_text(encoding="utf-8")
-    assert "version: 1" in body
-    assert "overrides:" in body
+    assert "schema_version: 1" in body
+    assert "aliases:" in body
+    assert "metrics:" in body
+    assert "review_conflicts:" in body
     assert "wrote 0 conflict scaffold(s)" in proc.stdout
 
 

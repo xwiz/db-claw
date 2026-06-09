@@ -1,6 +1,12 @@
-# Go-Live Packaging Plan
+# Private-Alpha Packaging Plan
 
-Date: 2026-06-05. Release path, not a result archive.
+Date: 2026-06-09. Release path, not a result archive.
+
+This document is about packaging and distribution only. Product readiness lives
+in `docs/results/v02-current-status.md`. DB Claw is not a broad production
+NL-to-SQL system. The resolution-decision loop now chooses `execute`,
+`ask_user`, `ask_llm`, or `reject` and persists approved mappings; the remaining
+release work is listed below.
 
 ## Ship Surface
 
@@ -72,22 +78,17 @@ For production-like schemas:
 - execute selected SQL only after local validation/rendering.
 
 ## Composer Wrapper
-A later Composer package can expose:
-
-```bash
-composer require --dev semsql/laravel
-php artisan semsql:extract
-php artisan semsql:doctor
-php artisan semsql:ask "count active users"
-```
-
-The wrapper should remain thin. It should not duplicate extraction, parsing,
-graph writing, runtime routing, or SQL rendering.
-
+A later thin Composer wrapper may expose Artisan `extract`, `doctor`, and `ask`
+commands without duplicating extraction, planning, or rendering.
 ## Private Alpha Gate
 
 Private alpha is reasonable after all of these are true:
 
+- [x] query JSON includes the resolution decision and atlas-strength report;
+- [x] rejected queries produce actionable user/LLM handoff packets;
+- [x] approved mappings can be saved and reused without static query shortcuts;
+- [ ] local resolver receives desktop/mobile visual QA;
+- [ ] Laravel passes extract, query, resolve, save, and rerun end to end;
 - the release workflow has passed on a real pre-release tag;
 - release assets are signed or attested;
 - `@semsql/cli` is published under the same non-dev version;
@@ -102,7 +103,6 @@ Private alpha is reasonable after all of these are true:
 - reviewed/provider typed proposals validate and render locally;
 - direct provider SQL remains rejected;
 - final quality gates in `docs/results/v02-quality-gate.md` are green.
-
 Use `v02-current-status.md` for decisions and `v02-evidence-ledger.md` for
 gate numbers. Do not copy run histories into this packaging plan.
 

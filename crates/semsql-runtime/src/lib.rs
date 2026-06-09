@@ -1,28 +1,21 @@
-//! Cascade orchestrator.
+//! Guarded semantic compiler and diagnostic model cascade.
 //!
-//! Drives the runtime pipeline:
+//! The production-facing path is:
 //!
 //! ```text
-//! NL query
-//!   → Stage 0a — Vocabulary Pre-resolver           (<1 ms, deterministic)
-//!   → Stage 0b — Intent Pattern Library            (<1 ms, deterministic)
-//!   → Stage 1  — Schema Linker                      (<5 ms, ~10M params)
-//!   → Stage 2  — Skeleton Generator + llguidance    (<15 ms, ~20M params)
-//!   → Stage 3  — Slot Filler + IntentResolver       (<3 ms, ~5M params)
-//!   → Stage 4  — NatSQL → SQL transpiler            (<1 ms, deterministic)
-//!   → (Python rewriter validates + injects scope)
-//!   → Second-pass re-validator
-//!   → Dialect renderer
+//! app/DB evidence -> SemanticAtlas -> IntentFrame -> candidate plans
+//!   -> BoundQueryPlan -> ResolutionDecision
+//!   -> deterministic renderer and validators, or a typed handoff packet
 //! ```
 //!
-//! Current v0.2 benchmark work uses deterministic pre-resolution plus
-//! ONNX-backed linker, skeleton, and slot-filler stages when the `onnx`
-//! feature is enabled. Non-ONNX builds keep the deterministic path available
-//! and surface an explicit model-stage error when a query needs the cascade.
+//! The older Stage 1/2/3 ONNX cascade remains available for benchmark and
+//! oracle diagnostics. It cannot emit executable SQL unless its output has
+//! been converted into and validated as a [`BoundQueryPlanTrace`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod context;
 pub mod grammar;
 pub mod manifest;
 pub mod normalize;
@@ -32,6 +25,9 @@ pub mod stage_linker;
 pub mod stage_pre_resolver;
 pub mod stage_skeleton;
 pub mod stage_slotfiller;
+
+const APPROVED_MEMORY_SOURCE_LAYER: i32 = 7;
+const AUTHORED_CONTRACT_SOURCE_LAYER: i32 = 8;
 #[cfg(feature = "onnx")]
 pub mod tokenizer_bridge;
 
@@ -82,6 +78,9 @@ pub struct CascadeOutcome {
     /// Validated executable plan. Runtime graph SQL is allowed to become final
     /// SQL only when this plan is valid.
     pub bound_query_plan: Option<BoundQueryPlanTrace>,
+    /// Public decision gate explaining whether SQL may execute or whether the
+    /// caller should hand off to a user, an LLM typed proposal, or reject.
+    pub resolution_decision: Option<ResolutionDecisionTrace>,
     /// Stage 3 per-slot decisions, when the model-backed slot filler ran.
     pub slot_decisions: Vec<stage_slotfiller::SlotDecision>,
 }
@@ -208,6 +207,12 @@ pub struct SemanticAtlasTrace {
     pub sample_value_field_count: usize,
     /// Number of vocabulary entries available to the planner.
     pub vocabulary_count: usize,
+    /// Number of aliases loaded from the authored semantic contract.
+    pub authored_alias_count: usize,
+    /// Number of confirmed/governed memory entries active for this graph.
+    pub approved_memory_count: usize,
+    /// Number of memory entries ignored because their drift key is stale.
+    pub stale_memory_count: usize,
     /// Entity summaries with table names and aliases.
     pub entities: Vec<SemanticAtlasEntityTrace>,
     /// Field summaries with roles, aliases, and value evidence counts.
@@ -439,6 +444,77 @@ pub struct BoundQueryPlanTrace {
     pub sql: Option<String>,
     /// Non-fatal diagnostics about missing evidence or future work.
     pub diagnostics: Vec<BoundPlanDiagnosticTrace>,
+}
+
+/// Public query decision emitted after typed planning.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ResolutionDecisionTrace {
+    /// Schema for this diagnostic payload.
+    pub schema_version: u64,
+    /// Payload source. Currently `runtime_resolution_decision`.
+    pub source: String,
+    /// Decision: `execute`, `ask_user`, `ask_llm`, or `reject`.
+    pub decision: String,
+    /// Stable reason code for the decision.
+    pub reason: String,
+    /// Human-facing next action.
+    pub next_action: String,
+    /// Whether a typed LLM proposal is allowed for this packet.
+    pub llm_eligible: bool,
+    /// Whether a user correction task is available.
+    pub user_actionable: bool,
+    /// Slot-level unresolved evidence that blocked execution.
+    pub unresolved_slots: Vec<ResolutionSlotTrace>,
+    /// Per-query SemanticAtlas strength report.
+    pub atlas_strength: AtlasStrengthReport,
+}
+
+/// One unresolved slot or weak evidence area in a resolution decision.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ResolutionSlotTrace {
+    /// Slot family, such as `metric`, `filter_value`, or `join_path`.
+    pub slot: String,
+    /// Strength score in `[0, 1]`.
+    pub strength: f32,
+    /// `strong`, `weak`, `missing`, or `ambiguous`.
+    pub status: String,
+    /// Stable reason code for this slot.
+    pub reason: String,
+    /// Candidate values or fields the user/LLM may choose among.
+    pub candidates: Vec<String>,
+    /// Preferred handoff for this slot: `user`, `llm`, or `reject`.
+    pub handoff: String,
+}
+
+/// Query-local atlas strength report.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AtlasStrengthReport {
+    /// Schema for this diagnostic payload.
+    pub schema_version: u64,
+    /// Payload source. Currently `runtime_atlas_strength`.
+    pub source: String,
+    /// Conservative overall score derived from critical slot scores.
+    pub overall: f32,
+    /// Subject/entity strength.
+    pub subject_strength: f32,
+    /// Projection/display strength.
+    pub projection_strength: f32,
+    /// Predicate field/value strength.
+    pub filter_value_strength: f32,
+    /// Join-path strength.
+    pub join_path_strength: f32,
+    /// Metric/measure strength.
+    pub metric_strength: f32,
+    /// Date/time role and literal strength.
+    pub date_time_strength: f32,
+    /// Active/sharded table-family strength.
+    pub table_family_strength: f32,
+    /// Result-shape strength.
+    pub result_shape_strength: f32,
+    /// Human-readable evidence notes.
+    pub evidence: Vec<String>,
+    /// Missing or weak evidence families.
+    pub missing: Vec<String>,
 }
 
 /// One projection in a [`BoundQueryPlanTrace`].
@@ -704,6 +780,12 @@ pub struct Cascade {
     /// exposes these as typed metric candidates rather than ad-hoc SQL.
     #[allow(dead_code)]
     graph_metric_definitions: Vec<MetricDefinitionRow>,
+    /// Count of aliases loaded from the authored semantic contract.
+    authored_alias_count: usize,
+    /// Count of confirmed/governed memory entries active for this graph.
+    approved_memory_count: usize,
+    /// Count of memory entries ignored because their drift key is stale.
+    stale_memory_count: usize,
     /// Stage 1 + Stage 3 model bundle, populated when the caller passes
     /// a manifest path AND the build was compiled with `--features onnx`.
     /// Stage 2 (skeleton generator) lands once distilled weights ship —
@@ -754,6 +836,18 @@ impl Cascade {
         intent_yaml_path: Option<&Path>,
         manifest_path: Option<&Path>,
     ) -> Result<Self> {
+        Self::load_with_context(graph_path, intent_yaml_path, manifest_path, None, None)
+    }
+
+    /// Build a cascade with optional authored semantic contract and approved
+    /// resolution-memory overlays.
+    pub fn load_with_context(
+        graph_path: impl AsRef<Path>,
+        intent_yaml_path: Option<&Path>,
+        manifest_path: Option<&Path>,
+        contract_path: Option<&Path>,
+        memory_path: Option<&Path>,
+    ) -> Result<Self> {
         let graph_path = graph_path.as_ref().to_path_buf();
         let pre_resolver = stage_pre_resolver::PreResolverIndex::load(&graph_path)?;
         let intent_library = match intent_yaml_path {
@@ -765,8 +859,11 @@ impl Cascade {
         let sample_values = sample_values(&graph_path).unwrap_or_default();
         let graph_entities = entities(&graph_path).unwrap_or_default();
         let graph_fields = fields(&graph_path).unwrap_or_default();
-        let graph_vocabulary = vocabulary(&graph_path).unwrap_or_default();
-        let graph_metric_definitions = metric_definitions(&graph_path).unwrap_or_default();
+        let mut graph_vocabulary = vocabulary(&graph_path).unwrap_or_default();
+        let mut graph_metric_definitions = metric_definitions(&graph_path).unwrap_or_default();
+        let context_overlay = context::load(&graph_path, contract_path, memory_path)?;
+        graph_vocabulary.extend(context_overlay.vocabulary);
+        graph_metric_definitions.extend(context_overlay.metric_definitions);
         #[cfg(feature = "onnx")]
         let models = match manifest_path {
             Some(p) => Some(load_models(p, &graph_path)?),
@@ -785,6 +882,9 @@ impl Cascade {
             graph_fields,
             graph_vocabulary,
             graph_metric_definitions,
+            authored_alias_count: context_overlay.authored_alias_count,
+            approved_memory_count: context_overlay.approved_memory_count,
+            stale_memory_count: context_overlay.stale_memory_count,
             #[cfg(feature = "onnx")]
             models,
         })
@@ -821,6 +921,11 @@ impl Cascade {
             &self.sample_values,
             &self.graph_vocabulary,
             &self.graph_metric_definitions,
+            SemanticContextCounts {
+                authored_aliases: self.authored_alias_count,
+                approved_memory: self.approved_memory_count,
+                stale_memory: self.stale_memory_count,
+            },
         );
         let atlas_trace = atlas.trace();
         let intent_frame = runtime_intent_frame_from_trace(nl, trace, &atlas);
@@ -842,15 +947,23 @@ impl Cascade {
         SemanticAtlasTrace,
         IntentFrameTrace,
         BoundQueryPlanTrace,
+        ResolutionDecisionTrace,
     ) {
         let runtime_query_frame = self.graph_query_frame_trace(nl);
         let (semantic_atlas, intent_frame, bound_query_plan) =
             self.runtime_typed_planning_traces(nl, &runtime_query_frame);
+        let resolution_decision = resolution_decision_from_traces(
+            &runtime_query_frame,
+            &semantic_atlas,
+            &intent_frame,
+            &bound_query_plan,
+        );
         (
             runtime_query_frame,
             semantic_atlas,
             intent_frame,
             bound_query_plan,
+            resolution_decision,
         )
     }
 
@@ -955,6 +1068,7 @@ impl Cascade {
                     semantic_atlas: None,
                     intent_frame: None,
                     bound_query_plan: None,
+                    resolution_decision: Some(stage0a_execute_resolution_decision(nl)),
                     slot_decisions: Vec::new(),
                 })
             }
@@ -973,6 +1087,12 @@ impl Cascade {
                         )
                     })?;
                     runtime_query_frame.used_for_final_sql = true;
+                    let resolution_decision = resolution_decision_from_traces(
+                        &runtime_query_frame,
+                        &semantic_atlas,
+                        &intent_frame,
+                        &bound_query_plan,
+                    );
                     return Ok(CascadeOutcome {
                         sql_text: sql,
                         timings_us: timings,
@@ -985,6 +1105,7 @@ impl Cascade {
                         semantic_atlas: Some(semantic_atlas),
                         intent_frame: Some(intent_frame),
                         bound_query_plan: Some(bound_query_plan),
+                        resolution_decision: Some(resolution_decision),
                         slot_decisions: Vec::new(),
                     });
                 }
@@ -997,11 +1118,29 @@ impl Cascade {
                         "queryframe fail-closed before model fallback: graph route was ambiguous or unsupported",
                     ));
                 }
+                let diagnostic_oracle_run = options.oracle_linked.is_some()
+                    || options.oracle_skeleton.is_some()
+                    || options.oracle_slot_map.is_some();
+                if !diagnostic_oracle_run {
+                    return Err(needs_model_error(
+                        "bound_query_plan required before model fallback: unbound model SQL is diagnostic-only; use the typed resolution packet",
+                    ));
+                }
                 let mut out = self.run_model_stages(nl, &intents, timings, confidences, options)?;
                 out.runtime_query_frame = Some(runtime_query_frame);
                 out.semantic_atlas = Some(semantic_atlas);
                 out.intent_frame = Some(intent_frame);
                 out.bound_query_plan = Some(bound_query_plan);
+                out.resolution_decision = Some(resolution_decision_from_traces(
+                    out.runtime_query_frame
+                        .as_ref()
+                        .expect("runtime frame just set"),
+                    out.semantic_atlas
+                        .as_ref()
+                        .expect("semantic atlas just set"),
+                    out.intent_frame.as_ref().expect("intent frame just set"),
+                    out.bound_query_plan.as_ref().expect("bound plan just set"),
+                ));
                 Ok(out)
             }
         }
@@ -1270,6 +1409,7 @@ impl Cascade {
             semantic_atlas: None,
             intent_frame: None,
             bound_query_plan: None,
+            resolution_decision: None,
             slot_decisions: slot_out.decisions,
         })
     }
@@ -1671,6 +1811,9 @@ struct RuntimeSemanticAtlas {
     sample_values: HashMap<String, SampleValueRow>,
     vocabulary: Vec<VocabularyEntry>,
     metric_definitions: Vec<MetricDefinitionRow>,
+    authored_alias_count: usize,
+    approved_memory_count: usize,
+    stale_memory_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1767,6 +1910,9 @@ impl RuntimeSemanticAtlas {
                 .collect(),
             vocabulary: vocabulary.to_vec(),
             metric_definitions: metric_definitions.to_vec(),
+            authored_alias_count: 0,
+            approved_memory_count: 0,
+            stale_memory_count: 0,
         }
     }
 
@@ -1933,6 +2079,9 @@ impl RuntimeSemanticAtlas {
             relationship_count: self.relationships.len(),
             sample_value_field_count: self.sample_values.len(),
             vocabulary_count: self.vocabulary.len(),
+            authored_alias_count: self.authored_alias_count,
+            approved_memory_count: self.approved_memory_count,
+            stale_memory_count: self.stale_memory_count,
             entities: entity_rows
                 .into_iter()
                 .map(|entity| SemanticAtlasEntityTrace {
@@ -2716,6 +2865,13 @@ fn semantic_runtime_atlas(
     RuntimeSemanticAtlas::from_rows(entities, fields, relationships, sample_values, vocabulary)
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SemanticContextCounts {
+    authored_aliases: usize,
+    approved_memory: usize,
+    stale_memory: usize,
+}
+
 fn semantic_runtime_atlas_with_metrics(
     entities: &[EntityRow],
     fields: &[FieldRow],
@@ -2723,15 +2879,20 @@ fn semantic_runtime_atlas_with_metrics(
     sample_values: &[SampleValueRow],
     vocabulary: &[VocabularyEntry],
     metric_definitions: &[MetricDefinitionRow],
+    context_counts: SemanticContextCounts,
 ) -> RuntimeSemanticAtlas {
-    RuntimeSemanticAtlas::from_rows_with_metrics(
+    let mut atlas = RuntimeSemanticAtlas::from_rows_with_metrics(
         entities,
         fields,
         relationships,
         sample_values,
         vocabulary,
         metric_definitions,
-    )
+    );
+    atlas.authored_alias_count = context_counts.authored_aliases;
+    atlas.approved_memory_count = context_counts.approved_memory;
+    atlas.stale_memory_count = context_counts.stale_memory;
+    atlas
 }
 
 fn runtime_intent_frame_from_trace(
@@ -3061,6 +3222,516 @@ fn runtime_bound_query_plan_from_trace(
     }
     plan.valid = true;
     plan
+}
+
+/// Build the public resolution decision from typed planning traces.
+pub fn resolution_decision_from_traces(
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &SemanticAtlasTrace,
+    intent: &IntentFrameTrace,
+    plan: &BoundQueryPlanTrace,
+) -> ResolutionDecisionTrace {
+    let atlas_strength = atlas_strength_report_from_traces(trace, atlas, intent, plan);
+    let unresolved_slots = resolution_unresolved_slots(trace, atlas, intent, plan, &atlas_strength);
+    let reject_reason = plan
+        .reject_reason
+        .as_deref()
+        .unwrap_or(trace.route_reason.as_str());
+    let (decision, reason, next_action, user_actionable, llm_eligible) = if plan.valid {
+        (
+            "execute",
+            "bound_plan_valid",
+            "execute validated local SQL",
+            false,
+            false,
+        )
+    } else if resolution_reason_is_hard_reject(reject_reason, trace, atlas) {
+        (
+            "reject",
+            reject_reason,
+            "reject; no safe bounded resolution is available",
+            false,
+            false,
+        )
+    } else if resolution_reason_prefers_user(reject_reason) {
+        (
+            "ask_user",
+            reject_reason,
+            "ask the user to choose or define the missing semantic binding",
+            true,
+            false,
+        )
+    } else if resolution_reason_prefers_llm(reject_reason, &atlas_strength) {
+        (
+            "ask_llm",
+            reject_reason,
+            "ask an LLM for a typed plan proposal over the bounded packet, then validate locally",
+            false,
+            true,
+        )
+    } else if atlas_strength.overall >= 0.45 {
+        (
+            "ask_user",
+            reject_reason,
+            "ask the user to disambiguate the weak semantic evidence",
+            true,
+            false,
+        )
+    } else {
+        (
+            "reject",
+            reject_reason,
+            "reject; atlas evidence is too weak for a safe handoff",
+            false,
+            false,
+        )
+    };
+    ResolutionDecisionTrace {
+        schema_version: 1,
+        source: "runtime_resolution_decision".to_string(),
+        decision: decision.to_string(),
+        reason: reason.to_string(),
+        next_action: next_action.to_string(),
+        llm_eligible,
+        user_actionable,
+        unresolved_slots,
+        atlas_strength,
+    }
+}
+
+fn stage0a_execute_resolution_decision(question: &str) -> ResolutionDecisionTrace {
+    let strength = AtlasStrengthReport {
+        schema_version: 1,
+        source: "runtime_atlas_strength".to_string(),
+        overall: 1.0,
+        subject_strength: 1.0,
+        projection_strength: 1.0,
+        filter_value_strength: 1.0,
+        join_path_strength: 1.0,
+        metric_strength: 1.0,
+        date_time_strength: 1.0,
+        table_family_strength: 1.0,
+        result_shape_strength: 1.0,
+        evidence: vec!["stage_0a_pre_resolver".to_string()],
+        missing: Vec::new(),
+    };
+    ResolutionDecisionTrace {
+        schema_version: 1,
+        source: "runtime_resolution_decision".to_string(),
+        decision: "execute".to_string(),
+        reason: "stage_0a_pre_resolver".to_string(),
+        next_action: format!("execute validated deterministic route for `{question}`"),
+        llm_eligible: false,
+        user_actionable: false,
+        unresolved_slots: Vec::new(),
+        atlas_strength: strength,
+    }
+}
+
+fn atlas_strength_report_from_traces(
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &SemanticAtlasTrace,
+    intent: &IntentFrameTrace,
+    plan: &BoundQueryPlanTrace,
+) -> AtlasStrengthReport {
+    let subject_strength = if plan.base_entity.is_some()
+        || intent.subject_entity.is_some()
+        || trace.projection.is_some()
+    {
+        1.0
+    } else if atlas.entity_count > 0 {
+        0.35
+    } else {
+        0.0
+    };
+    let projection_strength = if !plan.projections.is_empty()
+        && plan
+            .projections
+            .iter()
+            .all(|projection| projection.backed_by_atlas)
+    {
+        1.0
+    } else if trace.projection.is_some() || !intent.projections.is_empty() {
+        0.45
+    } else {
+        0.0
+    };
+    let mut filter_value_strength: f32 = if trace.predicates.is_empty()
+        || (!plan.predicates.is_empty()
+            && plan
+                .predicates
+                .iter()
+                .all(|predicate| predicate.backed_by_atlas && !predicate.evidence.is_empty()))
+    {
+        1.0
+    } else if !plan.predicates.is_empty() {
+        0.35
+    } else {
+        0.15
+    };
+    let reject_reason = plan.reject_reason.as_deref().unwrap_or_default();
+    if matches!(
+        reject_reason,
+        "missing_value_evidence" | "ambiguous_unscoped_value_field"
+    ) {
+        filter_value_strength = filter_value_strength.min(0.25);
+    }
+    let join_path_strength = if trace.required_entities.len() <= 1
+        || (!plan.joins.is_empty() && plan.joins.iter().all(|join| join.backed_by_atlas))
+    {
+        1.0
+    } else if atlas.relationship_count > 0 {
+        0.35
+    } else {
+        0.0
+    };
+    let metric_requested = !intent.measures.is_empty()
+        || trace.source.contains("metric")
+        || trace.source.contains("aggregate")
+        || trace
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.expression.contains('('));
+    let metric_strength = if !metric_requested
+        || (plan.valid && (!plan.projections.is_empty() || !intent.measures.is_empty()))
+    {
+        1.0
+    } else if !atlas.metric_candidates.is_empty() {
+        0.55
+    } else {
+        0.15
+    };
+    let date_requested = !intent.time_windows.is_empty()
+        || plan
+            .reject_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("date") || reason.contains("month"));
+    let date_time_strength = if !date_requested
+        || (!intent.time_windows.is_empty()
+            && intent
+                .time_windows
+                .iter()
+                .all(|window| !window.evidence.is_empty()))
+    {
+        1.0
+    } else {
+        0.25
+    };
+    let table_family_strength =
+        if trace.route_reason == "not_routed_ambiguous_physical_table_family" {
+            0.1
+        } else {
+            1.0
+        };
+    let result_shape_issue = reject_reason.contains("shape")
+        || reject_reason.contains("group_dimension")
+        || reject_reason.contains("comparison_dimension");
+    let result_shape_strength = if plan.valid || !result_shape_issue {
+        1.0
+    } else if trace.routed {
+        0.55
+    } else {
+        0.35
+    };
+    let scores = [
+        subject_strength,
+        projection_strength,
+        filter_value_strength,
+        join_path_strength,
+        metric_strength,
+        date_time_strength,
+        table_family_strength,
+        result_shape_strength,
+    ];
+    let overall = scores.iter().copied().fold(1.0_f32, f32::min);
+    let mut missing = Vec::new();
+    for (name, score) in [
+        ("subject", subject_strength),
+        ("projection", projection_strength),
+        ("filter_value", filter_value_strength),
+        ("join_path", join_path_strength),
+        ("metric", metric_strength),
+        ("date_time", date_time_strength),
+        ("table_family", table_family_strength),
+        ("result_shape", result_shape_strength),
+    ] {
+        if score < 0.7 {
+            missing.push(name.to_string());
+        }
+    }
+    AtlasStrengthReport {
+        schema_version: 1,
+        source: "runtime_atlas_strength".to_string(),
+        overall,
+        subject_strength,
+        projection_strength,
+        filter_value_strength,
+        join_path_strength,
+        metric_strength,
+        date_time_strength,
+        table_family_strength,
+        result_shape_strength,
+        evidence: vec![
+            format!("entities={}", atlas.entity_count),
+            format!("fields={}", atlas.field_count),
+            format!("relationships={}", atlas.relationship_count),
+            format!("sample_value_fields={}", atlas.sample_value_field_count),
+            format!("vocabulary={}", atlas.vocabulary_count),
+            format!("metrics={}", atlas.metric_candidates.len()),
+        ],
+        missing,
+    }
+}
+
+fn resolution_unresolved_slots(
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &SemanticAtlasTrace,
+    _intent: &IntentFrameTrace,
+    plan: &BoundQueryPlanTrace,
+    strength: &AtlasStrengthReport,
+) -> Vec<ResolutionSlotTrace> {
+    let mut slots = Vec::new();
+    let reason = plan
+        .reject_reason
+        .as_deref()
+        .unwrap_or(trace.route_reason.as_str());
+    for missing in &strength.missing {
+        let score = match missing.as_str() {
+            "subject" => strength.subject_strength,
+            "projection" => strength.projection_strength,
+            "filter_value" => strength.filter_value_strength,
+            "join_path" => strength.join_path_strength,
+            "metric" => strength.metric_strength,
+            "date_time" => strength.date_time_strength,
+            "table_family" => strength.table_family_strength,
+            "result_shape" => strength.result_shape_strength,
+            _ => 0.0,
+        };
+        slots.push(ResolutionSlotTrace {
+            slot: missing.clone(),
+            strength: score,
+            status: resolution_slot_status(score, reason).to_string(),
+            reason: reason.to_string(),
+            candidates: resolution_slot_candidates(missing, trace, atlas, plan),
+            handoff: resolution_slot_handoff(reason, strength).to_string(),
+        });
+    }
+    let forced_slot = match reason {
+        "missing_value_evidence" | "ambiguous_unscoped_value_field" => Some("filter_value"),
+        "not_routed_ambiguous_physical_table_family" => Some("table_family"),
+        "unknown_join_path" | "not_routed_no_join_path" => Some("join_path"),
+        "missing_projection" | "unknown_projection_field" => Some("projection"),
+        "missing_specific_date_window" | "missing_month_date_window" => Some("date_time"),
+        "order_field_mismatch" | "unknown_order_field" | "missing_superlative_order" => {
+            Some("order_field")
+        }
+        _ => None,
+    };
+    if let Some(slot) = forced_slot {
+        if !slots.iter().any(|entry| entry.slot == slot) {
+            slots.push(ResolutionSlotTrace {
+                slot: slot.to_string(),
+                strength: 0.25,
+                status: if reason.contains("ambiguous") {
+                    "ambiguous".to_string()
+                } else {
+                    "weak".to_string()
+                },
+                reason: reason.to_string(),
+                candidates: resolution_slot_candidates(slot, trace, atlas, plan),
+                handoff: resolution_slot_handoff(reason, strength).to_string(),
+            });
+        }
+    }
+    slots
+}
+
+fn resolution_slot_candidates(
+    slot: &str,
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &SemanticAtlasTrace,
+    plan: &BoundQueryPlanTrace,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match slot {
+        "subject" | "table_family" => {
+            out.extend(
+                atlas
+                    .entities
+                    .iter()
+                    .take(12)
+                    .map(|entity| entity.entity.clone()),
+            );
+        }
+        "projection" | "date_time" => {
+            out.extend(
+                atlas
+                    .fields
+                    .iter()
+                    .take(18)
+                    .map(|field| field.field.clone()),
+            );
+        }
+        "filter_value" => {
+            out.extend(plan.predicates.iter().map(|p| {
+                if p.value.is_empty() {
+                    p.field.clone()
+                } else {
+                    format!("{}={}", p.field, p.value)
+                }
+            }));
+            if out.is_empty() {
+                out.extend(
+                    trace
+                        .predicates
+                        .iter()
+                        .map(|p| format!("{}={}", p.field, p.value)),
+                );
+            }
+            let predicate_values: HashSet<String> = plan
+                .predicates
+                .iter()
+                .map(|predicate| graph_norm(&predicate.value))
+                .chain(
+                    trace
+                        .predicates
+                        .iter()
+                        .map(|predicate| graph_norm(&predicate.value)),
+                )
+                .filter(|value| !value.is_empty())
+                .collect();
+            out.extend(
+                atlas
+                    .value_aliases
+                    .iter()
+                    .filter(|alias| predicate_values.contains(&graph_norm(&alias.value)))
+                    .map(|alias| format!("{}={}", alias.field, alias.value)),
+            );
+        }
+        "join_path" => {
+            out.extend(atlas.relationships.iter().take(18).map(|rel| {
+                format!(
+                    "{}.{} -> {}.{}",
+                    rel.from_entity, rel.from_field, rel.to_entity, rel.to_field
+                )
+            }));
+        }
+        "metric" => {
+            out.extend(
+                atlas
+                    .metric_candidates
+                    .iter()
+                    .take(18)
+                    .map(|metric| metric.name.clone()),
+            );
+        }
+        "order_field" => {
+            out.extend(
+                atlas
+                    .fields
+                    .iter()
+                    .take(18)
+                    .map(|field| field.field.clone()),
+            );
+            out.extend(
+                atlas
+                    .metric_candidates
+                    .iter()
+                    .take(18)
+                    .map(|metric| metric.name.clone()),
+            );
+        }
+        "result_shape" => {
+            out.extend([
+                "table".to_string(),
+                "metric".to_string(),
+                "chart".to_string(),
+            ]);
+        }
+        _ => {}
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn resolution_slot_status(strength: f32, reason: &str) -> &'static str {
+    if reason.contains("ambiguous") {
+        "ambiguous"
+    } else if strength <= 0.1 {
+        "missing"
+    } else if strength < 0.7 {
+        "weak"
+    } else {
+        "strong"
+    }
+}
+
+fn resolution_slot_handoff(reason: &str, strength: &AtlasStrengthReport) -> &'static str {
+    if resolution_reason_code_is_hard_reject(reason) {
+        "reject"
+    } else if resolution_reason_prefers_llm(reason, strength) {
+        "llm"
+    } else {
+        "user"
+    }
+}
+
+fn resolution_reason_is_hard_reject(
+    reason: &str,
+    trace: &RuntimeQueryFrameTrace,
+    atlas: &SemanticAtlasTrace,
+) -> bool {
+    resolution_reason_code_is_hard_reject(reason) || (atlas.entity_count == 0 && !trace.routed)
+}
+
+fn resolution_reason_code_is_hard_reject(reason: &str) -> bool {
+    matches!(
+        reason,
+        "not_read_only_select"
+            | "not_routed_no_graph"
+            | "not_routed_no_predicates"
+            | "not_routed_too_many_predicates"
+            | "unsupported_limit"
+    )
+}
+
+fn resolution_reason_prefers_user(reason: &str) -> bool {
+    matches!(
+        reason,
+        "missing_value_evidence"
+            | "missing_value_candidate"
+            | "ambiguous_unscoped_value_field"
+            | "ambiguous_related_predicate_field"
+            | "missing_explicit_predicate_field"
+            | "unknown_join_path"
+            | "not_routed_no_join_path"
+            | "not_routed_ambiguous_physical_table_family"
+            | "missing_group_dimension"
+            | "missing_specific_date_window"
+            | "missing_month_date_window"
+            | "missing_numeric_threshold"
+            | "missing_numeric_range_predicate"
+            | "missing_projection"
+            | "unknown_projection_field"
+            | "unknown_predicate_field"
+            | "unknown_order_field"
+    )
+}
+
+fn resolution_reason_prefers_llm(reason: &str, strength: &AtlasStrengthReport) -> bool {
+    matches!(
+        reason,
+        "not_routed_complex_shape"
+            | "not_routed_large_schema_grouped_metric_needs_typed_proposal"
+            | "not_routed_grouped_metric_topk_unresolved"
+            | "unsupported_anti_join_shape"
+            | "missing_comparison_dimension"
+            | "missing_superlative_order"
+            | "order_field_mismatch"
+            | "projection_field_mismatch"
+            | "measure_field_mismatch"
+    ) && strength.overall >= 0.25
 }
 
 fn runtime_sql_is_read_only_select(sql: &str) -> bool {
@@ -4345,6 +5016,9 @@ fn runtime_prompt_ambiguous_unscoped_value_field(
         let Some(selected) = atlas.field(&predicate.field) else {
             return false;
         };
+        if runtime_predicate_has_unique_authoritative_enum_binding(nl, predicate, atlas) {
+            return false;
+        }
         if !runtime_field_can_have_ambiguous_unscoped_value(selected) {
             return false;
         }
@@ -4408,6 +5082,36 @@ fn runtime_prompt_ambiguous_unscoped_value_field(
             unique_top_selected || (selected_metric_entity && !duplicate_on_selected_entity);
         !selected_disambiguated
     })
+}
+
+fn runtime_predicate_has_unique_authoritative_enum_binding(
+    nl: &str,
+    predicate: &BoundPlanPredicateTrace,
+    atlas: &RuntimeSemanticAtlas,
+) -> bool {
+    let nl_norm = graph_norm(nl);
+    let mut matches = atlas
+        .vocabulary
+        .iter()
+        .filter(|entry| {
+            entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER
+                && entry.canonical_kind == "enum_value"
+                && entry.confidence >= 0.8
+        })
+        .filter_map(|entry| {
+            let term_norm = graph_norm(&entry.term);
+            if term_norm.len() < 2 || !graph_norm_contains(&nl_norm, &term_norm) {
+                return None;
+            }
+            let (field, raw_value) = entry.canonical_value.split_once(':')?;
+            Some((field.to_ascii_lowercase(), graph_norm(raw_value), term_norm))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    matches.len() == 1
+        && matches[0].0 == predicate.field.to_ascii_lowercase()
+        && matches[0].1 == graph_norm(predicate.value.trim_matches('\''))
 }
 
 fn runtime_predicate_entity_colocated_with_metric_plan(
@@ -15925,7 +16629,7 @@ fn graph_derived_scope_predicates(
     let q_tokens = graph_schema_match_tokens(nl);
     let mut grouped: HashMap<(String, String), GraphScopePredicateCandidate> = HashMap::new();
     for entry in vocabulary {
-        if entry.canonical_kind != "scope_predicate" || entry.confidence < 0.4 {
+        if entry.confidence < 0.4 {
             continue;
         }
         let term_norm = graph_norm(&entry.term);
@@ -15933,8 +16637,26 @@ fn graph_derived_scope_predicates(
         else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<GraphScopePredicateValue>(&entry.canonical_value)
-        else {
+        let value = if entry.canonical_kind == "scope_predicate" {
+            let Ok(value) =
+                serde_json::from_str::<GraphScopePredicateValue>(&entry.canonical_value)
+            else {
+                continue;
+            };
+            value
+        } else if entry.canonical_kind == "enum_value"
+            && entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER
+        {
+            let Some((field, raw_value)) = entry.canonical_value.split_once(':') else {
+                continue;
+            };
+            GraphScopePredicateValue {
+                scope: format!("approved_enum.{field}.{raw_value}"),
+                field: field.to_string(),
+                operator: "=".to_string(),
+                raw_value: raw_value.to_string(),
+            }
+        } else {
             continue;
         };
         let operator = graph_normalize_scope_operator(&value.operator);
@@ -15963,6 +16685,11 @@ fn graph_derived_scope_predicates(
         let score = 12.0
             + entry.confidence * 4.0
             + (entry.source_layer as f32 * 0.35)
+            + if entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER {
+                50.0
+            } else {
+                0.0
+            }
             + graph_field_tokens(field)
                 .intersection(&context_tokens)
                 .count() as f32
@@ -26303,8 +27030,9 @@ mod graph_schema_atlas_tests {
         graph_sample_value_is_temporal_subject_descriptor, graph_sample_value_query_aliases,
         graph_scope_term_is_temporal_subject_descriptor, graph_subject_entity_from_field_entities,
         graph_subject_entity_with_vocab, graph_topk_group_dimension_phrase,
-        graph_trace_predicates_are_grounded, runtime_bound_query_plan_from_trace,
-        runtime_intent_frame_from_trace, runtime_prompt_high_confidence_value_candidate_missing,
+        graph_trace_predicates_are_grounded, resolution_decision_from_traces,
+        runtime_bound_query_plan_from_trace, runtime_intent_frame_from_trace,
+        runtime_prompt_high_confidence_value_candidate_missing,
         runtime_prompt_related_predicate_field_ambiguity,
         runtime_prompt_requested_projection_missing, runtime_prompt_subject_entity_mismatch,
         semantic_atlas_codebook_lookup, semantic_runtime_atlas,
@@ -26322,6 +27050,133 @@ mod graph_schema_atlas_tests {
         writer, EntityInsert, FieldInsert, RelationshipInsert, SampleValuesInsert, VocabInsert,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn resolution_decision_distinguishes_execute_user_llm_and_reject() {
+        let atlas = super::SemanticAtlasTrace {
+            entity_count: 2,
+            field_count: 4,
+            relationship_count: 1,
+            vocabulary_count: 4,
+            metric_candidates: vec![super::SemanticAtlasMetricCandidateTrace {
+                name: "revenue".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let intent = IntentFrameTrace::default();
+        let execute = resolution_decision_from_traces(
+            &RuntimeQueryFrameTrace {
+                routed: true,
+                projection: Some(RuntimeQueryFrameProjectionTrace {
+                    entity: "accounts".to_string(),
+                    expression: "COUNT(accounts.id)".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &atlas,
+            &intent,
+            &BoundQueryPlanTrace {
+                valid: true,
+                base_entity: Some("accounts".to_string()),
+                projections: vec![super::BoundPlanProjectionTrace {
+                    backed_by_atlas: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(execute.decision, "execute");
+
+        let ask_user = resolution_decision_from_traces(
+            &RuntimeQueryFrameTrace {
+                route_reason: "routed".to_string(),
+                predicates: vec![RuntimeQueryFramePredicateTrace {
+                    field: "accounts.status".to_string(),
+                    value: "healthy".to_string(),
+                    operator: "=".to_string(),
+                }],
+                ..Default::default()
+            },
+            &atlas,
+            &intent,
+            &BoundQueryPlanTrace {
+                reject_reason: Some("missing_value_evidence".to_string()),
+                predicates: vec![BoundPlanPredicateTrace {
+                    field: "accounts.status".to_string(),
+                    value: "healthy".to_string(),
+                    backed_by_atlas: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(ask_user.decision, "ask_user");
+
+        let ask_user_for_ambiguity = resolution_decision_from_traces(
+            &RuntimeQueryFrameTrace {
+                route_reason: "routed".to_string(),
+                predicates: vec![RuntimeQueryFramePredicateTrace {
+                    field: "accounts.segment".to_string(),
+                    value: "enterprise".to_string(),
+                    operator: "=".to_string(),
+                }],
+                ..Default::default()
+            },
+            &atlas,
+            &intent,
+            &BoundQueryPlanTrace {
+                reject_reason: Some("ambiguous_unscoped_value_field".to_string()),
+                predicates: vec![BoundPlanPredicateTrace {
+                    field: "accounts.segment".to_string(),
+                    value: "enterprise".to_string(),
+                    backed_by_atlas: true,
+                    evidence: vec!["sample_value".to_string()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(ask_user_for_ambiguity.decision, "ask_user");
+
+        let ask_llm = resolution_decision_from_traces(
+            &RuntimeQueryFrameTrace {
+                route_reason: "not_routed_complex_shape".to_string(),
+                projection: Some(RuntimeQueryFrameProjectionTrace {
+                    entity: "accounts".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            &atlas,
+            &intent,
+            &BoundQueryPlanTrace {
+                reject_reason: Some("not_routed_complex_shape".to_string()),
+                base_entity: Some("accounts".to_string()),
+                projections: vec![super::BoundPlanProjectionTrace {
+                    backed_by_atlas: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert_eq!(ask_llm.decision, "ask_llm");
+
+        let reject = resolution_decision_from_traces(
+            &RuntimeQueryFrameTrace {
+                route_reason: "not_routed_no_graph".to_string(),
+                ..Default::default()
+            },
+            &super::SemanticAtlasTrace::default(),
+            &intent,
+            &BoundQueryPlanTrace {
+                reject_reason: Some("not_routed_no_graph".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reject.decision, "reject");
+    }
 
     type SemanticAliasFixture = (
         Vec<EntityRow>,
@@ -26588,6 +27443,7 @@ mod graph_schema_atlas_tests {
             &samples,
             &vocabulary,
             &metrics,
+            crate::SemanticContextCounts::default(),
         );
         let trace = atlas.trace();
 
@@ -26681,6 +27537,7 @@ mod graph_schema_atlas_tests {
             &samples,
             &vocabulary,
             &metrics,
+            crate::SemanticContextCounts::default(),
         );
         let question = "average invoice revenue for paying customers by region";
         let combined = semantic_atlas_codebook_lookup(
@@ -34977,6 +35834,56 @@ mod graph_schema_atlas_tests {
             &scoped_intent,
         );
         assert!(scoped_plan.valid, "{scoped_plan:?}");
+    }
+
+    #[test]
+    fn approved_enum_memory_overrides_weaker_duplicate_value_evidence() {
+        let entities = vec![entity_row("packages")];
+        let fields = vec![
+            typed_field_row("packages", "id", "INTEGER"),
+            field_row("packages", "package_name"),
+            field_row("packages", "package_tier"),
+        ];
+        let samples = vec![
+            sample_row("packages.package_name", &["Enterprise"]),
+            sample_row("packages.package_tier", &["enterprise"]),
+        ];
+        let vocabulary = vec![
+            VocabularyEntry {
+                term: "enterprise".to_string(),
+                canonical_kind: "scope_predicate".to_string(),
+                canonical_value: r#"{"scope":"packages.enterprise","field":"packages.package_name","operator":"=","rawValue":"Enterprise"}"#.to_string(),
+                confidence: 0.9,
+                source_layer: 6,
+            },
+            VocabularyEntry {
+                term: "enterprise".to_string(),
+                canonical_kind: "enum_value".to_string(),
+                canonical_value: "packages.package_tier:enterprise".to_string(),
+                confidence: 0.9,
+                source_layer: crate::APPROVED_MEMORY_SOURCE_LAYER,
+            },
+        ];
+        let question = "show packages in segment enterprise";
+
+        let trace = graph_query_frame_trace_with_vocab(
+            question,
+            &entities,
+            &fields,
+            &[],
+            &samples,
+            &vocabulary,
+        );
+        assert!(trace.routed, "{trace:?}");
+        assert_eq!(trace.predicates.len(), 1, "{trace:?}");
+        assert_eq!(trace.predicates[0].field, "packages.package_tier");
+        assert_eq!(trace.predicates[0].value, "enterprise");
+
+        let atlas = semantic_runtime_atlas(&entities, &fields, &[], &samples, &vocabulary);
+        let intent = runtime_intent_frame_from_trace(question, &trace, &atlas);
+        let plan = runtime_bound_query_plan_from_trace(question, &trace, &atlas, &intent);
+        assert!(plan.valid, "{plan:?}");
+        assert_eq!(plan.reject_reason, None);
     }
 
     #[test]

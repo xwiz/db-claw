@@ -11,6 +11,18 @@ use semsql_core::{Result, SemsqlError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// Read one metadata value from the graph.
+pub fn metadata(path: impl AsRef<Path>, key: &str) -> Result<Option<String>> {
+    let conn = open(path)?;
+    conn.query_row(
+        "SELECT value FROM semsql_metadata WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| SemsqlError::Other(format!("metadata `{key}` query: {e}")))
+}
+
 /// One vocabulary row, normalised for runtime lookup.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VocabularyEntry {
