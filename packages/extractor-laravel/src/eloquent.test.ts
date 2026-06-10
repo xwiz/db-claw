@@ -488,6 +488,133 @@ describe("scanEloquentModels", () => {
 		).toBe("staff_members.name");
 	});
 
+	it("emits exact grounded keys for belongsTo, hasMany, and hasOne methods", async () => {
+		await write(
+			"app/Models/Customer.php",
+			`<?php
+            namespace App\\Models;
+            class Customer extends Model {
+                protected $table = 'crm_clients';
+                protected $fillable = ['uid', 'name'];
+                public function orders(): HasMany {
+                    return $this->hasMany(Order::class, 'client_ref', 'uid');
+                }
+                public function profile(): HasOne {
+                    return $this->hasOne(CustomerProfile::class, 'client_ref', 'uid');
+                }
+            }`,
+		);
+		await write(
+			"app/Models/CustomerProfile.php",
+			`<?php
+            namespace App\\Models;
+            class CustomerProfile extends Model {
+                protected $table = 'client_profiles';
+                protected $fillable = ['client_ref'];
+            }`,
+		);
+		await write(
+			"app/Models/Order.php",
+			`<?php
+            namespace App\\Models;
+            class Order extends Model {
+                protected $table = 'sales_orders';
+                protected $fillable = ['client_ref'];
+                public function account(): BelongsTo {
+                    return $this->belongsTo(Customer::class, 'client_ref', 'uid');
+                }
+            }`,
+		);
+
+		const r = await scanEloquentModels(tmp);
+		const relationships = r.fragments.filter(
+			(fragment) => fragment.canonical.kind === "relationship",
+		);
+		expect(relationships).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					term: "account",
+					canonical: {
+						kind: "relationship",
+						from: "sales_orders",
+						to: "crm_clients",
+						fromField: "sales_orders.client_ref",
+						toField: "crm_clients.uid",
+						relationshipKind: "many_to_one",
+						relationName: "account",
+					},
+				}),
+				expect.objectContaining({
+					term: "orders",
+					canonical: {
+						kind: "relationship",
+						from: "crm_clients",
+						to: "sales_orders",
+						fromField: "crm_clients.uid",
+						toField: "sales_orders.client_ref",
+						relationshipKind: "one_to_many",
+						relationName: "orders",
+					},
+				}),
+				expect.objectContaining({
+					term: "profile",
+					canonical: {
+						kind: "relationship",
+						from: "crm_clients",
+						to: "client_profiles",
+						fromField: "crm_clients.uid",
+						toField: "client_profiles.client_ref",
+						relationshipKind: "one_to_one",
+						relationName: "profile",
+					},
+				}),
+			]),
+		);
+	});
+
+	it("uses Laravel convention keys when relationship arguments omit them", async () => {
+		await write(
+			"app/Models/Invoice.php",
+			`<?php
+            namespace App\\Models;
+            class Invoice extends Model {
+                public function customer(): BelongsTo {
+                    return $this->belongsTo(Customer::class);
+                }
+            }`,
+		);
+		await write(
+			"app/Models/Customer.php",
+			`<?php
+            namespace App\\Models;
+            class Customer extends Model {
+                public function invoices(): HasMany {
+                    return $this->hasMany(Invoice::class);
+                }
+            }`,
+		);
+
+		const r = await scanEloquentModels(tmp);
+		expect(r.fragments).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					canonical: expect.objectContaining({
+						kind: "relationship",
+						fromField: "invoices.customer_id",
+						toField: "customers.id",
+					}),
+				}),
+				expect.objectContaining({
+					canonical: expect.objectContaining({
+						kind: "relationship",
+						fromField: "customers.id",
+						toField: "invoices.customer_id",
+					}),
+				}),
+			]),
+		);
+	});
+
 	it("ignores files that don't extend a known Model base", async () => {
 		await write("app/Models/Helper.php", `<?php class Helper {}`);
 		await write(

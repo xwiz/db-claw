@@ -43,7 +43,19 @@ export type Canonical =
 			operator: string;
 			rawValue: string;
 	  }
-	| { kind: "relationship"; from: string; to: string };
+	| {
+			kind: "relationship";
+			from: string;
+			to: string;
+			/** Canonical source field, e.g. `orders.customer_id`. */
+			fromField?: string;
+			/** Canonical target field, e.g. `customers.id`. */
+			toField?: string;
+			/** Join cardinality used by the graph planner. */
+			relationshipKind?: "many_to_one" | "one_to_many" | "one_to_one";
+			/** Application-facing relationship method/name. */
+			relationName?: string;
+	  };
 
 /** Confidence in the mapping, `[0, 1]`. */
 export type Confidence = number;

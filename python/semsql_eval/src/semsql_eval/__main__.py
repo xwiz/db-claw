@@ -63,6 +63,10 @@ from .framework_bridge_probe import (
     render_framework_bridge_probe_markdown,
     run_framework_bridge_probe,
 )
+from .laravel_alpha_probe import (
+    render_laravel_alpha_probe_markdown,
+    run_laravel_alpha_probe,
+)
 from .llm_resolution import (
     DEFAULT_DEEPSEEK_BASE_URL,
     DEFAULT_DEEPSEEK_MODEL,
@@ -262,6 +266,62 @@ def framework_bridge_probe_cmd(
         out_md.write_text(rendered, encoding="utf-8")
     if report["status"] != "pass":
         raise click.ClickException("framework bridge probe failed")
+
+
+@cli.command("laravel-alpha-probe")
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output directory for the generated Laravel acceptance fixture.",
+)
+@click.option(
+    "--semsql-bin",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Native semsql binary to exercise.",
+)
+@click.option(
+    "--out-json",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional JSON report path.",
+)
+@click.option(
+    "--out-md",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional Markdown report path.",
+)
+@click.option(
+    "--build-extractor/--no-build-extractor",
+    default=False,
+    show_default=True,
+    help="Build the workspace extractor CLI before probing.",
+)
+def laravel_alpha_probe_cmd(
+    out_dir: Path,
+    semsql_bin: Path,
+    out_json: Path | None,
+    out_md: Path | None,
+    build_extractor: bool,
+) -> None:
+    """Run Laravel extract, ambiguity resolution, and approved rerun."""
+    report = run_laravel_alpha_probe(
+        out_dir=out_dir,
+        semsql_bin=semsql_bin,
+        build_extractor=build_extractor,
+    )
+    rendered = render_laravel_alpha_probe_markdown(report)
+    click.echo(rendered.rstrip())
+    if out_json is not None:
+        _write_json_report(out_json, report)
+    if out_md is not None:
+        out_md.parent.mkdir(parents=True, exist_ok=True)
+        out_md.write_text(rendered, encoding="utf-8")
+    if report["status"] != "pass":
+        raise click.ClickException("Laravel alpha probe failed")
 
 
 @cli.command("package-bridge-probe")

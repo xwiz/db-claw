@@ -63,6 +63,8 @@ pub struct JsonlIngestSummary {
     pub vocab_count: usize,
     /// Number of metric definition rows written.
     pub metric_definition_count: usize,
+    /// Number of grounded relationship edges written.
+    pub relationship_count: usize,
 }
 
 /// Options for DB-only extraction.
@@ -1100,6 +1102,18 @@ fn derive_app_name_for(db_url: &str) -> String {
 pub fn ingest_vocab_jsonl(graph_out: &Path, jsonl: &Path) -> Result<JsonlIngestSummary> {
     let conn = open(graph_out).context("open graph for vocab ingest")?;
     let resolver = GraphCanonicalResolver::load(graph_out)?;
+    let mut relationship_keys = semsql_graph::read::relationships(graph_out)?
+        .into_iter()
+        .map(|relationship| {
+            (
+                relationship.from_entity,
+                relationship.from_field,
+                relationship.to_entity,
+                relationship.to_field,
+                relationship.kind,
+            )
+        })
+        .collect::<HashSet<_>>();
     let text = std::fs::read_to_string(jsonl)
         .with_context(|| format!("read JSONL {}", jsonl.display()))?;
 
@@ -1194,7 +1208,14 @@ pub fn ingest_vocab_jsonl(graph_out: &Path, jsonl: &Path) -> Result<JsonlIngestS
                 .to_string();
                 ("scope_predicate".to_string(), canonical_value)
             }
-            TsCanonical::Relationship { from, to } => {
+            TsCanonical::Relationship {
+                from,
+                to,
+                from_field,
+                to_field,
+                relationship_kind,
+                relation_name,
+            } => {
                 let from = from.to_ascii_lowercase();
                 let to = to.to_ascii_lowercase();
                 let Some(from) = resolver.resolve_entity(&from) else {
@@ -1211,6 +1232,107 @@ pub fn ingest_vocab_jsonl(graph_out: &Path, jsonl: &Path) -> Result<JsonlIngestS
                     );
                     continue;
                 };
+                match (from_field, to_field) {
+                    (Some(from_field), Some(to_field)) => {
+                        let Some(from_field) =
+                            resolver.resolve_field(&from_field.to_ascii_lowercase())
+                        else {
+                            tracing::warn!(
+                                line = lineno + 1,
+                                "rejecting relationship with non-canonical from field"
+                            );
+                            continue;
+                        };
+                        let Some(to_field) = resolver.resolve_field(&to_field.to_ascii_lowercase())
+                        else {
+                            tracing::warn!(
+                                line = lineno + 1,
+                                "rejecting relationship with non-canonical to field"
+                            );
+                            continue;
+                        };
+                        if !from_field.starts_with(&format!("{from}."))
+                            || !to_field.starts_with(&format!("{to}."))
+                        {
+                            tracing::warn!(
+                                line = lineno + 1,
+                                "rejecting relationship whose fields do not belong to its endpoints"
+                            );
+                            continue;
+                        }
+                        let kind = relationship_kind.unwrap_or_else(|| "many_to_one".to_string());
+                        if !matches!(kind.as_str(), "many_to_one" | "one_to_many" | "one_to_one") {
+                            tracing::warn!(
+                                line = lineno + 1,
+                                value = %kind,
+                                "rejecting relationship with unsupported kind"
+                            );
+                            continue;
+                        }
+                        let from_field_name = from_field
+                            .split_once('.')
+                            .map(|(_, field)| field)
+                            .unwrap_or(from_field.as_str());
+                        let to_field_name = to_field
+                            .split_once('.')
+                            .map(|(_, field)| field)
+                            .unwrap_or(to_field.as_str());
+                        let (edge_from, edge_from_field, edge_to, edge_to_field, edge_kind) =
+                            if kind == "one_to_many" {
+                                (
+                                    to.as_str(),
+                                    to_field_name,
+                                    from.as_str(),
+                                    from_field_name,
+                                    "many_to_one",
+                                )
+                            } else {
+                                (
+                                    from.as_str(),
+                                    from_field_name,
+                                    to.as_str(),
+                                    to_field_name,
+                                    kind.as_str(),
+                                )
+                            };
+                        let relationship_key = (
+                            edge_from.to_string(),
+                            edge_from_field.to_string(),
+                            edge_to.to_string(),
+                            edge_to_field.to_string(),
+                            edge_kind.to_string(),
+                        );
+                        if relationship_keys.insert(relationship_key) {
+                            insert_relationship(
+                                &conn,
+                                RelationshipInsert {
+                                    from_entity: edge_from,
+                                    from_field: edge_from_field,
+                                    to_entity: edge_to,
+                                    to_field: edge_to_field,
+                                    kind: edge_kind,
+                                    relation_name: relation_name.as_deref(),
+                                },
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "{}:{}: ingest grounded relationship",
+                                    jsonl.display(),
+                                    lineno + 1
+                                )
+                            })?;
+                            summary.relationship_count += 1;
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        tracing::warn!(
+                            line = lineno + 1,
+                            "rejecting relationship with only one join field"
+                        );
+                        continue;
+                    }
+                }
                 ("relationship".to_string(), format!("{from}->{to}"))
             }
         };
@@ -1635,6 +1757,14 @@ enum TsCanonical {
     Relationship {
         from: String,
         to: String,
+        #[serde(default, rename = "fromField")]
+        from_field: Option<String>,
+        #[serde(default, rename = "toField")]
+        to_field: Option<String>,
+        #[serde(default, rename = "relationshipKind")]
+        relationship_kind: Option<String>,
+        #[serde(default, rename = "relationName")]
+        relation_name: Option<String>,
     },
 }
 
@@ -2754,6 +2884,80 @@ q1,qualifying 1,time in qualifying "
         let cascade = semsql_runtime::Cascade::load(&out, None).unwrap();
         let outcome = cascade.run("how many students").unwrap();
         assert_eq!(outcome.sql_text, "SELECT COUNT(*) FROM users");
+    }
+
+    #[tokio::test]
+    async fn jsonl_grounded_relationships_become_join_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("app.sqlite");
+        let graph = dir.path().join("app.semsql");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE crm_clients (
+                    uid INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE sales_orders (
+                    id INTEGER PRIMARY KEY,
+                    client_ref INTEGER NOT NULL,
+                    order_number TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        run_db_only(&format!("sqlite:{}", db.display()), &graph)
+            .await
+            .unwrap();
+        assert!(
+            semsql_graph::read::relationships(&graph)
+                .unwrap()
+                .is_empty(),
+            "non-standard key names should not be guessed as a DB relationship"
+        );
+
+        let jsonl = dir.path().join("laravel.jsonl");
+        std::fs::write(
+            &jsonl,
+            r#"{"term":"account","canonical":{"kind":"relationship","from":"sales_orders","to":"crm_clients","fromField":"sales_orders.client_ref","toField":"crm_clients.uid","relationshipKind":"many_to_one","relationName":"account"},"confidence":0.9,"locator":{"file":"app/Models/Order.php","line":8,"layer":2,"extractor":"extractor-laravel:eloquent:belongsTo"}}
+{"term":"orders","canonical":{"kind":"relationship","from":"crm_clients","to":"sales_orders","fromField":"crm_clients.uid","toField":"sales_orders.client_ref","relationshipKind":"one_to_many","relationName":"orders"},"confidence":0.9,"locator":{"file":"app/Models/Customer.php","line":8,"layer":2,"extractor":"extractor-laravel:eloquent:hasMany"}}
+"#,
+        )
+        .unwrap();
+
+        let written = ingest_vocab_jsonl(&graph, &jsonl).unwrap();
+        assert_eq!(written.vocab_count, 2);
+        assert_eq!(written.relationship_count, 1);
+        let relationships = semsql_graph::read::relationships(&graph).unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].from_entity, "sales_orders");
+        assert_eq!(relationships[0].from_field, "client_ref");
+        assert_eq!(relationships[0].to_entity, "crm_clients");
+        assert_eq!(relationships[0].to_field, "uid");
+        assert_eq!(relationships[0].kind, "many_to_one");
+    }
+
+    #[tokio::test]
+    async fn jsonl_relationships_fail_closed_when_join_fields_do_not_ground() {
+        let (dir, src) = build_demo_db();
+        let graph = dir.path().join("g.semsql");
+        run_db_only(&format!("sqlite:{}", src.display()), &graph)
+            .await
+            .unwrap();
+
+        let jsonl = dir.path().join("bad-relationship.jsonl");
+        std::fs::write(
+            &jsonl,
+            r#"{"term":"tenant","canonical":{"kind":"relationship","from":"users","to":"tenants","fromField":"users.missing_tenant_id","toField":"tenants.id","relationshipKind":"many_to_one","relationName":"tenant"},"confidence":0.9,"locator":{"file":"app/Models/User.php","line":8,"layer":2,"extractor":"extractor-laravel:eloquent:belongsTo"}}
+"#,
+        )
+        .unwrap();
+
+        let written = ingest_vocab_jsonl(&graph, &jsonl).unwrap();
+        assert_eq!(written.vocab_count, 0);
+        assert_eq!(written.relationship_count, 0);
     }
 
     #[tokio::test]

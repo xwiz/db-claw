@@ -18,9 +18,9 @@
  * Layer assignment: ORM (= 2). Higher than DB schema, lower than i18n /
  * Filament — those still win when they disagree.
  *
- * Relationship methods (`hasMany`, `belongsTo`, pivots, and morphs) are not
- * emitted yet. They require expression-level analysis and exact key metadata;
- * DB foreign keys remain the current relationship authority.
+ * Grounded `belongsTo`, `hasOne`, and `hasMany` methods are emitted with exact
+ * join keys. Pivot and polymorphic relationships remain excluded because a
+ * two-endpoint edge cannot represent their intermediate/discriminator rules.
  *
  * The walker also exposes a **class-to-table index** that `filament.ts`
  * consults before falling back to convention pluralisation — this is the
@@ -82,7 +82,9 @@ export async function scanEloquentModels(
 		castsByEntity: new Map(),
 	};
 	const configConstants = await readLaravelConfigScalarConstants(root);
-	await walk(path.join(root, "app"), result, configConstants);
+	const relationships: RelationshipCandidate[] = [];
+	await walk(path.join(root, "app"), result, configConstants, relationships);
+	emitRelationshipFragments(result, relationships);
 	return result;
 }
 
@@ -90,6 +92,7 @@ async function walk(
 	dir: string,
 	result: EloquentScanResult,
 	configConstants: Map<string, string>,
+	relationships: RelationshipCandidate[],
 ): Promise<void> {
 	let entries: string[];
 	try {
@@ -106,9 +109,9 @@ async function walk(
 			// proportional to the model count, not the codebase size.
 			if (entry === "Filament" || entry === "Http" || entry === "Console")
 				continue;
-			await walk(full, result, configConstants);
+			await walk(full, result, configConstants, relationships);
 		} else if (entry.endsWith(".php")) {
-			await scanModelFile(full, result, configConstants);
+			await scanModelFile(full, result, configConstants, relationships);
 		}
 	}
 }
@@ -117,6 +120,7 @@ async function scanModelFile(
 	file: string,
 	result: EloquentScanResult,
 	configConstants: Map<string, string>,
+	relationships: RelationshipCandidate[],
 ): Promise<void> {
 	const text = await fs.readFile(file, "utf8");
 	const cls = parseClassDeclaration(text);
@@ -148,6 +152,9 @@ async function scanModelFile(
 	const fqn = cls.namespace ? `${cls.namespace}\\${cls.name}` : cls.name;
 	result.classToEntity.set(fqn, canonicalEntity);
 	result.classToEntity.set(cls.name, canonicalEntity);
+	relationships.push(
+		...parseRelationshipCandidates(text, file, cls.name, canonicalEntity),
+	);
 
 	emitModelEntityAliases(result, file, cls, canonicalEntity);
 
@@ -340,6 +347,159 @@ function scopeLocator(file: string, line: number): VocabFragment["locator"] {
 
 function scopeNameToCanonical(name: string): string {
 	return name
+		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+		.replace(/[^A-Za-z0-9_]+/g, "_")
+		.replace(/^_+|_+$/g, "")
+		.toLowerCase();
+}
+
+interface RelationshipCandidate {
+	file: string;
+	line: number;
+	relationName: string;
+	sourceEntity: string;
+	sourceClass: string;
+	targetClass: string;
+	method: "belongsTo" | "hasOne" | "hasMany";
+	foreignKey?: string;
+	relatedKey?: string;
+}
+
+function parseRelationshipCandidates(
+	text: string,
+	file: string,
+	sourceClass: string,
+	sourceEntity: string,
+): RelationshipCandidate[] {
+	const out: RelationshipCandidate[] = [];
+	const methodRx =
+		/function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?::\s*[A-Za-z_\\][A-Za-z0-9_\\|?]*)?\s*\{/g;
+	let match = methodRx.exec(text);
+	while (match !== null) {
+		const relationName = match[1]!;
+		if (relationName.startsWith("scope")) {
+			match = methodRx.exec(text);
+			continue;
+		}
+		const openIdx = match.index + match[0].lastIndexOf("{");
+		const body = sliceBalanced(text, openIdx, "{", "}");
+		if (body) {
+			const call = body.body.match(
+				/\$this\s*->\s*(belongsTo|hasOne|hasMany)\s*\(/,
+			);
+			if (call?.index !== undefined) {
+				const method = call[1] as RelationshipCandidate["method"];
+				const callOpenIdx = call.index + call[0].lastIndexOf("(");
+				const argsSpan = sliceBalanced(body.body, callOpenIdx, "(", ")");
+				if (argsSpan) {
+					const args = splitTopLevelArgs(argsSpan.body);
+					const targetClass = readClassLiteral(args[0] ?? "");
+					if (targetClass) {
+						const candidate: RelationshipCandidate = {
+							file,
+							line: lineOf(text, openIdx),
+							relationName,
+							sourceEntity,
+							sourceClass,
+							targetClass,
+							method,
+						};
+						const foreignKey = readPhpStringLiteral(args[1] ?? "");
+						const relatedKey = readPhpStringLiteral(args[2] ?? "");
+						if (foreignKey) candidate.foreignKey = foreignKey;
+						if (relatedKey) candidate.relatedKey = relatedKey;
+						out.push(candidate);
+					}
+				}
+			}
+		}
+		match = methodRx.exec(text);
+	}
+	return out;
+}
+
+function readClassLiteral(value: string): string | null {
+	const match = value.trim().match(/^\\?([A-Za-z_][A-Za-z0-9_\\]*)::class$/);
+	return match?.[1] ?? null;
+}
+
+function emitRelationshipFragments(
+	result: EloquentScanResult,
+	candidates: RelationshipCandidate[],
+): void {
+	for (const candidate of candidates) {
+		const targetEntity =
+			result.classToEntity.get(candidate.targetClass) ??
+			result.classToEntity.get(
+				candidate.targetClass.split("\\").pop() ?? candidate.targetClass,
+			) ??
+			classNameToTable(candidate.targetClass);
+		if (!targetEntity) {
+			result.skipped.push({
+				file: candidate.file,
+				reason: `cannot derive relationship target ${candidate.targetClass}`,
+			});
+			continue;
+		}
+		const sourceKey = snakeClassName(candidate.sourceClass);
+		const relationKey = snakeClassName(candidate.relationName);
+		const isBelongsTo = candidate.method === "belongsTo";
+		const from = candidate.sourceEntity;
+		const to = targetEntity;
+		const fromField = isBelongsTo
+			? (candidate.foreignKey ?? `${relationKey}_id`)
+			: (candidate.relatedKey ?? "id");
+		const toField = isBelongsTo
+			? (candidate.relatedKey ?? "id")
+			: (candidate.foreignKey ?? `${sourceKey}_id`);
+		const relationshipKind =
+			candidate.method === "belongsTo"
+				? "many_to_one"
+				: candidate.method === "hasMany"
+					? "one_to_many"
+					: "one_to_one";
+		try {
+			const canonicalFrom = sanitiseCanonical(from);
+			const canonicalTo = sanitiseCanonical(to);
+			const canonicalFromField = sanitiseCanonical(fromField);
+			const canonicalToField = sanitiseCanonical(toField);
+			const relationName = sanitiseCanonical(
+				snakeClassName(candidate.relationName),
+			);
+			const term = sanitiseLabel(
+				prettyScopeName(candidate.relationName),
+			).toLowerCase();
+			result.fragments.push({
+				term,
+				canonical: {
+					kind: "relationship",
+					from: canonicalFrom,
+					to: canonicalTo,
+					fromField: `${canonicalFrom}.${canonicalFromField}`,
+					toField: `${canonicalTo}.${canonicalToField}`,
+					relationshipKind,
+					relationName,
+				},
+				confidence: candidate.foreignKey ? 0.9 : 0.82,
+				locator: {
+					file: candidate.file,
+					line: candidate.line,
+					layer: SourceLayer.Orm,
+					extractor: `extractor-laravel:eloquent:${candidate.method}`,
+				},
+			});
+		} catch {
+			result.skipped.push({
+				file: candidate.file,
+				reason: `invalid relationship ${candidate.relationName}`,
+			});
+		}
+	}
+}
+
+function snakeClassName(name: string): string {
+	return name
+		.replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
 		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
 		.replace(/[^A-Za-z0-9_]+/g, "_")
 		.replace(/^_+|_+$/g, "")

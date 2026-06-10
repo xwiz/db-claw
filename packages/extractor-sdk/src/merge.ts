@@ -46,7 +46,13 @@ function canonicalKey(c: Canonical): string {
 		case "scope_predicate":
 			return `scope:${c.scope}:${c.field}:${c.operator}:${c.rawValue}`;
 		case "relationship":
-			return `rel:${c.from}->${c.to}`;
+			return [
+				"rel",
+				`${c.from}.${c.fromField ?? "*"}`,
+				`${c.to}.${c.toField ?? "*"}`,
+				c.relationshipKind ?? "unknown",
+				c.relationName ?? "",
+			].join(":");
 	}
 }
 

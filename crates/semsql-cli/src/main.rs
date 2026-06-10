@@ -417,15 +417,16 @@ async fn cmd_extract_with_source_runner(
                 extract::JsonlIngestSummary::default()
             };
             println!(
-                "wrote {} entities, {} fields, {} relationships, {} sample-value rows, {} vocab rows, {} metric definitions ({} schema-value predicates, {} vocab and {} metrics from JSONL) to {}",
+                "wrote {} entities, {} fields, {} relationships, {} sample-value rows, {} vocab rows, {} metric definitions ({} schema-value predicates, {} vocab, {} relationships, and {} metrics from JSONL) to {}",
                 summary.entity_count,
                 summary.field_count,
-                summary.relationship_count,
+                summary.relationship_count + extra_vocab.relationship_count,
                 summary.sample_value_count,
                 summary.vocab_count + extra_vocab.vocab_count,
                 extra_vocab.metric_definition_count,
                 summary.value_description_predicate_count,
                 extra_vocab.vocab_count,
+                extra_vocab.relationship_count,
                 extra_vocab.metric_definition_count,
                 output.display()
             );
@@ -466,18 +467,22 @@ async fn cmd_extract_with_source_runner(
                 extract::JsonlIngestSummary::default()
             };
             println!(
-                "wrote {} entities, {} fields, {} relationships, {} sample-value rows, {} vocab rows, {} metric definitions ({} schema-value predicates, {} vocab and {} metrics from framework `{}`, {} vocab and {} metrics from JSONL) to {}",
+                "wrote {} entities, {} fields, {} relationships, {} sample-value rows, {} vocab rows, {} metric definitions ({} schema-value predicates, {} vocab, {} relationships, and {} metrics from framework `{}`, {} vocab, {} relationships, and {} metrics from JSONL) to {}",
                 summary.entity_count,
                 summary.field_count,
-                summary.relationship_count,
+                summary.relationship_count
+                    + source_written.relationship_count
+                    + extra_vocab.relationship_count,
                 summary.sample_value_count,
                 summary.vocab_count + source_written.vocab_count + extra_vocab.vocab_count,
                 source_written.metric_definition_count + extra_vocab.metric_definition_count,
                 summary.value_description_predicate_count,
                 source_written.vocab_count,
+                source_written.relationship_count,
                 source_written.metric_definition_count,
                 other,
                 extra_vocab.vocab_count,
+                extra_vocab.relationship_count,
                 extra_vocab.metric_definition_count,
                 output.display()
             );

@@ -10,11 +10,12 @@ LLMs propose typed plans over bounded evidence; direct provider SQL is never aut
 - JSON packets plus local web, CLI, and JSON resolution surfaces.
 - Authored alias/metric contracts and drift-keyed confirmed/governed memory.
 - Approved enum corrections outrank weaker generated/sample evidence.
+- Grounded Eloquent relationships plus generated Laravel correction-loop gate.
 
 ## Next
 1. Extend contracts to virtual fields, canonical joins, date roles, table-family rules, and typed templates.
-2. Complete Laravel relationships, scopes, casts, accessors, validation/resources, Filament filters, and report shapes.
-3. Run Laravel extract/query/resolve/save/rerun acceptance.
+2. Add Laravel accessors, resources, filters, report shapes, and cast use.
+3. Run the correction loop on a held-out real Laravel app.
 4. Add memory rejection/promotion workflows and keep drift visible in `doctor`.
 5. Visually QA desktop/mobile resolver and document JSON embedding.
 6. Run held-out app-aware versus DB-only ablations, then port to other frameworks.

@@ -3233,10 +3233,7 @@ pub fn resolution_decision_from_traces(
 ) -> ResolutionDecisionTrace {
     let atlas_strength = atlas_strength_report_from_traces(trace, atlas, intent, plan);
     let unresolved_slots = resolution_unresolved_slots(trace, atlas, intent, plan, &atlas_strength);
-    let reject_reason = plan
-        .reject_reason
-        .as_deref()
-        .unwrap_or(trace.route_reason.as_str());
+    let reject_reason = resolution_effective_reason(trace, intent, plan);
     let (decision, reason, next_action, user_actionable, llm_eligible) = if plan.valid {
         (
             "execute",
@@ -3486,15 +3483,12 @@ fn atlas_strength_report_from_traces(
 fn resolution_unresolved_slots(
     trace: &RuntimeQueryFrameTrace,
     atlas: &SemanticAtlasTrace,
-    _intent: &IntentFrameTrace,
+    intent: &IntentFrameTrace,
     plan: &BoundQueryPlanTrace,
     strength: &AtlasStrengthReport,
 ) -> Vec<ResolutionSlotTrace> {
     let mut slots = Vec::new();
-    let reason = plan
-        .reject_reason
-        .as_deref()
-        .unwrap_or(trace.route_reason.as_str());
+    let reason = resolution_effective_reason(trace, intent, plan);
     for missing in &strength.missing {
         let score = match missing.as_str() {
             "subject" => strength.subject_strength,
@@ -3512,12 +3506,14 @@ fn resolution_unresolved_slots(
             strength: score,
             status: resolution_slot_status(score, reason).to_string(),
             reason: reason.to_string(),
-            candidates: resolution_slot_candidates(missing, trace, atlas, plan),
+            candidates: resolution_slot_candidates(missing, trace, atlas, intent, plan),
             handoff: resolution_slot_handoff(reason, strength).to_string(),
         });
     }
     let forced_slot = match reason {
-        "missing_value_evidence" | "ambiguous_unscoped_value_field" => Some("filter_value"),
+        "missing_value_evidence"
+        | "ambiguous_unscoped_value_field"
+        | "ambiguous_unbound_value_field" => Some("filter_value"),
         "not_routed_ambiguous_physical_table_family" => Some("table_family"),
         "unknown_join_path" | "not_routed_no_join_path" => Some("join_path"),
         "missing_projection" | "unknown_projection_field" => Some("projection"),
@@ -3538,7 +3534,7 @@ fn resolution_unresolved_slots(
                     "weak".to_string()
                 },
                 reason: reason.to_string(),
-                candidates: resolution_slot_candidates(slot, trace, atlas, plan),
+                candidates: resolution_slot_candidates(slot, trace, atlas, intent, plan),
                 handoff: resolution_slot_handoff(reason, strength).to_string(),
             });
         }
@@ -3550,6 +3546,7 @@ fn resolution_slot_candidates(
     slot: &str,
     trace: &RuntimeQueryFrameTrace,
     atlas: &SemanticAtlasTrace,
+    intent: &IntentFrameTrace,
     plan: &BoundQueryPlanTrace,
 ) -> Vec<String> {
     let mut out = Vec::new();
@@ -3606,6 +3603,21 @@ fn resolution_slot_candidates(
                     .iter()
                     .filter(|alias| predicate_values.contains(&graph_norm(&alias.value)))
                     .map(|alias| format!("{}={}", alias.field, alias.value)),
+            );
+            out.extend(
+                intent
+                    .codebook_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.kind == SemanticAtlasCodebookKind::Value
+                            && candidate.score >= 12.0
+                    })
+                    .filter_map(|candidate| {
+                        candidate
+                            .value
+                            .as_deref()
+                            .map(|value| format!("{}={value}", candidate.target))
+                    }),
             );
         }
         "join_path" => {
@@ -3702,6 +3714,7 @@ fn resolution_reason_prefers_user(reason: &str) -> bool {
         "missing_value_evidence"
             | "missing_value_candidate"
             | "ambiguous_unscoped_value_field"
+            | "ambiguous_unbound_value_field"
             | "ambiguous_related_predicate_field"
             | "missing_explicit_predicate_field"
             | "unknown_join_path"
@@ -3717,6 +3730,47 @@ fn resolution_reason_prefers_user(reason: &str) -> bool {
             | "unknown_predicate_field"
             | "unknown_order_field"
     )
+}
+
+fn resolution_effective_reason<'a>(
+    trace: &'a RuntimeQueryFrameTrace,
+    intent: &IntentFrameTrace,
+    plan: &'a BoundQueryPlanTrace,
+) -> &'a str {
+    let reason = plan
+        .reject_reason
+        .as_deref()
+        .unwrap_or(trace.route_reason.as_str());
+    if reason == "not_routed_no_predicates"
+        && resolution_has_bounded_unbound_value_ambiguity(intent)
+    {
+        "ambiguous_unbound_value_field"
+    } else {
+        reason
+    }
+}
+
+fn resolution_has_bounded_unbound_value_ambiguity(intent: &IntentFrameTrace) -> bool {
+    let mut targets_by_value: HashMap<String, HashSet<String>> = HashMap::new();
+    for candidate in &intent.codebook_candidates {
+        if candidate.kind != SemanticAtlasCodebookKind::Value || candidate.score < 12.0 {
+            continue;
+        }
+        let Some(value) = candidate.value.as_deref() else {
+            continue;
+        };
+        let value = graph_norm(value);
+        if value.is_empty() {
+            continue;
+        }
+        targets_by_value
+            .entry(value)
+            .or_default()
+            .insert(candidate.target.to_ascii_lowercase());
+    }
+    targets_by_value
+        .values()
+        .any(|targets| targets.len() >= 2 && targets.len() <= 12)
 }
 
 fn resolution_reason_prefers_llm(reason: &str, strength: &AtlasStrengthReport) -> bool {
@@ -27139,6 +27193,58 @@ mod graph_schema_atlas_tests {
             },
         );
         assert_eq!(ask_user_for_ambiguity.decision, "ask_user");
+
+        let ask_user_for_unbound_value = resolution_decision_from_traces(
+            &RuntimeQueryFrameTrace {
+                route_reason: "not_routed_no_predicates".to_string(),
+                ..Default::default()
+            },
+            &atlas,
+            &IntentFrameTrace {
+                codebook_candidates: vec![
+                    SemanticAtlasCodebookCandidate {
+                        kind: SemanticAtlasCodebookKind::Value,
+                        target: "packages.plan_level".to_string(),
+                        value: Some("enterprise".to_string()),
+                        score: 16.0,
+                        matched_alias: "enterprise".to_string(),
+                        source: "sample_values".to_string(),
+                        evidence: vec!["display".to_string()],
+                    },
+                    SemanticAtlasCodebookCandidate {
+                        kind: SemanticAtlasCodebookKind::Value,
+                        target: "packages.service_level".to_string(),
+                        value: Some("enterprise".to_string()),
+                        score: 16.0,
+                        matched_alias: "enterprise".to_string(),
+                        source: "sample_values".to_string(),
+                        evidence: vec!["display".to_string()],
+                    },
+                ],
+                ..Default::default()
+            },
+            &BoundQueryPlanTrace {
+                reject_reason: Some("not_routed_no_predicates".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(ask_user_for_unbound_value.decision, "ask_user");
+        assert_eq!(
+            ask_user_for_unbound_value.reason,
+            "ambiguous_unbound_value_field"
+        );
+        assert!(ask_user_for_unbound_value
+            .unresolved_slots
+            .iter()
+            .any(|slot| {
+                slot.slot == "filter_value"
+                    && slot
+                        .candidates
+                        .contains(&"packages.plan_level=enterprise".to_string())
+                    && slot
+                        .candidates
+                        .contains(&"packages.service_level=enterprise".to_string())
+            }));
 
         let ask_llm = resolution_decision_from_traces(
             &RuntimeQueryFrameTrace {

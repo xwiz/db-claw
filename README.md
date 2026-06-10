@@ -108,9 +108,8 @@ Current proof points:
 - broad BIRD remains poor after shortcut removal and is a DB-only atlas signal,
   not a reason to add static examples.
 
-Remaining alpha work is broader semantic-contract coverage, a full Laravel
-extract/query/resolve/rerun proof, release rehearsal, and visual QA of the local
-resolver.
+Remaining alpha work is broader semantic-contract coverage, a held-out real
+Laravel correction loop, release rehearsal, and visual QA of the local resolver.
 
 Detailed status lives in [docs/results/v02-current-status.md](docs/results/v02-current-status.md).
 

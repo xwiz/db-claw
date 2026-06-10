@@ -88,14 +88,14 @@ Private alpha is reasonable after all of these are true:
 - [x] rejected queries produce actionable user/LLM handoff packets;
 - [x] approved mappings can be saved and reused without static query shortcuts;
 - [ ] local resolver receives desktop/mobile visual QA;
-- [ ] Laravel passes extract, query, resolve, save, and rerun end to end;
+- [x] generated Laravel fixture passes extract, query, resolve, save, and rerun;
+- [ ] a held-out real Laravel app passes the same correction loop;
 - the release workflow has passed on a real pre-release tag;
 - release assets are signed or attested;
 - `@semsql/cli` is published under the same non-dev version;
 - fresh `pnpm --package @semsql/cli@<version> dlx semsql ...` downloads and runs the tagged binary;
 - extractor package tarballs are clean and versioned;
 - fresh installs expose `semsql-extract` to native `semsql extract`;
-- Laravel extraction has real-app smokes;
 - `semsql doctor` gives actionable diagnostics;
 - real MariaDB and Postgres read-only probes pass on disposable or approved
   targets;

@@ -9,6 +9,7 @@
  *  - Filament Resource `$navigationLabel`, `$modelLabel`, `$pluralModelLabel`.
  *  - Eloquent `$casts`, `$fillable`, model aliases, and simple parameterless
  *    local scopes.
+ *  - Grounded Eloquent `belongsTo`, `hasOne`, and `hasMany` join keys.
  *  - `lang/*.php`, `lang/**\/*.json` via @semsql/extractor-i18n.
  *  - Blade `<th>label</th>` adjacent to `{{ $model->field }}`.
  *
