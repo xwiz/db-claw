@@ -500,24 +500,17 @@ fn greedy_argmax_logprob(logits: &[f32]) -> Result<(usize, f32)> {
         return Err(SemsqlError::Other("empty logits from decoder".into()));
     }
 
-    let max = logits
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f32::NEG_INFINITY, f32::max);
-    if max.is_infinite() {
-        return Err(SemsqlError::Other(
-            "all tokens masked (grammar + model mismatch)".into(),
-        ));
-    }
-
-    let best_idx = logits
+    let best_idx_max = logits
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite())
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap();
+        .map(|(i, v)| (i, *v));
+    let Some((best_idx, max)) = best_idx_max else {
+        return Err(SemsqlError::Other(
+            "all tokens masked (grammar + model mismatch)".into(),
+        ));
+    };
 
     // Compute log(softmax[best_idx]) for confidence tracking.
     let exps: Vec<f32> = logits

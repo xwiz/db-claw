@@ -388,6 +388,26 @@ fn phrase_is_mentioned(haystack_lower: &str, phrase_lower: &str) -> bool {
         .any(|window| window == phrase_tokens.as_slice())
 }
 
+fn compound_entity_phrase_mentioned(nl: &str, entity_name: &str) -> bool {
+    let phrase = entity_name.replace('_', " ");
+    if phrase == entity_name {
+        return false;
+    }
+    let phrase_lower = phrase.to_ascii_lowercase();
+    let tokens: Vec<&str> = phrase_lower.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return false;
+    }
+    let nl_lower = nl.to_ascii_lowercase();
+    let nl_tokens: Vec<&str> = nl_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    nl_tokens
+        .windows(tokens.len())
+        .any(|window| window == tokens.as_slice())
+}
+
 fn po_box_mentions(nl: &str) -> Vec<String> {
     let tokens: Vec<&str> = nl
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
@@ -4347,5 +4367,65 @@ mod tests {
     fn pick_best_index_ignores_nan() {
         let scores = vec![f32::NAN, 0.4, 0.7, f32::NAN];
         assert_eq!(pick_best_index(&scores), Some(2));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_matches_full_phrase() {
+        assert!(compound_entity_phrase_mentioned(
+            "show system settings",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_rejects_bare_word() {
+        assert!(!compound_entity_phrase_mentioned(
+            "show settings",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_rejects_unrelated() {
+        assert!(!compound_entity_phrase_mentioned(
+            "show users",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_rejects_singular_bare_word() {
+        assert!(!compound_entity_phrase_mentioned(
+            "show setting",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_matches_partial_prefix() {
+        assert!(!compound_entity_phrase_mentioned(
+            "show system",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_simple_name_is_no_op() {
+        assert!(!compound_entity_phrase_mentioned(
+            "show settings",
+            "settings"
+        ));
+    }
+
+    #[test]
+    fn compound_entity_phrase_mentioned_punctuation_around_phrase() {
+        assert!(compound_entity_phrase_mentioned(
+            "How many system settings?",
+            "system_settings"
+        ));
+        assert!(compound_entity_phrase_mentioned(
+            "system settings!",
+            "system_settings"
+        ));
     }
 }

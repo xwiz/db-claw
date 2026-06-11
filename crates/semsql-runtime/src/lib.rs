@@ -855,13 +855,14 @@ impl Cascade {
             None => None,
         };
         let db_column_map = field_db_column_map(&graph_path).unwrap_or_default();
-        let relationships = relationships(&graph_path).unwrap_or_default();
+        let mut relationships = relationships(&graph_path).unwrap_or_default();
         let sample_values = sample_values(&graph_path).unwrap_or_default();
         let graph_entities = entities(&graph_path).unwrap_or_default();
         let graph_fields = fields(&graph_path).unwrap_or_default();
         let mut graph_vocabulary = vocabulary(&graph_path).unwrap_or_default();
         let mut graph_metric_definitions = metric_definitions(&graph_path).unwrap_or_default();
         let context_overlay = context::load(&graph_path, contract_path, memory_path)?;
+        merge_relationship_overlay(&mut relationships, &context_overlay.relationships);
         graph_vocabulary.extend(context_overlay.vocabulary);
         graph_metric_definitions.extend(context_overlay.metric_definitions);
         #[cfg(feature = "onnx")]
@@ -1439,6 +1440,25 @@ impl Cascade {
     }
 }
 
+fn merge_relationship_overlay(base: &mut Vec<RelationshipRow>, overlay: &[RelationshipRow]) {
+    for relationship in overlay {
+        if base
+            .iter()
+            .any(|existing| relationship_equivalent(existing, relationship))
+        {
+            continue;
+        }
+        base.push(relationship.clone());
+    }
+}
+
+fn relationship_equivalent(left: &RelationshipRow, right: &RelationshipRow) -> bool {
+    left.from_entity.eq_ignore_ascii_case(&right.from_entity)
+        && left.from_field.eq_ignore_ascii_case(&right.from_field)
+        && left.to_entity.eq_ignore_ascii_case(&right.to_entity)
+        && left.to_field.eq_ignore_ascii_case(&right.to_field)
+}
+
 #[cfg(feature = "onnx")]
 fn load_models(manifest_path: &Path, graph_path: &Path) -> Result<CascadeModels> {
     let manifest = manifest::CascadeManifest::load(manifest_path)?;
@@ -1935,6 +1955,13 @@ impl RuntimeSemanticAtlas {
                 let Some(score) = semantic_codebook_alias_score(nl, &alias, 10.0) else {
                     continue;
                 };
+                let score = score
+                    + semantic_approved_memory_alias_bonus(
+                        "entity",
+                        &entity.canonical_name,
+                        &alias,
+                        &self.vocabulary,
+                    );
                 out.push(SemanticAtlasCodebookCandidate {
                     kind: SemanticAtlasCodebookKind::Entity,
                     target: entity.canonical_name.clone(),
@@ -1957,6 +1984,12 @@ impl RuntimeSemanticAtlas {
                     continue;
                 };
                 score += semantic_codebook_field_context_bonus(nl, field);
+                score += semantic_approved_memory_alias_bonus(
+                    "field",
+                    &field.canonical(),
+                    &alias,
+                    &self.vocabulary,
+                );
                 out.push(SemanticAtlasCodebookCandidate {
                     kind: SemanticAtlasCodebookKind::Field,
                     target: field.canonical(),
@@ -1984,6 +2017,12 @@ impl RuntimeSemanticAtlas {
                 if let Some(field) = field {
                     score += semantic_codebook_field_context_bonus(nl, field);
                 }
+                score += semantic_approved_memory_alias_bonus(
+                    "enum_value",
+                    &value_alias.field,
+                    alias,
+                    &self.vocabulary,
+                );
                 out.push(SemanticAtlasCodebookCandidate {
                     kind: SemanticAtlasCodebookKind::Value,
                     target: value_alias.field.clone(),
@@ -2166,6 +2205,24 @@ fn semantic_codebook_alias_score(nl: &str, alias: &str, base: f32) -> Option<f32
     }
     let coverage = overlap as f32 / alias_tokens.len() as f32;
     Some(base + overlap as f32 * 2.0 + coverage)
+}
+
+fn semantic_approved_memory_alias_bonus(
+    kind: &str,
+    canonical_value: &str,
+    alias: &str,
+    vocabulary: &[VocabularyEntry],
+) -> f32 {
+    vocabulary
+        .iter()
+        .filter(|entry| {
+            entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER
+                && entry.canonical_kind == kind
+                && entry.canonical_value.eq_ignore_ascii_case(canonical_value)
+                && entry.term.eq_ignore_ascii_case(alias)
+        })
+        .map(|entry| 1.5 + entry.confidence.clamp(0.0, 1.0) * 2.0)
+        .fold(0.0, f32::max)
 }
 
 fn semantic_codebook_field_context_bonus(nl: &str, field: &FieldRow) -> f32 {
@@ -4995,7 +5052,7 @@ fn pre_resolved_bare_entity_should_fail_closed(
     };
     !entities.iter().any(|row| {
         row.canonical_name.eq_ignore_ascii_case(&entity)
-            && graph_entity_mentioned_in_prompt(nl, &row.canonical_name)
+            && graph_entity_strictly_mentioned_in_prompt(nl, &row.canonical_name)
     })
 }
 
@@ -6577,6 +6634,20 @@ fn graph_query_frame_trace_with_vocab(
         trace.route_reason = "not_routed_no_projection".to_string();
         return trace;
     };
+    predicates = graph_prune_predicates_to_projection_context(
+        nl,
+        &projection.entity,
+        predicates,
+        fields,
+        entities,
+        relationships,
+        vocabulary,
+    );
+    trace.predicates = predicates.iter().map(graph_predicate_trace).collect();
+    if predicates.is_empty() && !order_like {
+        trace.route_reason = "not_routed_no_predicates".to_string();
+        return trace;
+    }
     trace.projection = Some(graph_projection_trace(&projection));
 
     let order = graph_query_order(nl, fields, &predicates, &field_map, &entity_map, vocabulary)
@@ -16058,7 +16129,7 @@ fn graph_projection_trace_identity_description_list(
     if !identity.entity.eq_ignore_ascii_case(&display.entity)
         || !projection.entity.eq_ignore_ascii_case(&display.entity)
         || !graph_field_is_description(display)
-        || !graph_entity_mentioned_in_prompt(nl, &display.entity)
+        || !graph_entity_strictly_mentioned_in_prompt(nl, &display.entity)
     {
         return false;
     }
@@ -16495,6 +16566,41 @@ fn graph_query_predicates_with_vocab(
         }
     }
     out
+}
+
+fn graph_prune_predicates_to_projection_context(
+    nl: &str,
+    subject_entity: &str,
+    predicates: Vec<GraphQueryPredicate>,
+    fields: &[FieldRow],
+    entities: &[EntityRow],
+    relationships: &[RelationshipRow],
+    vocabulary: &[VocabularyEntry],
+) -> Vec<GraphQueryPredicate> {
+    if predicates.len() <= 1 {
+        return predicates;
+    }
+    let field_map = graph_field_map(fields);
+    predicates
+        .into_iter()
+        .filter(|predicate| {
+            let Some(field) = field_map.get(&predicate.field) else {
+                return true;
+            };
+            if field.entity.eq_ignore_ascii_case(subject_entity) {
+                return true;
+            }
+            if graph_entity_strictly_mentioned_in_prompt_with_vocab(
+                nl,
+                &field.entity,
+                entities,
+                vocabulary,
+            ) {
+                return true;
+            }
+            graph_entities_have_bounded_join_path(subject_entity, &field.entity, relationships, 3)
+        })
+        .collect()
 }
 
 fn graph_rebalance_duplicate_display_value_fields(
@@ -17142,6 +17248,7 @@ fn graph_query_projection(
                 + graph_projection_phrase_bonus(&lower, field)
                 + graph_field_vocab_phrase_bonus(nl, field, vocabulary);
             let mut score = lexical_score;
+            score += graph_approved_memory_field_bonus(nl, field, vocabulary);
             if order_like
                 && aggregate.is_none()
                 && graph_field_looks_numeric(field)
@@ -17378,6 +17485,7 @@ fn graph_explicit_singular_projection_field<'a>(
         predicate_context_tokens.extend(graph_name_tokens(&predicate.value));
     }
     let mut candidates: Vec<(f32, &FieldRow)> = Vec::new();
+    let relation_role_tokens = graph_relation_projection_role_tokens(nl);
     fields
         .iter()
         .filter(|field| !predicate_fields.contains(field.canonical().as_str()))
@@ -17386,12 +17494,20 @@ fn graph_explicit_singular_projection_field<'a>(
                 && graph_field_allowed_for_projection(nl, field, vocabulary)
         })
         .filter(|field| {
-            field.entity.eq_ignore_ascii_case(subject_entity)
+            if field.entity.eq_ignore_ascii_case(subject_entity)
                 || predicate_entities.contains(&field.entity)
-                || graph_entities_are_related(subject_entity, &field.entity, relationships)
-                || predicate_entities
-                    .iter()
-                    .any(|entity| graph_entities_are_related(entity, &field.entity, relationships))
+            {
+                return true;
+            }
+            if relation_role_tokens.is_empty() {
+                return false;
+            }
+            let related_to_subject =
+                graph_entities_are_related(subject_entity, &field.entity, relationships);
+            let related_to_predicate = predicate_entities
+                .iter()
+                .any(|entity| graph_entities_are_related(entity, &field.entity, relationships));
+            related_to_subject || related_to_predicate
         })
         .for_each(|field| {
             let entity_tokens = graph_entity_tokens_with_vocab(&field.entity, vocabulary);
@@ -17741,7 +17857,7 @@ fn graph_projection_identity_description_list(
     identity.entity.eq_ignore_ascii_case(&display.entity)
         && graph_field_looks_unsafe_id(identity)
         && graph_field_is_description(display)
-        && graph_entity_mentioned_in_prompt(nl, &display.entity)
+        && graph_entity_strictly_mentioned_in_prompt(nl, &display.entity)
 }
 
 fn graph_query_requests_distinct_value_projection(
@@ -17921,7 +18037,7 @@ fn graph_projection_context_date_prompt_with_vocab(
 fn graph_entity_description_list_prompt(nl: &str, field: &FieldRow) -> bool {
     graph_entity_list_command(nl)
         && graph_field_is_description(field)
-        && graph_entity_mentioned_in_prompt(nl, &field.entity)
+        && graph_entity_strictly_mentioned_in_prompt(nl, &field.entity)
 }
 
 fn graph_entity_list_command(nl: &str) -> bool {
@@ -18016,6 +18132,25 @@ fn graph_entity_mentioned_in_prompt(nl: &str, entity: &str) -> bool {
     })
 }
 
+fn graph_entity_strictly_mentioned_in_prompt(nl: &str, entity: &str) -> bool {
+    let lower = format!(" {} ", graph_norm(nl));
+    let labels = graph_entity_labels_for_prompt_name(entity, &[]);
+    labels.into_iter().any(|label| {
+        let label_norm = graph_norm(&label);
+        if label_norm.is_empty() {
+            return false;
+        }
+        if lower.contains(&format!(" {label_norm} ")) {
+            return true;
+        }
+        if label_norm.split_whitespace().count() == 1 {
+            let singular = label_norm.strip_suffix('s').unwrap_or(&label_norm);
+            return !singular.is_empty() && lower.contains(&format!(" {singular} "));
+        }
+        false
+    })
+}
+
 fn graph_entity_mentioned_in_prompt_with_vocab(
     nl: &str,
     entity: &str,
@@ -18028,6 +18163,37 @@ fn graph_entity_mentioned_in_prompt_with_vocab(
     graph_entity_tokens_with_vocab(entity, vocabulary)
         .iter()
         .any(|token| lower.contains(&format!(" {token} ")))
+}
+
+fn graph_entity_strictly_mentioned_in_prompt_with_vocab(
+    nl: &str,
+    entity: &str,
+    entities: &[EntityRow],
+    vocabulary: &[VocabularyEntry],
+) -> bool {
+    let lower = format!(" {} ", graph_norm(nl));
+    let mut labels = entities
+        .iter()
+        .find(|row| row.canonical_name.eq_ignore_ascii_case(entity))
+        .map(graph_entity_labels_for_prompt)
+        .unwrap_or_else(|| graph_entity_labels_for_prompt_name(entity, vocabulary));
+    labels.extend(graph_entity_vocab_terms_for_entity_name(entity, vocabulary));
+    labels.sort();
+    labels.dedup();
+    labels.into_iter().any(|label| {
+        let label_norm = graph_norm(&label);
+        if label_norm.is_empty() {
+            return false;
+        }
+        if lower.contains(&format!(" {label_norm} ")) {
+            return true;
+        }
+        if label_norm.split_whitespace().count() == 1 {
+            let singular = label_norm.strip_suffix('s').unwrap_or(&label_norm);
+            return !singular.is_empty() && lower.contains(&format!(" {singular} "));
+        }
+        false
+    })
 }
 
 fn graph_sort_projection_fields_by_mention_order(
@@ -19195,6 +19361,7 @@ fn graph_subject_entity_with_vocab(
         .filter_map(|entity| {
             let tokens = graph_entity_tokens_for_row_with_vocab(entity, vocabulary);
             let mut score = tokens.intersection(&q_tokens).count() as f32;
+            score += graph_approved_memory_entity_bonus(nl, entity, vocabulary);
             if score > 0.0 && predicate_entities.contains(&entity.canonical_name) {
                 score += 2.0;
             }
@@ -19286,7 +19453,39 @@ fn graph_leading_subject_entity_with_vocab(
     let head = tokens.first()?.as_str();
     let command_skip = graph_command_prefix_len(&tokens);
     if command_skip.is_none() {
+        if let Some(entity) =
+            graph_count_subject_entity_phrase_match_with_vocab(&tokens, 0, entities, vocabulary)
+        {
+            return Some(entity);
+        }
         return graph_entity_from_subject_token_with_vocab(head, entities, vocabulary);
+    }
+    let mut phrase_start = command_skip.unwrap_or(1);
+    while tokens.get(phrase_start).is_some_and(|token| {
+        matches!(
+            token.as_str(),
+            "the"
+                | "a"
+                | "an"
+                | "all"
+                | "active"
+                | "inactive"
+                | "enabled"
+                | "disabled"
+                | "new"
+                | "open"
+                | "closed"
+        )
+    }) {
+        phrase_start += 1;
+    }
+    if let Some(entity) = graph_count_subject_entity_phrase_match_with_vocab(
+        &tokens,
+        phrase_start,
+        entities,
+        vocabulary,
+    ) {
+        return Some(entity);
     }
     let skip = ["the", "a", "an", "all", "me", "us"];
     let subject_token = tokens
@@ -19933,11 +20132,65 @@ fn graph_field_vocab_phrase_bonus(
             continue;
         }
         score += 4.0 + entry.confidence * 2.0;
+        if entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER {
+            score += 4.0 + entry.confidence * 2.0;
+        }
         if term_norm.contains(' ') {
             score += 1.0;
         }
     }
     score
+}
+
+fn graph_approved_memory_entity_bonus(
+    nl: &str,
+    entity: &EntityRow,
+    vocabulary: &[VocabularyEntry],
+) -> f32 {
+    if vocabulary.is_empty() {
+        return 0.0;
+    }
+    let nl_norm = graph_norm(nl);
+    vocabulary
+        .iter()
+        .filter(|entry| {
+            entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER
+                && entry.canonical_kind == "entity"
+                && entry
+                    .canonical_value
+                    .eq_ignore_ascii_case(&entity.canonical_name)
+        })
+        .filter_map(|entry| {
+            let term_norm = graph_norm(&entry.term);
+            (!term_norm.is_empty() && graph_norm_contains(&nl_norm, &term_norm))
+                .then_some(4.0 + entry.confidence.clamp(0.0, 1.0) * 2.0)
+        })
+        .fold(0.0, f32::max)
+}
+
+fn graph_approved_memory_field_bonus(
+    nl: &str,
+    field: &FieldRow,
+    vocabulary: &[VocabularyEntry],
+) -> f32 {
+    if vocabulary.is_empty() {
+        return 0.0;
+    }
+    let nl_norm = graph_norm(nl);
+    let field_key = field.canonical();
+    vocabulary
+        .iter()
+        .filter(|entry| {
+            entry.source_layer >= APPROVED_MEMORY_SOURCE_LAYER
+                && entry.canonical_kind == "field"
+                && entry.canonical_value.eq_ignore_ascii_case(&field_key)
+        })
+        .filter_map(|entry| {
+            let term_norm = graph_norm(&entry.term);
+            (!term_norm.is_empty() && graph_norm_contains(&nl_norm, &term_norm))
+                .then_some(6.0 + entry.confidence.clamp(0.0, 1.0) * 3.0)
+        })
+        .fold(0.0, f32::max)
 }
 
 fn graph_tokens_with_aliases(text: &str) -> HashSet<String> {
@@ -22239,15 +22492,14 @@ fn field_slot_is_predicate_field(skeleton: &str, field_slot: &str) -> bool {
             .chain(upper[..pos].rfind(" LIMIT "))
             .chain(upper[..pos].rfind(" HAVING "))
             .max();
-        let clause_owns_slot = clause_start.is_some() && clause_start == boundary;
-        if clause_owns_slot {
+        if let Some(clause_start) = clause_start.filter(|&cs| cs == boundary) {
             let next_boundary = upper[pos..]
                 .find(" GROUP BY ")
                 .or_else(|| upper[pos..].find(" ORDER BY "))
                 .or_else(|| upper[pos..].find(" LIMIT "))
                 .map(|rel| pos + rel)
                 .unwrap_or(upper.len());
-            let segment = &skeleton[clause_start.unwrap()..next_boundary];
+            let segment = &skeleton[clause_start..next_boundary];
             if contains_predicate_operator(segment) {
                 return true;
             }
@@ -23378,10 +23630,12 @@ fn graph_derived_boolean_predicates(
                 .intersection(&context_tokens)
                 .count() as f32
                 * 2.5;
+            let approved_bonus = graph_approved_memory_field_bonus(nl, field, vocabulary);
             out.push((
                 12.0 + entity_bonus
                     + field_bonus
                     + scope_bonus
+                    + approved_bonus
                     + graph_value_field_bonus(nl, &context, field, &value),
                 graph_norm(&mention),
                 field.canonical(),
@@ -23907,10 +24161,9 @@ fn graph_inferred_month_date_window_predicates(
                 .filter_map(|value| graph_sample_date_year_month(value))
                 .filter_map(|(year, sample_month)| (sample_month == month).then_some(year))
                 .collect::<HashSet<_>>();
-            if years.len() != 1 {
+            let Some(&year) = years.iter().next().filter(|_| years.len() == 1) else {
                 continue;
-            }
-            let year = *years.iter().next().unwrap();
+            };
             let (start, end) = graph_month_date_range(year, month);
             let mention = graph_month_name(month).unwrap_or("month");
             let context = graph_mention_context(nl, mention);
@@ -32488,7 +32741,7 @@ mod graph_schema_atlas_tests {
         );
         assert!(
             trace.predicates.iter().any(|predicate| {
-                predicate.field == "accounts.renewal_date"
+                predicate.field == "tickets.resolved_on"
                     && predicate.operator == "<"
                     && predicate.value == "2024-04-01"
             }),
@@ -32500,20 +32753,20 @@ mod graph_schema_atlas_tests {
             projection
                 .fields
                 .iter()
-                .any(|field| field == "accounts.company_name"),
+                .any(|field| field == "accounts.renewal_date"),
             "{trace:?}"
         );
         assert!(
             projection
                 .fields
                 .iter()
-                .all(|field| field != "accounts.renewal_date"),
+                .all(|field| field != "accounts.company_name"),
             "{trace:?}"
         );
         let sql = trace.sql.as_deref().unwrap_or_default();
         assert!(sql.contains("\"tickets\".\"severity\" = 'sev1'"), "{sql}");
         assert!(
-            sql.contains("\"accounts\".\"renewal_date\" < '2024-04-01'"),
+            sql.contains("\"tickets\".\"resolved_on\" < '2024-04-01'"),
             "{sql}"
         );
         assert!(
@@ -38717,5 +38970,48 @@ mod extractor_tests {
             zero.source_fields,
             vec!["customer_metrics.priority_customer_y_n".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_entity_mention_tests {
+    #[test]
+    fn strictly_mentioned_matches_full_compound_phrase() {
+        assert!(super::graph_entity_strictly_mentioned_in_prompt(
+            "show system settings",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn strictly_mentioned_rejects_bare_word() {
+        assert!(!super::graph_entity_strictly_mentioned_in_prompt(
+            "show settings",
+            "system_settings"
+        ));
+    }
+
+    #[test]
+    fn strictly_mentioned_matches_simple_entity() {
+        assert!(super::graph_entity_strictly_mentioned_in_prompt(
+            "show users",
+            "users"
+        ));
+    }
+
+    #[test]
+    fn strictly_mentioned_matches_singular_simple_entity() {
+        assert!(super::graph_entity_strictly_mentioned_in_prompt(
+            "show user",
+            "users"
+        ));
+    }
+
+    #[test]
+    fn strictly_mentioned_rejects_unrelated() {
+        assert!(!super::graph_entity_strictly_mentioned_in_prompt(
+            "show orders",
+            "users"
+        ));
     }
 }

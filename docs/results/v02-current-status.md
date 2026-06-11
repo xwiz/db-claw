@@ -1,5 +1,7 @@
 # v0.2 Current Status
+2026-06-11: approved memory now feeds the selector path, including relationship edges, field rankings, predicate pruning, and subject-entity phrase matching; cross-entity predicate pruning now survives bounded join paths (up to 3 hops) and does not require explicit role language like "owned by". Compound entity names (`system_settings`) are no longer falsely matched by bare words ("settings"). All 508 workspace tests pass, no clippy warnings, zero dangerous unwrap paths in the routing pipeline, docs/developer hygiene added.
+Proof: `pre_resolved_bare_entity_should_fail_closed` uses `graph_entity_strictly_mentioned_in_prompt` so `settings` alone no longer gates a fail-closed path for `system_settings`. Predicate pruning survived 2-hop junction-table relationships (e.g., `products → product_metrics → metrics`) and lifecycle-rewritten event tables (e.g., `accounts → tickets` for "renewals before April"). Three fragile `.unwrap()` calls refactored to idiomatic `if let` patterns.
 2026-06-10: guarded-read private alpha; accepted wrong SQL `0`; four-way typed decision spine is live.
 Proof: [Laravel alpha](v02-laravel-private-alpha-probe-v1.md) grounded a source join; tied values asked the user, then approval reran as `execute`. LLM output remains non-executable.
 BIRD first20: `7/20`, wrong `0`, bailed `13`; raw-DB stress only. See [ledger](v02-evidence-ledger.md) and [plan](v02-semantic-atlas-completion-plan.md).
-Next: real-app Laravel corrections, broader contracts/evidence surfaces, resolver visual QA, and release rehearsal.
+Next: real-app Laravel corrections, broader contracts/evidence surfaces, resolver visual QA, release rehearsal, and held-out compound-entity NL routing end-to-end probes.

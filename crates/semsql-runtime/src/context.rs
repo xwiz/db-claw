@@ -2,7 +2,7 @@
 
 use crate::{APPROVED_MEMORY_SOURCE_LAYER, AUTHORED_CONTRACT_SOURCE_LAYER};
 use semsql_core::{Result, SemsqlError};
-use semsql_graph::read::{metadata, MetricDefinitionRow, VocabularyEntry};
+use semsql_graph::read::{metadata, MetricDefinitionRow, RelationshipRow, VocabularyEntry};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -13,6 +13,8 @@ pub struct SemanticContextOverlay {
     pub vocabulary: Vec<VocabularyEntry>,
     /// Authored governed metrics.
     pub metric_definitions: Vec<MetricDefinitionRow>,
+    /// Authored and approved-memory relationships.
+    pub relationships: Vec<RelationshipRow>,
     /// Number of authored aliases loaded.
     pub authored_alias_count: usize,
     /// Number of approved memory entries loaded.
@@ -183,10 +185,16 @@ pub fn load(
                 continue;
             }
             validate_alias(&entry.kind, &entry.target, entry.confidence)?;
+            let term = entry.term.trim().to_ascii_lowercase();
+            let target = entry.target;
+            if entry.kind == "relationship" {
+                let relationship = parse_relationship_target(&target)?;
+                overlay.relationships.push(relationship);
+            }
             overlay.vocabulary.push(VocabularyEntry {
-                term: entry.term.trim().to_ascii_lowercase(),
+                term,
                 canonical_kind: entry.kind,
-                canonical_value: entry.target,
+                canonical_value: target,
                 confidence: entry.confidence,
                 source_layer: APPROVED_MEMORY_SOURCE_LAYER,
             });
@@ -194,6 +202,37 @@ pub fn load(
         }
     }
     Ok(overlay)
+}
+
+fn parse_relationship_target(target: &str) -> Result<RelationshipRow> {
+    let (left, right) = target.split_once("->").ok_or_else(|| {
+        SemsqlError::Other(format!(
+            "relationship memory target must use `left -> right` syntax, got `{target}`"
+        ))
+    })?;
+    let (from_entity, from_field) = parse_relationship_endpoint(left.trim())?;
+    let (to_entity, to_field) = parse_relationship_endpoint(right.trim())?;
+    Ok(RelationshipRow {
+        from_entity,
+        from_field,
+        to_entity,
+        to_field,
+        kind: "approved_memory".to_string(),
+    })
+}
+
+fn parse_relationship_endpoint(endpoint: &str) -> Result<(String, String)> {
+    let (entity, field) = endpoint.split_once('.').ok_or_else(|| {
+        SemsqlError::Other(format!(
+            "relationship memory endpoint must use `entity.field` syntax, got `{endpoint}`"
+        ))
+    })?;
+    if entity.trim().is_empty() || field.trim().is_empty() {
+        return Err(SemsqlError::Other(format!(
+            "relationship memory endpoint must not contain empty parts, got `{endpoint}`"
+        )));
+    }
+    Ok((entity.trim().to_string(), field.trim().to_string()))
 }
 
 fn parse_yaml_or_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -351,6 +390,40 @@ entries:
         assert_eq!(overlay.metric_definitions.len(), 1);
         assert!(overlay.vocabulary.iter().any(|entry| entry.term == "speed"));
         assert!(!overlay.vocabulary.iter().any(|entry| entry.term == "risky"));
+    }
+
+    #[test]
+    fn loads_approved_relationship_memory_as_relationship_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("app.semsql");
+        let connection = semsql_graph::open(&graph).unwrap();
+        stamp_metadata(&connection, "test-app", "schema-123").unwrap();
+        let memory = dir.path().join("semsql.memory.yaml");
+        std::fs::write(
+            &memory,
+            r#"
+schema_version: 1
+drift_key: schema-123
+entries:
+  - term: bank
+    kind: relationship
+    target: bank_settings.bank_id -> banks.id
+    status: confirmed
+"#,
+        )
+        .unwrap();
+
+        let overlay = load(&graph, None, Some(&memory)).unwrap();
+
+        assert_eq!(overlay.approved_memory_count, 1);
+        assert_eq!(overlay.relationships.len(), 1);
+        let relationship = &overlay.relationships[0];
+        assert_eq!(relationship.from_entity, "bank_settings");
+        assert_eq!(relationship.from_field, "bank_id");
+        assert_eq!(relationship.to_entity, "banks");
+        assert_eq!(relationship.to_field, "id");
+        assert_eq!(relationship.kind, "approved_memory");
+        assert!(overlay.vocabulary.iter().any(|entry| entry.term == "bank"));
     }
 
     #[test]

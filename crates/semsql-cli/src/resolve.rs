@@ -479,6 +479,11 @@ fn normalized_target(kind: &str, target: &str) -> String {
             return field.trim().to_string();
         }
     }
+    if kind == "relationship" {
+        if let Some((left, right)) = target.split_once("->") {
+            return format!("{} -> {}", left.trim(), right.trim());
+        }
+    }
     target.trim().to_string()
 }
 
