@@ -87,7 +87,7 @@ Private alpha is reasonable after all of these are true:
 - [x] query JSON includes the resolution decision and atlas-strength report;
 - [x] rejected queries produce actionable user/LLM handoff packets;
 - [x] approved mappings can be saved and reused without static query shortcuts;
-- [ ] local resolver receives desktop/mobile visual QA;
+- [x] local resolver receives desktop/mobile visual QA;
 - [x] generated Laravel fixture passes extract, query, resolve, save, and rerun;
 - [ ] a held-out real Laravel app passes the same correction loop;
 - the release workflow has passed on a real pre-release tag;
