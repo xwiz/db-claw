@@ -89,7 +89,7 @@ Private alpha is reasonable after all of these are true:
 - [x] approved mappings can be saved and reused without static query shortcuts;
 - [x] local resolver receives desktop/mobile visual QA;
 - [x] generated Laravel fixture passes extract, query, resolve, save, and rerun;
-- [ ] a held-out real Laravel app passes the same correction loop;
+- [x] a held-out real Laravel app passes the same correction loop;
 - the release workflow has passed on a real pre-release tag;
 - release assets are signed or attested;
 - `@semsql/cli` is published under the same non-dev version;
